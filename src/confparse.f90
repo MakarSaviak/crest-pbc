@@ -126,8 +126,10 @@ subroutine parseflags(env,arg,nra)
   env%Threads = 1                !> total number of threads
   env%MAXRUN = 1                 !> number of parallel xtb jobs
   env%omp = 1                    !> # of OMP_NUM_THREADS and MKL_NUMTHREADS to be used
+  env%ThreadsMD = 0              !> optional total number of threads for MD/MTD
   env%autothreads = .true.       !> automatically determine optimal parameters omp and MAXRUN
   env%threadssetmanual = .false. !> did the user set the #threads manually?
+  env%threadsmdsetmanual = .false. !> did the user set the #threads for MD/MTD manually?
 
   env%scratch = .false.          !> use scratch directory?
   call getcwd(env%homedir)       !> original directory
@@ -1447,6 +1449,13 @@ subroutine parseflags(env,arg,nra)
         env%threadssetmanual = .true.
         write (*,'(2x,a,1x,i0,1x,a)') trim(arg(i)),nint(xx(1)), &
         &     '(CPUs/Threads selected)'
+      case ('-TMD','-tmd') !> set total number of OMP threads for MD/MTD only
+        call readl(arg(i+1),xx,j)
+        if (index(arg(i+1),'-') .ne. 0) xx = 0d0
+        env%ThreadsMD = nint(xx(1))
+        env%threadsmdsetmanual = env%ThreadsMD > 0
+        write (*,'(2x,a,1x,i0,1x,a)') trim(arg(i)),nint(xx(1)), &
+        &     '(CPUs/Threads selected for MD/MTD)'
       case ('-inplace')     !> activate "in-place" mode for optimizations (ON by default)
         env%inplaceMode = .true.
 !========================================================================================!

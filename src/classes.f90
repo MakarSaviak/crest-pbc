@@ -340,6 +340,7 @@ module crest_data
     integer :: MAXRUN = 1      !> number of cores per job
     integer :: omp = 1         !> OMP/MKL_NUM_THREADS
     integer :: Threads = 1     !> Total number of threads (=omp*MAXRUN)
+    integer :: ThreadsMD = 0   !> Optional total thread budget for MD/MTD only
     logical :: omp_allow_nested = .true.  !> allow nested OpenMP threadding
 
     !>--- various names and flags
@@ -569,6 +570,7 @@ module crest_data
     logical :: subRMSD               !> include only the selected substructure into the CREGEN RMSD
     logical :: superquick            !> very crude quick-run option
     logical :: threadssetmanual      !> are #CPUs set with the '-T' flag ?
+    logical :: threadsmdsetmanual    !> are #CPUs for MD/MTD set with '-TMD'?
     logical :: trackorigin           !> track the origin of a conformation?
     logical :: testnumgrad = .false. !> test numerical gradient in singlepoint
     logical :: use_xtbiff = .false.  !> use xtbiff for QCG?

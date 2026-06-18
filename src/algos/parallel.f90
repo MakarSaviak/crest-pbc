@@ -436,10 +436,11 @@ subroutine crest_search_multimd(env,mol,mddats,nsim)
   type(coord),allocatable :: moltmps(:)
   integer :: i,j,io,ich
   logical :: pr,ex,nested
-  integer :: T,Tn
+  integer :: T,Tn,Trestore,Tnrestore,thread_save
   real(wp) :: percent
   character(len=80) :: atmp
   character(len=*),parameter :: mdir = 'MDFILES'
+  logical :: use_tmd_threads
 
   type(calcdata),allocatable :: calculations(:)
   integer :: vz,job,thread_id
@@ -463,6 +464,9 @@ subroutine crest_search_multimd(env,mol,mddats,nsim)
   end if
 
 !>--- prepare calculation containers for parallelization (one per thread)
+  use_tmd_threads = env%threadsmdsetmanual.and.env%ThreadsMD > 0
+  thread_save = env%Threads
+  if (use_tmd_threads) env%Threads = env%ThreadsMD
   call new_ompautoset(env,'auto_nested',nsim,T,Tn) 
   nested = env%omp_allow_nested
 
@@ -538,6 +542,10 @@ subroutine crest_search_multimd(env,mol,mddats,nsim)
   call profiler%clear()
   deallocate (calculations)
   if (allocated(moltmps)) deallocate (moltmps)
+  if (use_tmd_threads) then
+    env%Threads = thread_save
+    call new_ompautoset(env,'max',0,Trestore,Tnrestore)
+  end if
   return
 contains
   subroutine collect(n,mddats)
@@ -744,10 +752,11 @@ subroutine crest_search_multimd2(env,mols,mddats,nsim)
   type(coord),allocatable :: moltmps(:)
   integer :: i,j,io,ich
   logical :: pr,ex,nested
-  integer :: T,Tn
+  integer :: T,Tn,Trestore,Tnrestore,thread_save
   real(wp) :: percent
   character(len=80) :: atmp
   character(len=*),parameter :: mdir = 'MDFILES'
+  logical :: use_tmd_threads
 
   type(calcdata),allocatable :: calculations(:)
   integer :: vz,job,thread_id
@@ -769,6 +778,9 @@ subroutine crest_search_multimd2(env,mols,mddats,nsim)
   end if
 
 !>--- prepare calculation objects for parallelization (one per thread)
+  use_tmd_threads = env%threadsmdsetmanual.and.env%ThreadsMD > 0
+  thread_save = env%Threads
+  if (use_tmd_threads) env%Threads = env%ThreadsMD
   call new_ompautoset(env,'auto_nested',nsim,T,Tn)
   nested = env%omp_allow_nested
 
@@ -837,6 +849,10 @@ subroutine crest_search_multimd2(env,mols,mddats,nsim)
   call profiler%clear()
   deallocate (calculations)
   if (allocated(moltmps)) deallocate (moltmps)
+  if (use_tmd_threads) then
+    env%Threads = thread_save
+    call new_ompautoset(env,'max',0,Trestore,Tnrestore)
+  end if
   return
 contains
   subroutine collect(n,mddats)

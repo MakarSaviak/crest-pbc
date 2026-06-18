@@ -151,6 +151,8 @@ subroutine confscript_morehelp(flag)
     write (*,'(5x,''                     determined automatically for each step.'')')
     write (*,'(5x,''                     If not set by "-T", this number is read'')')
     write (*,'(5x,''                     from the OMP_NUM_THREADS global variable.'')')
+    write (*,'(5x,''-TMD <int>         : Override total CPUs(threads) for MD/MTD only'')')
+    write (*,'(5x,''                     while keeping "-T" for other workflow steps.'')')
     write (*,'(5x,''-g <string>        : use GBSA implicit solvent'')')
     write (*,'(5x,''                     for solvent <string>'')')
     write (*,'(5x,''-alpb <string>     : use ALPB implicit solvent'')')
@@ -929,6 +931,9 @@ subroutine crest_dry(env)
     write (*,'(/,1x,a)') 'Technical settings'
     write (*,'(2x,a,a)') 'working directory : ',trim(dumstr)
     write (*,'(2x,a,i0)') 'CPUs (threads)     (-T) : ',env%threads
+    if (env%threadsmdsetmanual) then
+      write (*,'(2x,a,i0)') 'CPUs for MD/MTD  (-TMD) : ',env%ThreadsMD
+    end if
 
   end if
 

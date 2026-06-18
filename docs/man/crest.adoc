@@ -89,6 +89,10 @@ If no such file is present as the first argument **crest** will automatically se
   Parallel settings are then determined automatically for each step.
   If not set by "`**-T**`", this number is read from the **OMP_NUM_THREADS** global variable.
 
+*-TMD* _int_::
+  Override the total number of CPUs (threads) to be used for MD/MTD sampling.
+  Other workflow steps continue to use the global **-T** thread budget.
+
 === Calculation options
 
 *-g* _string_::
