@@ -37,6 +37,11 @@ module metadynamics_module
   integer,parameter :: damp_heaviside_cv = 4
   integer,parameter,public :: cv_rmsd_static = 5
 
+  logical,save :: whole_graph_ready = .false.
+  integer,save :: cached_whole_nbonds = 0
+  logical,allocatable,save :: cached_whole_mask(:)
+  integer,allocatable,save :: cached_whole_bonds(:,:)
+
   !======================================================================================!
   !data object that contains settings and trackers for a single MTD potential
   type :: mtdpot
@@ -80,6 +85,9 @@ module metadynamics_module
   public :: mtd_ini
   public :: cv_dump
   public :: calc_mtd
+  public :: prepare_whole_bond_graph
+  public :: read_whole_bond_graph
+  public :: pbc_make_whole
 
 !========================================================================================!
 !========================================================================================!
@@ -197,34 +205,46 @@ contains  !> MODULE PROCEDURES START HERE
 !========================================================================================!
   subroutine setup_mtd_whole(mol,pot,pr)
 !**********************************************
-!* Set up first-pass PBC make-whole support for
-!* RMSD metadynamics. The bond graph is built
-!* once from the initial selected atoms.
+!* Set up PBC make-whole support for RMSD-MTD.
+!* The selected graph is read once from the
+!* freshly generated bondlengths file.
 !**********************************************
     implicit none
     type(coord),intent(in) :: mol
     type(mtdpot),intent(inout) :: pot
     logical,intent(in) :: pr
-
     if (.not.pot%whole) return
     if (.not.(pot%mtdtype == cv_rmsd.or.pot%mtdtype == cv_rmsd_static)) return
 
     if (.not.allocated(mol%lat)) then
-      pot%whole = .false.
-      if (pr) write (stdout,'(1x,a)') '*WARNING* -whole requested, but no lattice is available.'
-      return
+      write (stdout,'(1x,a)') 'ERROR: -whole requested, but no lattice is available.'
+      error stop
+    end if
+
+    if (.not.whole_graph_ready) then
+      write (stdout,'(1x,a)') 'ERROR: selected PBC make-whole graph was not prepared before MD.'
+      error stop
+    end if
+    if (size(cached_whole_mask) /= mol%nat) then
+      write (stdout,'(1x,a)') 'ERROR: selected PBC make-whole graph has the wrong system size.'
+      error stop
+    end if
+
+    if (.not.allocated(pot%atinclude)) then
+      allocate (pot%atinclude(mol%nat),source=cached_whole_mask)
+    else if (size(pot%atinclude) /= mol%nat.or. &
+    & any(pot%atinclude .neqv. cached_whole_mask)) then
+      write (stdout,'(1x,a)') 'ERROR: RMSD-MTD selection differs from the prepared PBC graph.'
+      error stop
     end if
 
     if (allocated(pot%whole_mask)) deallocate (pot%whole_mask)
-    allocate (pot%whole_mask(mol%nat),source=.true.)
-    if (allocated(pot%atinclude)) pot%whole_mask(:) = pot%atinclude(:)
-
-    call build_whole_bond_graph(mol,pot%whole_mask,pot%whole_bonds,pot%whole_nbonds)
-    if (pot%whole_nbonds < 1) then
-      pot%whole = .false.
-      if (pr) write (stdout,'(1x,a)') '*WARNING* -whole requested, but no selected bond graph was found.'
-      return
-    end if
+    allocate (pot%whole_mask(mol%nat),source=cached_whole_mask)
+    if (allocated(pot%whole_bonds)) deallocate (pot%whole_bonds)
+    allocate (pot%whole_bonds(2,cached_whole_nbonds),source=cached_whole_bonds)
+    pot%whole_nbonds = cached_whole_nbonds
+    if (pr) write (stdout,'(1x,a,i0,a,i0,a)') 'Loaded ',count(pot%whole_mask,1), &
+    & ' selected atoms and ',pot%whole_nbonds,' bonds for PBC make-whole.'
 
     if (pot%mtdtype == cv_rmsd_static .and. allocated(pot%cvxyz)) then
       block
@@ -242,52 +262,152 @@ contains  !> MODULE PROCEDURES START HERE
   end subroutine setup_mtd_whole
 
 !========================================================================================!
-  subroutine build_whole_bond_graph(mol,mask,bonds,nbonds)
-!**********************************************
-!* Build a fixed selected-atom covalent graph
-!* from minimum-image distances in the starting
-!* geometry. This intentionally does not parse
-!* bondlengths or gfnff_topo in the first pass.
-!**********************************************
+  subroutine prepare_whole_bond_graph(fname,nat,mask,nbonds,ncomponents,iostat)
+!***********************************************************************
+!* Parse and cache the selected graph once, before any MTD worker can  *
+!* change directories. Each mtdpot receives its own immutable copy.    *
+!***********************************************************************
     implicit none
-    type(coord),intent(in) :: mol
-    logical,intent(in) :: mask(mol%nat)
-    integer,allocatable,intent(inout) :: bonds(:,:)
-    integer,intent(out) :: nbonds
+    character(len=*),intent(in) :: fname
+    integer,intent(in) :: nat
+    logical,intent(in) :: mask(nat)
+    integer,intent(out) :: nbonds,ncomponents,iostat
+    integer,allocatable :: bonds(:,:)
 
-    integer :: i,j,nmax
-    real(wp) :: invlat(3,3)
-    real(wp) :: dx(3),mic(3),rcut
+    whole_graph_ready = .false.
+    cached_whole_nbonds = 0
+    if (allocated(cached_whole_mask)) deallocate (cached_whole_mask)
+    if (allocated(cached_whole_bonds)) deallocate (cached_whole_bonds)
+
+    call read_whole_bond_graph(fname,nat,mask,bonds,nbonds,ncomponents,iostat)
+    if (iostat /= 0) return
+    allocate (cached_whole_mask(nat),source=mask)
+    allocate (cached_whole_bonds(2,nbonds),source=bonds)
+    cached_whole_nbonds = nbonds
+    whole_graph_ready = .true.
+    deallocate (bonds)
+  end subroutine prepare_whole_bond_graph
+
+!========================================================================================!
+  subroutine read_whole_bond_graph(fname,nat,mask,bonds,nbonds,ncomponents,iostat)
+!***********************************************************************
+!* Read the lower-case distance records from a bondlengths-style file. *
+!* Only pairs fully contained in the supplied RMSD-MTD mask are kept.  *
+!***********************************************************************
+    implicit none
+    character(len=*),intent(in) :: fname
+    integer,intent(in) :: nat
+    logical,intent(in) :: mask(nat)
+    integer,allocatable,intent(inout) :: bonds(:,:)
+    integer,intent(out) :: nbonds,ncomponents,iostat
+
+    character(len=1024) :: line
+    integer :: i,j,k,ich,io,nmax,itmp
+    logical :: duplicate
     integer,allocatable :: tmp(:,:)
 
     nbonds = 0
+    ncomponents = 0
+    iostat = 0
     if (allocated(bonds)) deallocate (bonds)
-    if (count(mask,1) < 2) return
+    if (count(mask,1) < 2) then
+      iostat = 4
+      return
+    end if
 
-    call invert_lat3(mol%lat,invlat)
     nmax = count(mask,1)*(count(mask,1)-1)/2
     allocate (tmp(2,nmax),source=0)
 
-    do i = 1,mol%nat-1
-      if (.not.mask(i)) cycle
-      do j = i+1,mol%nat
-        if (.not.mask(j)) cycle
-        dx(:) = mol%xyz(:,j)-mol%xyz(:,i)
-        call minimum_image_displacement(dx,mol%lat,invlat,mic)
-        rcut = 1.25_wp*(whole_covrad(mol%at(i))+whole_covrad(mol%at(j)))
-        if (norm2(mic) <= rcut) then
-          nbonds = nbonds+1
-          tmp(1,nbonds) = i
-          tmp(2,nbonds) = j
+    open (newunit=ich,file=fname,status='old',action='read',iostat=io)
+    if (io /= 0) then
+      iostat = 1
+      deallocate (tmp)
+      return
+    end if
+    do
+      read (ich,'(a)',iostat=io) line
+      if (io /= 0) exit
+      line = adjustl(line)
+      if (index(line,'distance:') /= 1) cycle
+      read (line(10:),*,iostat=io) i,j
+      if (io /= 0) cycle
+      if (i < 1.or.i > nat.or.j < 1.or.j > nat.or.i == j) cycle
+      if (.not.mask(i).or..not.mask(j)) cycle
+      if (i > j) then
+        itmp = i
+        i = j
+        j = itmp
+      end if
+      duplicate = .false.
+      do k = 1,nbonds
+        if (tmp(1,k) == i.and.tmp(2,k) == j) then
+          duplicate = .true.
+          exit
         end if
       end do
+      if (duplicate) cycle
+      nbonds = nbonds+1
+      tmp(1,nbonds) = i
+      tmp(2,nbonds) = j
     end do
+    close (ich)
 
-    if (nbonds > 0) then
-      allocate (bonds(2,nbonds),source=tmp(:,1:nbonds))
+    if (nbonds < 1) then
+      iostat = 2
+      deallocate (tmp)
+      return
     end if
+    call count_whole_components(nat,mask,tmp(:,1:nbonds),nbonds,ncomponents)
+    if (ncomponents /= 1) then
+      iostat = 3
+      deallocate (tmp)
+      return
+    end if
+    allocate (bonds(2,nbonds),source=tmp(:,1:nbonds))
     deallocate (tmp)
-  end subroutine build_whole_bond_graph
+  end subroutine read_whole_bond_graph
+
+!========================================================================================!
+  subroutine count_whole_components(nat,mask,bonds,nbonds,ncomponents)
+    implicit none
+    integer,intent(in) :: nat,nbonds
+    logical,intent(in) :: mask(nat)
+    integer,intent(in) :: bonds(2,nbonds)
+    integer,intent(out) :: ncomponents
+
+    logical,allocatable :: seen(:)
+    integer,allocatable :: queue(:)
+    integer :: seed,head,tail,i,j,b
+
+    ncomponents = 0
+    allocate (seen(nat),source=.false.)
+    allocate (queue(nat),source=0)
+    do seed = 1,nat
+      if (.not.mask(seed).or.seen(seed)) cycle
+      ncomponents = ncomponents+1
+      head = 1
+      tail = 1
+      queue(tail) = seed
+      seen(seed) = .true.
+      do while (head <= tail)
+        i = queue(head)
+        head = head+1
+        do b = 1,nbonds
+          j = 0
+          if (bonds(1,b) == i) then
+            j = bonds(2,b)
+          else if (bonds(2,b) == i) then
+            j = bonds(1,b)
+          end if
+          if (j < 1.or.seen(j)) cycle
+          seen(j) = .true.
+          tail = tail+1
+          queue(tail) = j
+        end do
+      end do
+    end do
+    deallocate (queue,seen)
+  end subroutine count_whole_components
 
 !========================================================================================!
   subroutine pbc_make_whole(nat,xyz,lat,mask,bonds,nbonds,whole)
@@ -388,35 +508,6 @@ contains  !> MODULE PROCEDURES START HERE
     invlat(3,2) = -(lat(1,1)*lat(3,2)-lat(1,2)*lat(3,1))/det
     invlat(3,3) =  (lat(1,1)*lat(2,2)-lat(1,2)*lat(2,1))/det
   end subroutine invert_lat3
-
-!========================================================================================!
-  pure real(wp) function whole_covrad(at)
-!**********************************************
-!* Compact covalent radii table in Bohr for
-!* first-pass bond perception.
-!**********************************************
-    implicit none
-    integer,intent(in) :: at
-    real(wp) :: rad
-    select case (at)
-    case (1);  rad = 0.31_wp
-    case (5);  rad = 0.84_wp
-    case (6);  rad = 0.76_wp
-    case (7);  rad = 0.71_wp
-    case (8);  rad = 0.66_wp
-    case (9);  rad = 0.57_wp
-    case (14); rad = 1.11_wp
-    case (15); rad = 1.07_wp
-    case (16); rad = 1.05_wp
-    case (17); rad = 1.02_wp
-    case (30); rad = 1.22_wp
-    case (35); rad = 1.20_wp
-    case (53); rad = 1.39_wp
-    case default
-      rad = 1.00_wp
-    end select
-    whole_covrad = rad*aatoau
-  end function whole_covrad
 
 !========================================================================================!
   subroutine mtd_deallocate(self)

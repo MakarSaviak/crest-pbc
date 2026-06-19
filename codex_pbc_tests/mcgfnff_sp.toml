@@ -2,7 +2,7 @@ input = "methane_pbc.extxyz"
 runtype = "singlepoint"
 mcgfnff = true
 nci_wall = false
-whole = true
+whole = false
 
 [[calculation.level]]
 method = "gfnff"

@@ -45,6 +45,7 @@ module dynamics_module
 
   !>-- REEXPORTS from metadynamics_module
   public :: mtdpot,mtd_ini,cv_dump,calc_mtd
+  public :: prepare_whole_bond_graph
   public :: cv_std_mtd,cv_rmsd,cv_rmsd_static
 
   !>-- REEXPORTS from shake_module

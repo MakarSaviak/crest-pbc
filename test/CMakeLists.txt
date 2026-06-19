@@ -8,6 +8,7 @@ set(
   "CN"
   "optimization"
   "molecular_dynamics"
+  "pbc_whole"
   "getsym"
   "irmsd"
   "graphs"

@@ -36,7 +36,7 @@
 !>  nra  -  number of command line args in "arg"
 !>-----------------------------------------------
 subroutine parseflags(env,arg,nra)
-  use iso_fortran_env,wp => real64
+  use iso_fortran_env,wp => real64,stderr => error_unit
   use crest_data
   use crest_calculator
   use iomod
@@ -64,6 +64,9 @@ subroutine parseflags(env,arg,nra)
   character(len=:),allocatable :: argument
   logical,allocatable :: processedarg(:)
   logical,allocatable :: atlist(:)
+  logical,allocatable :: wholemask(:)
+  logical :: wholemask_found
+  integer :: wholeio,wholenbonds,wholecomponents
   character(len=:),allocatable :: arg1,arg2,arg3
   character(len=:),allocatable :: hybrid_quality,hybrid_workhorse
   character(len=4) :: hybrid_mode
@@ -3085,8 +3088,26 @@ subroutine parseflags(env,arg,nra)
     write (stdout,*)
   end if
 
+!>--- deterministic bond graph source for PBC RMSD-MTD
+  if (env%pbcwhole) then
+    inquire (file='coord',exist=ex)
+    if (.not.ex) then
+      write (stderr,'(a)') 'ERROR: -whole requires a freshly generated coord file.'
+      error stop
+    end if
+    inquire (file='bondlengths',exist=ex)
+    if (ex) call remove('bondlengths')
+    call autoBondConstraint_withEZ('coord',env%forceconst,env%wbofile)
+    inquire (file='bondlengths',exist=ex)
+    if (.not.ex) then
+      write (stderr,'(a)') 'ERROR: failed to generate bondlengths for PBC RMSD-MTD.'
+      error stop
+    end if
+    write (stdout,'(1x,a)') 'Generated fresh bondlengths from current coord for PBC RMSD-MTD.'
+  end if
+
 !>--- automatic bond constraint setup
-  if (bondconst) then
+  if (bondconst.and..not.env%pbcwhole) then
     select case (ctype)
     case (1)
       call autoBondConstraint('coord',env%forceconst,env%wbofile)
@@ -3106,6 +3127,55 @@ subroutine parseflags(env,arg,nra)
 
 !>--- internal constraint check-up
   call internal_constraint_repair(env,bondconst)
+
+!>--- parse and validate the selected graph before any MTD worker changes directories
+  if (env%pbcwhole) then
+    allocate (wholemask(env%nat),source=.false.)
+    wholemask_found = .false.
+    if (allocated(env%mddat%mtd)) then
+      do i = 1,env%mddat%npot
+        if (.not.env%mddat%mtd(i)%whole) cycle
+        if (.not.(env%mddat%mtd(i)%mtdtype == cv_rmsd.or. &
+        & env%mddat%mtd(i)%mtdtype == cv_rmsd_static)) cycle
+        if (.not.allocated(env%mddat%mtd(i)%atinclude)) cycle
+        if (.not.wholemask_found) then
+          wholemask = env%mddat%mtd(i)%atinclude
+          wholemask_found = .true.
+        else if (any(wholemask .neqv. env%mddat%mtd(i)%atinclude)) then
+          write (stderr,'(a)') 'ERROR: -whole requires one consistent RMSD-MTD atom selection.'
+          error stop
+        end if
+      end do
+    end if
+    if (.not.wholemask_found.and.allocated(env%includeRMSD)) then
+      if (count(env%includeRMSD == 1) < env%nat) then
+        wholemask = (env%includeRMSD == 1)
+        wholemask_found = .true.
+      end if
+    end if
+    if (.not.wholemask_found) then
+      write (stderr,'(a)') 'ERROR: -whole requires an explicit RMSD-MTD atom selection.'
+      error stop
+    end if
+    call prepare_whole_bond_graph('bondlengths',env%nat,wholemask, &
+    & wholenbonds,wholecomponents,wholeio)
+    if (wholeio /= 0) then
+      select case (wholeio)
+      case (1)
+        write (stderr,'(a)') 'ERROR: fresh bondlengths is unavailable for -whole.'
+      case (2)
+        write (stderr,'(a)') 'ERROR: no selected bonds were found in bondlengths.'
+      case (3)
+        write (stderr,'(a,i0,a)') 'ERROR: selected -whole graph has ',wholecomponents,' components.'
+      case default
+        write (stderr,'(a)') 'ERROR: invalid selected atom mask for -whole.'
+      end select
+      error stop
+    end if
+    write (stdout,'(1x,a,i0,a,i0,a)') 'Prepared ',count(wholemask,1), &
+    & ' selected atoms and ',wholenbonds,' bonds for PBC RMSD-MTD.'
+    deallocate (wholemask)
+  end if
 
 !========================================================================================!
 !>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>!

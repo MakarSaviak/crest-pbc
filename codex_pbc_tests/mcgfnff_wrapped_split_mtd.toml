@@ -1,4 +1,4 @@
-input = "methane_pbc_wrapped_split.extxyz"
+input = "methane_pbc.extxyz"
 runtype = "dynamics"
 mcgfnff = true
 nci_wall = false
@@ -19,6 +19,7 @@ printstep = 1
 [dynamics.meta]
 type = "rmsd"
 whole = true
+includermsd = "1-5"
 kpush = 0.001
 alpha = 1.0
 dump_fs = 1.0
