@@ -181,6 +181,7 @@ module calc_type
 
 !>--- GFN-FF data
     type(gfnff_data),allocatable :: ff_dat
+    logical :: mcgfnff = .false.
 
 !>--- libpvol data
     integer  :: pvmodel = 1            !> libpvol model type (0=XHCFF, 1=PV)
@@ -1282,6 +1283,7 @@ contains  !>--- Module routines start here
     self%saveint    = src%saveint
     self%ceh_guess  = src%ceh_guess
     self%restart    = src%restart
+    self%mcgfnff    = src%mcgfnff
 
     self%ngrid       = src%ngrid
     self%extpressure = src%extpressure
@@ -1441,7 +1443,11 @@ contains  !>--- Module routines start here
     case (jobtype%gfn0occ)
       self%shortflag = 'GFN0-xTB*'
     case (jobtype%gfnff)
-      self%shortflag = 'GFN-FF'
+      if (self%mcgfnff) then
+        self%shortflag = 'MC-GFN-FF'
+      else
+        self%shortflag = 'GFN-FF'
+      end if
     case (jobtype%libpvol)
       self%shortflag = 'libpvol'
     case (jobtype%lj)
@@ -1532,6 +1538,14 @@ contains  !>--- Module routines start here
       case (xtblvl%ceh)
         write (iunit,fmt4) 'Charge Extended Hückel (CEH) model'
       end select
+    end if
+    if (self%id == jobtype%gfnff) then
+      write (atmp,*) 'MC-GFN-FF'
+      if (self%mcgfnff) then
+        write (iunit,fmt3) atmp,'yes'
+      else
+        write (iunit,fmt3) atmp,'no'
+      end if
     end if
 
     !> MLIP (fmlip-relay) backend details — print only what is meaningful
@@ -1786,6 +1800,9 @@ contains  !>--- Module routines start here
     select case (trim(levelstring))
     case ('gfnff','--gff','--gfnff')
       self%id = jobtype%gfnff
+    case ('mcgfnff','--mcgfnff','mc-gfnff','mc-gfn-ff')
+      self%id = jobtype%gfnff
+      self%mcgfnff = .true.
     case ('gfn0','--gfn0')
       self%id = jobtype%gfn0
     case ('gfn2','--gfn2')

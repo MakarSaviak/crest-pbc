@@ -1,0 +1,17 @@
+input = "methane_pbc_wrapped_split.extxyz"
+runtype = "dynamics"
+mcgfnff = true
+nci_wall = false
+whole = true
+
+[[calculation.level]]
+method = "gfnff"
+mcgfnff = true
+
+[dynamics]
+length_ps = 0.002
+tstep = 1.0
+temperature = 300.0
+dump = 1.0
+shake = 0
+printstep = 1

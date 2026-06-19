@@ -328,6 +328,7 @@ module crest_data
     integer :: nat
     integer,allocatable :: at(:)
     real(wp),allocatable :: xyz(:,:)
+    real(wp),allocatable :: lat(:,:)
     integer :: ichrg = 0
     integer :: uhf = 0
     integer :: ntopo = 0
@@ -615,6 +616,9 @@ module crest_data
     logical :: multilevelopt = .true. !> perform the multileveloptimization
     logical :: newcregen = .false.   !> use the CREGEN rewrite
     logical :: NCI = .false.         !> NCI special usage
+    logical :: disable_nci_wall = .false. !> skip automatic NCI/wall setup
+    logical :: mcgfnff = .false.     !> use MC-GFN-FF parametrisation for GFN-FF
+    logical :: pbcwhole = .false.    !> make selected PBC RMSD-MTD atoms whole
     logical :: niceprint = .false.   !> make a nice progress-bar printout
     logical :: noconst = .false.     !> no constrain of solute during QCG Growth
     logical :: onlyZsort = .false.   !> do only the ZSORT routine ?
@@ -922,6 +926,7 @@ contains  !> MODULE PROCEDURES START HERE
     integer,intent(in) :: nat
     if (allocated(self%at)) deallocate (self%at)
     if (allocated(self%xyz)) deallocate (self%xyz)
+    if (allocated(self%lat)) deallocate (self%lat)
     allocate (self%at(nat),source=0)
     allocate (self%xyz(3,nat),source=0.0_wp)
   end subroutine ref_init
@@ -961,6 +966,7 @@ contains  !> MODULE PROCEDURES START HERE
     mol%nat = self%nat
     if (allocated(self%at)) mol%at = self%at
     if (allocated(self%xyz)) mol%xyz = self%xyz
+    if (allocated(self%lat)) mol%lat = self%lat
     mol%chrg = self%ichrg
     mol%uhf = self%uhf
     return
@@ -974,6 +980,7 @@ contains  !> MODULE PROCEDURES START HERE
     self%nat = mol%nat
     self%at = mol%at
     self%xyz = mol%xyz
+    if (allocated(mol%lat)) self%lat = mol%lat
     self%ichrg = mol%chrg
     self%uhf = mol%uhf
     return
@@ -1431,6 +1438,9 @@ contains  !> MODULE PROCEDURES START HERE
     self%multilevelopt  = src%multilevelopt
     self%newcregen      = src%newcregen
     self%NCI            = src%NCI
+    self%disable_nci_wall = src%disable_nci_wall
+    self%mcgfnff        = src%mcgfnff
+    self%pbcwhole       = src%pbcwhole
     self%niceprint      = src%niceprint
     self%noconst        = src%noconst
     self%onlyZsort      = src%onlyZsort

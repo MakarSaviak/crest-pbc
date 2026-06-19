@@ -55,7 +55,7 @@ contains    !> MODULE PROCEDURES START HERE
     if (allocated(mol%lat)) then
       write (iunit,'(a)') '# Lattice vectors (in Ångström)'
       do i = 1,3
-        write (iunit,'(3F16.8)') mol%lat(1:3,i)
+        write (iunit,'(3F16.8)') mol%lat(1:3,i)*0.52917721092_wp
       end do
     end if
 

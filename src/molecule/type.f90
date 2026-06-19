@@ -435,7 +435,7 @@ contains  !> MODULE PROCEDURES START HERE
     end if
     if (allocated(self%lat)) then
       write (iunit,'(a)',advance='no') 'Lattice="'
-      write (iunit,'(9f15.8)',advance='no') reshape(self%lat, [9])
+      write (iunit,'(9f15.8)',advance='no') reshape(self%lat*autoaa, [9])
       write (iunit,'(a)',advance='no') '"  pbc="T T T"  '
     end if
     if (allocated(self%gradient)) then

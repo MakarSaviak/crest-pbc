@@ -259,6 +259,9 @@ contains !> MODULE PROCEDURES START HERE
         job%id = jobtype%gfn0occ
       case ('gfnff','gff','gfn-ff')
         job%id = jobtype%gfnff
+      case ('mcgfnff','mc-gfnff','mc-gfn-ff')
+        job%id = jobtype%gfnff
+        job%mcgfnff = .true.
       case ('pvol','libpvol','pv')
         job%id = jobtype%libpvol
       case ('gxtb','g-xtb','gxtb-xtb')
@@ -554,6 +557,8 @@ contains !> MODULE PROCEDURES START HERE
       job%ceh_guess = kv%value_b
     case ('spin_polarized')
       job%spin_polarized = kv%value_b
+    case ('mcgfnff','mc_gfnff')
+      job%mcgfnff = kv%value_b
 
     case default
       !>--- keyword not correctly read/found
@@ -1407,6 +1412,8 @@ contains !> MODULE PROCEDURES START HERE
     case ('biasfile')
       mtd%mtdtype = cv_rmsd_static
       mtd%biasfile = kv%value_c
+    case ('whole','pbc_whole')
+      mtd%whole = kv%value_b
 
     case ('includermsd','atlist+')
       nat = env%ref%nat
@@ -1428,6 +1435,9 @@ contains !> MODULE PROCEDURES START HERE
       rd = .false.
       return
     end select
+    if (env%pbcwhole.and.(mtd%mtdtype == cv_rmsd.or.mtd%mtdtype == cv_rmsd_static)) then
+      mtd%whole = .true.
+    end if
 
   end subroutine parse_metadyn_auto
 

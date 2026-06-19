@@ -549,6 +549,7 @@ subroutine crest_init_multimd_smtd(env,mddats,nsim,biasfile)
   mtdtmp%cvdump_fs = huge(dum1)   !> set to large to avoid new structure dumps
   mtdtmp%cvdumpstep = huge(idum1) !> same
   mtdtmp%mtdtype = cv_rmsd_static  !> set the correct bias type
+  mtdtmp%whole = env%pbcwhole
 
 !>--- load static bias stuctures
   inquire (file=biasfile,exist=ex)
@@ -589,4 +590,3 @@ subroutine crest_init_multimd_smtd(env,mddats,nsim,biasfile)
   deallocate (eread,at,xyz)
   return
 end subroutine crest_init_multimd_smtd
-

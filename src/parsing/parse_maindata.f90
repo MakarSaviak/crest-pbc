@@ -324,6 +324,14 @@ contains   !> MODULE PROCEDURES START HERE
 
     case ('omp_nested')
       env%omp_allow_nested = val
+    case ('whole','pbc_whole')
+      env%pbcwhole = val
+    case ('nci_wall')
+      env%disable_nci_wall = .not.val
+    case ('nonciwall','nowall')
+      env%disable_nci_wall = val
+    case ('mcgfnff','mc_gfnff')
+      env%mcgfnff = val
     case default
       rd = .false.
     end select

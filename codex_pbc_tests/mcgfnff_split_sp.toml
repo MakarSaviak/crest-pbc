@@ -1,0 +1,9 @@
+input = "methane_pbc_split.extxyz"
+runtype = "singlepoint"
+mcgfnff = true
+nci_wall = false
+whole = true
+
+[[calculation.level]]
+method = "gfnff"
+mcgfnff = true

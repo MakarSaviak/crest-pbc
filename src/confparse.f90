@@ -256,6 +256,9 @@ subroutine parseflags(env,arg,nra)
   ctype = 0                !> bond constraint type
 
   env%NCI = .false.      !> use specialized NCI mode?
+  env%disable_nci_wall = .false.
+  env%mcgfnff = .false.
+  env%pbcwhole = .false.
   env%potscal = 1.0d0    !> scale automatically set wall potential by this factor
 
 !>--- get CHRG and UHF if the respective files are present
@@ -1385,6 +1388,30 @@ subroutine parseflags(env,arg,nra)
         processedarg(i) = .true.
         env%keepModef = .true.
 
+      case ('-nonciwall','--nonciwall','-nowall','--nowall')
+        processedarg(i) = .true.
+        env%disable_nci_wall = .true.
+        write (stdout,'(2x,a,1x,a)') trim(arg(i)),' : disabling automatic NCI/wall setup.'
+
+      case ('-whole','--whole')
+        processedarg(i) = .true.
+        env%pbcwhole = .true.
+        if (i+1 .le. nra) then
+          select case (lowercase(trim(arg1)))
+          case ('true','t','yes','y','on','1')
+            env%pbcwhole = .true.
+            processedarg(i+1) = .true.
+          case ('false','f','no','n','off','0')
+            env%pbcwhole = .false.
+            processedarg(i+1) = .true.
+          end select
+        end if
+        if (env%pbcwhole) then
+          write (stdout,'(2x,a,1x,a)') trim(arg(i)),' : PBC make-whole preprocessing enabled for RMSD-MTD.'
+        else
+          write (stdout,'(2x,a,1x,a)') trim(arg(i)),' : PBC make-whole preprocessing disabled for RMSD-MTD.'
+        end if
+
       case ('-opt','-optlev')             !> settings for optimization level of GFN-xTB
         processedarg(i) = .true.
         if (i+1 .le. nra) then
@@ -1436,6 +1463,12 @@ subroutine parseflags(env,arg,nra)
         env%gfnver = '--gxtb'
         write (stdout,'(2x,a,'' : Use of g-xTB requested.'')') env%gfnver
         call gxtb_syscall_warning()
+
+      case ('-mcgfnff','--mcgfnff','-mc-gfnff','--mc-gfnff')
+        processedarg(i) = .true.
+        env%gfnver = '--gff'
+        env%mcgfnff = .true.
+        write (stdout,'(2x,a,'' : Use of MC-GFN-FF requested.'')') '--mcgfnff'
 
       case ('-gxtb_dev')
         processedarg(i) = .true.
@@ -3041,7 +3074,7 @@ subroutine parseflags(env,arg,nra)
   if (env%potscal < 1.0d-5) env%potscal = 1.0_wp
 
 !>--- automatic wall potential for the LEGACY version
-  if ((env%NCI.or.env%wallsetup).and.env%legacy) then
+  if ((env%NCI .or. env%wallsetup) .and. env%legacy .and. .not.env%disable_nci_wall) then
     call wallpot(env)
     if (env%wallsetup) then
       write (stdout,'(2x,a)') 'Automatically generated ellipsoide potential:'
@@ -3437,7 +3470,7 @@ subroutine inputcoords(env,arg)
   logical :: ex,ex2
   character(len=:),allocatable :: inputfile
   character(len=:),allocatable :: arg2
-  type(coord) :: mol
+  type(coord) :: mol,mollat
   type(zmolecule) :: zmol
   integer :: i,idiff
   integer,allocatable :: tmpinclude(:)
@@ -3485,6 +3518,11 @@ subroutine inputcoords(env,arg)
 !>-- after this point there should always be an coord file present
   if (.not.allocated(env%inputcoords)) env%inputcoords = 'coord'
   call mol%open('coord')
+  if (i == coordtype%extxyz) then
+    call mollat%open(inputfile)
+    if (allocated(mollat%lat)) mol%lat = mollat%lat
+    call mollat%deallocate()
+  end if
 !>-- shift to CMA and/or align according to rot.const. We have to be careful about this.
   if (any((/crest_sp,crest_optimize,crest_numhessian,crest_trialopt, &
   &         crest_ensemblesp,crest_ensemblehess/) == env%crestver)) then
@@ -3508,6 +3546,7 @@ subroutine inputcoords(env,arg)
   env%ref%nat = mol%nat
   env%ref%at = mol%at
   env%ref%xyz = mol%xyz
+  if (allocated(mol%lat)) env%ref%lat = mol%lat
   env%ref%ichrg = env%chrg
   env%ref%uhf = env%uhf
 !>-- topology save

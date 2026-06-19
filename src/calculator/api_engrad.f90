@@ -340,7 +340,11 @@ contains    !> MODULE PROCEDURES START HERE
         calc%ff_dat%refcharges = tmpchrgs
       end if
 
-      call gfnff_api_setup(mol,calc%chrg,calc%ff_dat,iostatus,pr,calc%prch)
+      if (calc%mcgfnff) then
+        call gfnff_api_setup(mol,calc%chrg,calc%ff_dat,iostatus,pr,calc%prch,version=4)
+      else
+        call gfnff_api_setup(mol,calc%chrg,calc%ff_dat,iostatus,pr,calc%prch)
+      end if
 
       if (calc%ceh_guess) then
         call remove(tmpchrgs)

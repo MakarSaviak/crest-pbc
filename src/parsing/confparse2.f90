@@ -166,7 +166,7 @@ subroutine internal_constraint_repair(env,bondconst)
   end if
 
 !>--- wall potential setup for calculator version
-  if (env%NCI.or.env%wallsetup) then
+  if ((env%NCI .or. env%wallsetup) .and. .not.env%disable_nci_wall) then
     write (stdout,'("> ",a)') 'Generating logfermi wall potential for the system.'
     if (allocated(env%potatlist)) then
       write (stdout,'("> ",a,f8.3,2x,a,f8.3,a,a)') 'wscal=',env%potscal, &

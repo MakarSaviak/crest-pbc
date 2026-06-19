@@ -103,6 +103,7 @@ subroutine trialMD_calculator(env)
   MTD%kpush = prefac
   MTD%alpha = alpha
   MTD%mtdtype = cv_rmsd
+  MTD%whole = env%pbcwhole
   MTD%cvdump_fs = 550.0_wp
   call MDSTART%add(MTD)
   pr = .false. !> supress stdout printout of MD

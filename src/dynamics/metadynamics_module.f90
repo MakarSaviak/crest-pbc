@@ -60,6 +60,10 @@ module metadynamics_module
     character(len=:),allocatable :: biasfile !> specify a file from which the bias is obtained
     logical,allocatable :: atinclude(:) !specify atoms to include in RMSD potentail
     real(wp),allocatable :: cvxyz(:,:,:) !ensemble of CV structures to calculate RMSD from
+    logical :: whole = .false. !> repair selected PBC atoms before RMSD-MTD
+    integer :: whole_nbonds = 0
+    logical,allocatable :: whole_mask(:)
+    integer,allocatable :: whole_bonds(:,:) !> selected-atom bond graph for make-whole
 
     !>--- damping of the MTD potential
     integer :: damptype = 0
@@ -179,6 +183,8 @@ contains  !> MODULE PROCEDURES START HERE
 
     end select
 
+    call setup_mtd_whole(mol,pot,pr)
+
     !>--- printout
     if (pr) then
       call pot%info(stdout)
@@ -189,6 +195,230 @@ contains  !> MODULE PROCEDURES START HERE
   end subroutine mtd_ini
 
 !========================================================================================!
+  subroutine setup_mtd_whole(mol,pot,pr)
+!**********************************************
+!* Set up first-pass PBC make-whole support for
+!* RMSD metadynamics. The bond graph is built
+!* once from the initial selected atoms.
+!**********************************************
+    implicit none
+    type(coord),intent(in) :: mol
+    type(mtdpot),intent(inout) :: pot
+    logical,intent(in) :: pr
+
+    if (.not.pot%whole) return
+    if (.not.(pot%mtdtype == cv_rmsd.or.pot%mtdtype == cv_rmsd_static)) return
+
+    if (.not.allocated(mol%lat)) then
+      pot%whole = .false.
+      if (pr) write (stdout,'(1x,a)') '*WARNING* -whole requested, but no lattice is available.'
+      return
+    end if
+
+    if (allocated(pot%whole_mask)) deallocate (pot%whole_mask)
+    allocate (pot%whole_mask(mol%nat),source=.true.)
+    if (allocated(pot%atinclude)) pot%whole_mask(:) = pot%atinclude(:)
+
+    call build_whole_bond_graph(mol,pot%whole_mask,pot%whole_bonds,pot%whole_nbonds)
+    if (pot%whole_nbonds < 1) then
+      pot%whole = .false.
+      if (pr) write (stdout,'(1x,a)') '*WARNING* -whole requested, but no selected bond graph was found.'
+      return
+    end if
+
+    if (pot%mtdtype == cv_rmsd_static .and. allocated(pot%cvxyz)) then
+      block
+        integer :: i
+        real(wp),allocatable :: xyzwhole(:,:)
+        allocate (xyzwhole(3,size(pot%cvxyz,2)),source=0.0_wp)
+        do i = 1,size(pot%cvxyz,3)
+          call pbc_make_whole(size(pot%cvxyz,2),pot%cvxyz(:,:,i),mol%lat, &
+          & pot%whole_mask,pot%whole_bonds,pot%whole_nbonds,xyzwhole)
+          pot%cvxyz(:,:,i) = xyzwhole(:,:)
+        end do
+        deallocate (xyzwhole)
+      end block
+    end if
+  end subroutine setup_mtd_whole
+
+!========================================================================================!
+  subroutine build_whole_bond_graph(mol,mask,bonds,nbonds)
+!**********************************************
+!* Build a fixed selected-atom covalent graph
+!* from minimum-image distances in the starting
+!* geometry. This intentionally does not parse
+!* bondlengths or gfnff_topo in the first pass.
+!**********************************************
+    implicit none
+    type(coord),intent(in) :: mol
+    logical,intent(in) :: mask(mol%nat)
+    integer,allocatable,intent(inout) :: bonds(:,:)
+    integer,intent(out) :: nbonds
+
+    integer :: i,j,nmax
+    real(wp) :: invlat(3,3)
+    real(wp) :: dx(3),mic(3),rcut
+    integer,allocatable :: tmp(:,:)
+
+    nbonds = 0
+    if (allocated(bonds)) deallocate (bonds)
+    if (count(mask,1) < 2) return
+
+    call invert_lat3(mol%lat,invlat)
+    nmax = count(mask,1)*(count(mask,1)-1)/2
+    allocate (tmp(2,nmax),source=0)
+
+    do i = 1,mol%nat-1
+      if (.not.mask(i)) cycle
+      do j = i+1,mol%nat
+        if (.not.mask(j)) cycle
+        dx(:) = mol%xyz(:,j)-mol%xyz(:,i)
+        call minimum_image_displacement(dx,mol%lat,invlat,mic)
+        rcut = 1.25_wp*(whole_covrad(mol%at(i))+whole_covrad(mol%at(j)))
+        if (norm2(mic) <= rcut) then
+          nbonds = nbonds+1
+          tmp(1,nbonds) = i
+          tmp(2,nbonds) = j
+        end if
+      end do
+    end do
+
+    if (nbonds > 0) then
+      allocate (bonds(2,nbonds),source=tmp(:,1:nbonds))
+    end if
+    deallocate (tmp)
+  end subroutine build_whole_bond_graph
+
+!========================================================================================!
+  subroutine pbc_make_whole(nat,xyz,lat,mask,bonds,nbonds,whole)
+!**********************************************
+!* Reconstruct selected atoms by walking the
+!* fixed bond graph with minimum-image bonded
+!* displacements. Unselected atoms are copied.
+!**********************************************
+    implicit none
+    integer,intent(in) :: nat,nbonds
+    real(wp),intent(in) :: xyz(3,nat)
+    real(wp),intent(in) :: lat(3,3)
+    logical,intent(in) :: mask(nat)
+    integer,intent(in) :: bonds(2,nbonds)
+    real(wp),intent(out) :: whole(3,nat)
+
+    logical,allocatable :: seen(:)
+    integer,allocatable :: queue(:)
+    integer :: head,tail,seed,i,j,b
+    real(wp) :: invlat(3,3),dx(3),mic(3)
+
+    whole(:,:) = xyz(:,:)
+    if (nbonds < 1.or.count(mask,1) < 2) return
+
+    call invert_lat3(lat,invlat)
+    allocate (seen(nat),source=.false.)
+    allocate (queue(nat),source=0)
+
+    do seed = 1,nat
+      if (.not.mask(seed).or.seen(seed)) cycle
+      head = 1
+      tail = 1
+      queue(tail) = seed
+      seen(seed) = .true.
+      whole(:,seed) = xyz(:,seed)
+
+      do while (head <= tail)
+        i = queue(head)
+        head = head+1
+        do b = 1,nbonds
+          j = 0
+          if (bonds(1,b) == i) then
+            j = bonds(2,b)
+          else if (bonds(2,b) == i) then
+            j = bonds(1,b)
+          end if
+          if (j < 1.or.seen(j)) cycle
+          dx(:) = xyz(:,j)-xyz(:,i)
+          call minimum_image_displacement(dx,lat,invlat,mic)
+          whole(:,j) = whole(:,i)+mic(:)
+          seen(j) = .true.
+          tail = tail+1
+          queue(tail) = j
+        end do
+      end do
+    end do
+
+    deallocate (queue,seen)
+  end subroutine pbc_make_whole
+
+!========================================================================================!
+  subroutine minimum_image_displacement(dx,lat,invlat,mic)
+    implicit none
+    real(wp),intent(in) :: dx(3),lat(3,3),invlat(3,3)
+    real(wp),intent(out) :: mic(3)
+    real(wp) :: df(3)
+    integer :: k
+    df(:) = matmul(invlat,dx)
+    do k = 1,3
+      df(k) = df(k)-anint(df(k))
+    end do
+    mic(:) = matmul(lat,df)
+  end subroutine minimum_image_displacement
+
+!========================================================================================!
+  subroutine invert_lat3(lat,invlat)
+    implicit none
+    real(wp),intent(in) :: lat(3,3)
+    real(wp),intent(out) :: invlat(3,3)
+    real(wp) :: det
+
+    det = lat(1,1)*(lat(2,2)*lat(3,3)-lat(2,3)*lat(3,2)) &
+    &   - lat(1,2)*(lat(2,1)*lat(3,3)-lat(2,3)*lat(3,1)) &
+    &   + lat(1,3)*(lat(2,1)*lat(3,2)-lat(2,2)*lat(3,1))
+
+    if (abs(det) <= epsilon(det)) then
+      invlat = 0.0_wp
+      return
+    end if
+
+    invlat(1,1) =  (lat(2,2)*lat(3,3)-lat(2,3)*lat(3,2))/det
+    invlat(1,2) = -(lat(1,2)*lat(3,3)-lat(1,3)*lat(3,2))/det
+    invlat(1,3) =  (lat(1,2)*lat(2,3)-lat(1,3)*lat(2,2))/det
+    invlat(2,1) = -(lat(2,1)*lat(3,3)-lat(2,3)*lat(3,1))/det
+    invlat(2,2) =  (lat(1,1)*lat(3,3)-lat(1,3)*lat(3,1))/det
+    invlat(2,3) = -(lat(1,1)*lat(2,3)-lat(1,3)*lat(2,1))/det
+    invlat(3,1) =  (lat(2,1)*lat(3,2)-lat(2,2)*lat(3,1))/det
+    invlat(3,2) = -(lat(1,1)*lat(3,2)-lat(1,2)*lat(3,1))/det
+    invlat(3,3) =  (lat(1,1)*lat(2,2)-lat(1,2)*lat(2,1))/det
+  end subroutine invert_lat3
+
+!========================================================================================!
+  pure real(wp) function whole_covrad(at)
+!**********************************************
+!* Compact covalent radii table in Bohr for
+!* first-pass bond perception.
+!**********************************************
+    implicit none
+    integer,intent(in) :: at
+    real(wp) :: rad
+    select case (at)
+    case (1);  rad = 0.31_wp
+    case (5);  rad = 0.84_wp
+    case (6);  rad = 0.76_wp
+    case (7);  rad = 0.71_wp
+    case (8);  rad = 0.66_wp
+    case (9);  rad = 0.57_wp
+    case (14); rad = 1.11_wp
+    case (15); rad = 1.07_wp
+    case (16); rad = 1.05_wp
+    case (17); rad = 1.02_wp
+    case (30); rad = 1.22_wp
+    case (35); rad = 1.20_wp
+    case (53); rad = 1.39_wp
+    case default
+      rad = 1.00_wp
+    end select
+    whole_covrad = rad*aatoau
+  end function whole_covrad
+
+!========================================================================================!
   subroutine mtd_deallocate(self)
 !**********************************************
 !* subroutine mtd_deallocate
@@ -197,6 +427,8 @@ contains  !> MODULE PROCEDURES START HERE
     class(mtdpot) :: self
     if (allocated(self%cvxyz)) deallocate (self%cvxyz)
     if (allocated(self%atinclude)) deallocate (self%atinclude)
+    if (allocated(self%whole_mask)) deallocate (self%whole_mask)
+    if (allocated(self%whole_bonds)) deallocate (self%whole_bonds)
     if (allocated(self%cv)) deallocate (self%cv)
     if (allocated(self%cvgrd)) deallocate (self%cvgrd)
 
@@ -209,6 +441,8 @@ contains  !> MODULE PROCEDURES START HERE
     self%cvdump_fs = 0.0_wp !xyz dump frequency (in fs)
     self%cvdumpstep = 0 !xyz dump frequency (in MD steps)
     self%maxsave = 0
+    self%whole = .false.
+    self%whole_nbonds = 0
     self%damptype = 0
     self%ramp = -1.0_wp
     self%damp = 1.0_wp
@@ -251,6 +485,12 @@ contains  !> MODULE PROCEDURES START HERE
       if (allocated(self%atinclude)) then
         write (iunit,'("  # of atoms affected",t25,":",i10)') count(self%atinclude,1)
       end if
+      if (self%whole) then
+        write (iunit,'("  PBC make-whole",t25,":",1x,a,1x,"(",i0," bonds)")') &
+        & 'on',self%whole_nbonds
+      else
+        write (iunit,'("  PBC make-whole",t25,":",1x,a)') 'off'
+      end if
     end if
 
     return
@@ -279,7 +519,12 @@ contains  !> MODULE PROCEDURES START HERE
       if (pot%cvdump == pot%cvdumpstep) then !> the MTD tracks when it needs to be updated
         pot%cvdump = 0  !> reset if new CV is added
         pot%ncur = pot%ncur+1
-        pot%cvxyz(:,:,pot%ncur) = mol%xyz(:,:)
+        if (pot%whole .and. allocated(mol%lat) .and. allocated(pot%whole_bonds)) then
+          call pbc_make_whole(mol%nat,mol%xyz,mol%lat,pot%whole_mask, &
+          & pot%whole_bonds,pot%whole_nbonds,pot%cvxyz(:,:,pot%ncur))
+        else
+          pot%cvxyz(:,:,pot%ncur) = mol%xyz(:,:)
+        end if
         if (pot%ncur == 1) then
           !>--- The first one should be sligthly distorted
           call rmsdcv_perturb(mol%nat,pot%cvxyz(:,:,pot%ncur))
@@ -464,29 +709,43 @@ contains  !> MODULE PROCEDURES START HERE
 
     real(wp),allocatable :: xyzref(:,:)
     real(wp),allocatable :: xyzcp(:,:)
+    real(wp),allocatable :: xyzwhole(:,:)
     real(wp),allocatable :: grad(:,:)
     real(wp) :: U(3,3),x_center(3),y_center(3)
     real(wp) :: rmsdval,E,dEdr
 
     integer :: i,j,k,l
+    logical :: usewhole
 
     ebias = 0.0_wp
     grdmtd = 0.0_wp
 
     if (pot%ncur < 1) return
+    usewhole = pot%whole .and. allocated(mol%lat) .and. allocated(pot%whole_mask) &
+    & .and. allocated(pot%whole_bonds) .and. pot%whole_nbonds > 0
+    if (usewhole) then
+      allocate (xyzwhole(3,mol%nat),source=0.0_wp)
+      call pbc_make_whole(mol%nat,mol%xyz,mol%lat,pot%whole_mask, &
+      & pot%whole_bonds,pot%whole_nbonds,xyzwhole)
+    end if
 
     if (.not.allocated(pot%atinclude)) then !>-- include all atoms in RMSD
       allocate (xyzref(3,mol%nat),grad(3,mol%nat),source=0.0_wp)
       !$omp parallel default(none) &
-      !$omp shared(pot,mol) &
+      !$omp shared(pot,mol,xyzwhole,usewhole) &
       !$omp private(grad,xyzref,U,x_center,y_center,rmsdval,E,dEdr) &
       !$omp reduction(+:ebias,grdmtd)
       !$omp do schedule(dynamic)
       do i = 1,pot%ncur
         grad = 0.0_wp
         xyzref = pot%cvxyz(:,:,i)
-        call rmsd(mol%nat,mol%xyz,xyzref,1,U,x_center,y_center,rmsdval, &
-        &          .true.,grad)
+        if (usewhole) then
+          call rmsd(mol%nat,xyzwhole,xyzref,1,U,x_center,y_center,rmsdval, &
+          &          .true.,grad)
+        else
+          call rmsd(mol%nat,mol%xyz,xyzref,1,U,x_center,y_center,rmsdval, &
+          &          .true.,grad)
+        end if
         E = pot%kpush*exp(-pot%alpha*rmsdval**2)
         if (i == pot%ncur.or.pot%mtdtype == cv_rmsd_static) then
           E = E*pot%damp
@@ -501,10 +760,13 @@ contains  !> MODULE PROCEDURES START HERE
 
     else !>--- use only selected atoms in RMSD
       k = count(pot%atinclude,1)
-      if (k < 1) return
+      if (k < 1) then
+        if (allocated(xyzwhole)) deallocate (xyzwhole)
+        return
+      end if
       allocate (xyzcp(3,k),xyzref(3,k),grad(3,k),source=0.0_wp)
       !$omp parallel default(none) &
-      !$omp shared(pot,mol,k) &
+      !$omp shared(pot,mol,k,xyzwhole,usewhole) &
       !$omp private(grad,xyzref,U,x_center,y_center,rmsdval,E,dEdr) &
       !$omp private(xyzcp,j,l) &
       !$omp reduction(+:ebias,grdmtd)
@@ -515,7 +777,11 @@ contains  !> MODULE PROCEDURES START HERE
         do j = 1,mol%nat
           if (pot%atinclude(j)) then
             l = l+1
-            xyzcp(:,l) = mol%xyz(:,j)
+            if (usewhole) then
+              xyzcp(:,l) = xyzwhole(:,j)
+            else
+              xyzcp(:,l) = mol%xyz(:,j)
+            end if
             xyzref(:,l) = pot%cvxyz(:,j,i)
           end if
         end do
@@ -539,6 +805,8 @@ contains  !> MODULE PROCEDURES START HERE
       !$omp end parallel
       deallocate (grad,xyzref,xyzcp)
     end if
+
+    if (allocated(xyzwhole)) deallocate (xyzwhole)
 
     return
   end subroutine calc_rmsd_mtd

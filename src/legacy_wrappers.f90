@@ -50,6 +50,7 @@ subroutine env2calc(env,calc,molin)
   call cal%sync_multiplicity()   !> keep the multiplicity store aligned with uhf
   cal%chrg = env%chrg
   cal%spin_polarized = env%spin_polarized
+  if (cal%id == jobtype%gfnff) cal%mcgfnff = env%mcgfnff
 !>-- obtain WBOs OFF by default
   cal%rdwbo = .false.
   cal%rddip = .false.
@@ -106,6 +107,7 @@ subroutine env2calc(env,calc,molin)
     cal2%chrg = cal%chrg
     cal2%uhf = cal%uhf
     cal2%spin_polarized = cal%spin_polarized
+    if (cal2%id == jobtype%gfnff) cal2%mcgfnff = env%mcgfnff
     if (env%gbsa) then
       cal2%solvmodel = cal%solvmodel
       cal2%solvent = cal%solvent

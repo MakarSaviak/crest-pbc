@@ -991,6 +991,7 @@ subroutine crest_search_multimd_init2(env,mddats,nsim)
       mtds(i)%alpha = env%metadexp(i)
       mtds(i)%cvdump_fs = float(env%mddump)
       mtds(i)%mtdtype = cv_rmsd
+      mtds(i)%whole = env%pbcwhole
 
       mddats(i)%npot = 1
       allocate (mddats(i)%mtd(1),source=mtds(i))
