@@ -122,6 +122,7 @@ subroutine crest_search_entropy(env,tim)
       write (stdout,'(1x,a,i0)') 'Meta-Dynamics Iteration ',i
       write (stdout,'(1x,a)') '------------------------------'
 
+      call env%ref%to(mol)
       nsim = -1 !>--- enambles automatic MTD setup in init routines
       call crest_search_multimd_init(env,mol,mddat,nsim)
       allocate (mddats(nsim),source=mddat)
@@ -491,4 +492,3 @@ subroutine crest_init_multimd_smtd(env,mddats,nsim,biasfile)
   deallocate (eread,at,xyz)
   return
 end subroutine crest_init_multimd_smtd
-
