@@ -116,6 +116,7 @@ subroutine crest_search_imtdgc(env,tim)
     write(stdout,'(1x,a,i0)') 'Meta-Dynamics Iteration ',i
     write(stdout,'(1x,a)') '------------------------------'
 
+    call env%ref%to(mol)
     nsim = -1 !>--- enambles automatic MTD setup in init routines
     call crest_search_multimd_init(env,mol,mddat,nsim)
     allocate (mddats(nsim), source=mddat)
@@ -639,5 +640,4 @@ subroutine crest_newcross3(env)
     enddo
   end do
 end subroutine crest_newcross3
-
 
