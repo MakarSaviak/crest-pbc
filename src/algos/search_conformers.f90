@@ -159,6 +159,7 @@ subroutine crest_search_imtdgc(env,tim)
           & ' from existing trajectory/ensemble'
         ensnam = trim(rdat%last_file)
       else
+        call env%ref%to(mol)
         nsim = -1 !>--- enambles automatic MTD setup in init routines
         call crest_search_multimd_init(env,mol,mddat,nsim)
         allocate (mddats(nsim),source=mddat)
