@@ -642,7 +642,7 @@ subroutine discardbroken(ch,env,topocheck,nat,nall,at,xyz,comments,newnall)
   integer :: llan
   integer,allocatable :: order(:),orderref(:)
   integer :: nat0
-  real(wp),allocatable :: cref(:,:),c0(:,:),c1(:,:)
+  real(wp),allocatable :: cref(:,:),c0(:,:),c1(:,:),csort(:,:)
   integer,allocatable  :: at0(:),atdum(:)
   real(wp),allocatable :: cn(:),bond(:,:)
   integer :: frag,frag0
@@ -720,7 +720,12 @@ subroutine discardbroken(ch,env,topocheck,nat,nall,at,xyz,comments,newnall)
   !>--- sort the xyz array (only if structures have been discarded)
   if (newnall .lt. nall) then
     order = orderref
-    call xyzqsort(nat,nall,xyz,c0,order,1,nall)
+    ! xyzqsort reorders the complete nat-atom ensemble.  Under --subrmsd,
+    ! c0 has only env%rednat columns and cannot safely serve as its scratch
+    ! buffer.  Use a full-size scratch array for the whole-system sort.
+    allocate (csort(3,nat))
+    call xyzqsort(nat,nall,xyz,csort,order,1,nall)
+    deallocate (csort)
     order = orderref
     call stringqsort(nall,comments,1,nall,order)
 
@@ -735,6 +740,7 @@ subroutine discardbroken(ch,env,topocheck,nat,nall,at,xyz,comments,newnall)
   if (allocated(bond)) deallocate (bond)
   if (allocated(atdum)) deallocate (atdum)
   if (allocated(c1)) deallocate (c1)
+  if (allocated(csort)) deallocate (csort)
   if (allocated(at0)) deallocate (at0)
   if (allocated(c0)) deallocate (c0)
   if (allocated(cref)) deallocate (cref)
