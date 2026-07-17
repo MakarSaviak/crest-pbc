@@ -574,6 +574,28 @@ contains  !> MODULE PROCEDURES START HERE
           end do
         end if
   
+      case ('com_bias','com bias')
+        call parse_xtb_logical(kv%rawvalue,env%mtd_com_bias,io)
+        if (io /= 0) error stop '**ERROR** invalid $metadyn com_bias value'
+
+      case ('com_factor','com factor')
+        read(kv%rawvalue,*,iostat=io) rdum
+        if (io /= 0 .or. rdum < 0.0_wp) then
+          error stop '**ERROR** $metadyn com_factor must be a non-negative number in Eh'
+        end if
+        env%mtd_com_factor = rdum
+
+      case ('com_width','com width')
+        read(kv%rawvalue,*,iostat=io) rdum
+        if (io /= 0 .or. rdum <= 0.0_wp) then
+          error stop '**ERROR** $metadyn com_width must be positive in bohr^-2'
+        end if
+        env%mtd_com_width = rdum
+
+      case ('com_mass_weighted','com mass weighted')
+        call parse_xtb_logical(kv%rawvalue,env%mtd_com_mass_weighted,io)
+        if (io /= 0) error stop '**ERROR** invalid $metadyn com_mass_weighted value'
+
       case ('kscal')
         !> define a global metadynamics k-push scaling factor
         read(kv%rawvalue,*) r1
@@ -854,6 +876,27 @@ contains  !> MODULE PROCEDURES START HERE
     hdr = trim(atmp)
     return
   end subroutine clearxtbheader
+
+
+!========================================================================================!
+  subroutine parse_xtb_logical(raw,value,io)
+    character(len=*),intent(in) :: raw
+    logical,intent(out) :: value
+    integer,intent(out) :: io
+    character(len=:),allocatable :: tmp
+
+    tmp = trim(adjustl(lowercase(raw)))
+    io = 0
+    select case (tmp)
+    case ('true','.true.','t','yes','y','on','1')
+      value = .true.
+    case ('false','.false.','f','no','n','off','0')
+      value = .false.
+    case default
+      value = .false.
+      io = 1
+    end select
+  end subroutine parse_xtb_logical
 
 !========================================================================================!
 end module parse_xtbinput

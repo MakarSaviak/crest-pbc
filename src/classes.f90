@@ -385,6 +385,10 @@ module crest_data
     real(wp),allocatable :: metadexp(:)
     integer,allocatable  :: metadlist(:)
     real(wp) :: mtd_kscal = 1.0_wp !> globally scale kpush for all metadynamics
+    logical  :: mtd_com_bias = .false. !> add a translation-sensitive COM hill to RMSD MTD
+    real(wp) :: mtd_com_factor = 0.0_wp !> COM hill amplitude in Eh
+    real(wp) :: mtd_com_width = 0.05_wp !> COM hill width in bohr^-2
+    logical  :: mtd_com_mass_weighted = .true. !> mass-weighted COM (otherwise centroid)
 
     character(len=:),allocatable :: mtdstaticfile
     integer :: nstatic

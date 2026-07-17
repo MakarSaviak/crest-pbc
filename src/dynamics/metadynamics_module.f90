@@ -25,6 +25,7 @@ module metadynamics_module
   use crest_parameters
   use ls_rmsd
   use strucrd
+  use atmasses, only : ams
 
   implicit none
 
@@ -47,6 +48,10 @@ module metadynamics_module
 
     real(wp) :: kpush = 1.0_wp
     real(wp) :: alpha = 1.0_wp
+    logical  :: com_bias = .false.
+    real(wp) :: com_factor = 0.0_wp
+    real(wp) :: com_width = 0.05_wp
+    logical  :: com_mass_weighted = .true.
 
     !>--- regular MTD, some CV
     real(wp),allocatable :: cv(:) !list of cv values at each timestep
@@ -76,6 +81,7 @@ module metadynamics_module
   public :: mtd_ini
   public :: cv_dump
   public :: calc_mtd
+  public :: calc_com_mtd
 
 !========================================================================================!
 !========================================================================================!
@@ -102,6 +108,14 @@ contains  !> MODULE PROCEDURES START HERE
 
     if (pr) then
       write (stdout,'(">--- metadynamics parameter ---")')
+    end if
+
+    if (pot%com_bias) then
+      if (pot%com_factor < 0.0_wp) error stop '**ERROR** COM MTD factor must be non-negative'
+      if (pot%com_width <= 0.0_wp) error stop '**ERROR** COM MTD width must be positive'
+      if (allocated(pot%atinclude)) then
+        if (count(pot%atinclude) < 1) error stop '**ERROR** COM MTD atom selection is empty'
+      end if
     end if
 
     dum1 = anint((mdlength*1000.0_wp)/tstep)
@@ -203,6 +217,10 @@ contains  !> MODULE PROCEDURES START HERE
     self%ncur = 0
     self%kpush = 1.0_wp
     self%alpha = 1.0_wp
+    self%com_bias = .false.
+    self%com_factor = 0.0_wp
+    self%com_width = 0.05_wp
+    self%com_mass_weighted = .true.
     self%cvdump = 0 !xyz dump counter
     self%cvdump_fs = 0.0_wp !xyz dump frequency (in fs)
     self%cvdumpstep = 0 !xyz dump frequency (in MD steps)
@@ -234,6 +252,17 @@ contains  !> MODULE PROCEDURES START HERE
     end select
     write (iunit,'(" kpush /Eh     :",f10.4)') self%kpush
     write (iunit,'(" alpha /bohr⁻² :",f10.4)') self%alpha
+    if (self%com_bias) then
+      write (iunit,'(" COM bias enabled")')
+      write (iunit,'(" COM factor /Eh :",f12.6)') self%com_factor
+      write (iunit,'(" COM width /bohr^-2 :",f12.6)') self%com_width
+      write (iunit,'(" COM mass weighted :",l2)') self%com_mass_weighted
+      if (allocated(self%atinclude)) then
+        write (iunit,'(" COM selected atoms :",i8)') count(self%atinclude)
+      else
+        write (iunit,'(" COM selected atoms : all")')
+      end if
+    end if
 
     select case (self%mtdtype)
     case (cv_rmsd)
@@ -337,7 +366,8 @@ contains  !> MODULE PROCEDURES START HERE
     type(mtdpot) :: pot
     real(wp),intent(out) :: emtd
     real(wp),intent(out) :: grdmtd(3,mol%nat)
-    real(wp) :: dum
+    real(wp) :: dum,ecom
+    real(wp) :: grdcom(3,mol%nat)
     emtd = 0.0_wp
     grdmtd = 0.0_wp
 
@@ -349,11 +379,21 @@ contains  !> MODULE PROCEDURES START HERE
       dum = float(pot%cvdump)
       call calc_damp(pot,cv_rmsd,dum)
       call calc_rmsd_mtd(mol,pot,emtd,grdmtd)
+      if (pot%com_bias) then
+        call calc_com_mtd(mol,pot,ecom,grdcom)
+        emtd = emtd+ecom
+        grdmtd = grdmtd+grdcom
+      end if
 
     case (cv_rmsd_static)
       dum = float(pot%cvdump)
       call calc_damp(pot,cv_rmsd_static,dum)
       call calc_rmsd_mtd(mol,pot,emtd,grdmtd)
+      if (pot%com_bias) then
+        call calc_com_mtd(mol,pot,ecom,grdcom)
+        emtd = emtd+ecom
+        grdmtd = grdmtd+grdcom
+      end if
 
     case default
       emtd = 0.0_wp
@@ -535,6 +575,97 @@ contains  !> MODULE PROCEDURES START HERE
 
     return
   end subroutine calc_rmsd_mtd
+
+
+!========================================================================================!
+  subroutine calc_com_mtd(mol,pot,ebias,grdmtd)
+!***********************************************************************
+!* Add a translation-sensitive COM Gaussian for the same deposited
+!* structures and atom selection used by RMSD metadynamics.
+!* Coordinates are raw lab-frame bohr coordinates; no RMSD alignment is
+!* applied. com_factor is in Eh and com_width is in bohr^-2.
+!***********************************************************************
+    implicit none
+    type(coord),intent(in) :: mol
+    type(mtdpot),intent(in) :: pot
+    real(wp),intent(out) :: ebias
+    real(wp),intent(out) :: grdmtd(3,mol%nat)
+
+    integer :: i,j
+    real(wp) :: rnow(3),rref(3),dr(3),dedr(3)
+    real(wp) :: weight,wsum,ecom
+    logical :: selected
+
+    ebias = 0.0_wp
+    grdmtd = 0.0_wp
+
+    if (.not.pot%com_bias) return
+    if (abs(pot%com_factor) <= tiny(1.0_wp)) return
+    if (pot%ncur < 1) return
+    if (pot%com_width <= 0.0_wp) error stop '**ERROR** COM MTD width must be positive'
+
+    wsum = 0.0_wp
+    do j = 1,mol%nat
+      selected = .true.
+      if (allocated(pot%atinclude)) selected = pot%atinclude(j)
+      if (.not.selected) cycle
+      if (pot%com_mass_weighted) then
+        if (mol%at(j) < 1 .or. mol%at(j) > size(ams)) then
+          error stop '**ERROR** invalid atomic number in COM MTD selection'
+        end if
+        weight = ams(mol%at(j))
+      else
+        weight = 1.0_wp
+      end if
+      wsum = wsum+weight
+    end do
+    if (wsum <= tiny(1.0_wp)) error stop '**ERROR** empty or zero-mass COM MTD selection'
+
+    !$omp parallel default(none) &
+    !$omp shared(pot,mol,wsum,ams) &
+    !$omp private(i,j,rnow,rref,dr,dedr,weight,ecom,selected) &
+    !$omp reduction(+:ebias,grdmtd)
+    !$omp do schedule(dynamic)
+    do i = 1,pot%ncur
+      rnow = 0.0_wp
+      rref = 0.0_wp
+      do j = 1,mol%nat
+        selected = .true.
+        if (allocated(pot%atinclude)) selected = pot%atinclude(j)
+        if (.not.selected) cycle
+        if (pot%com_mass_weighted) then
+          weight = ams(mol%at(j))
+        else
+          weight = 1.0_wp
+        end if
+        rnow = rnow+weight*mol%xyz(:,j)
+        rref = rref+weight*pot%cvxyz(:,j,i)
+      end do
+      rnow = rnow/wsum
+      rref = rref/wsum
+      dr = rnow-rref
+
+      ecom = pot%com_factor*exp(-pot%com_width*dot_product(dr,dr))
+      if (i == pot%ncur .or. pot%mtdtype == cv_rmsd_static) ecom = ecom*pot%damp
+      dedr = -2.0_wp*pot%com_width*ecom*dr
+      ebias = ebias+ecom
+
+      do j = 1,mol%nat
+        selected = .true.
+        if (allocated(pot%atinclude)) selected = pot%atinclude(j)
+        if (.not.selected) cycle
+        if (pot%com_mass_weighted) then
+          weight = ams(mol%at(j))/wsum
+        else
+          weight = 1.0_wp/wsum
+        end if
+        grdmtd(:,j) = grdmtd(:,j)+weight*dedr
+      end do
+    end do
+    !$omp end do
+    !$omp end parallel
+
+  end subroutine calc_com_mtd
 
 !========================================================================================!
   subroutine calc_std_mtd(mol,pot,cvt,ebias,grdmtd)

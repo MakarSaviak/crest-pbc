@@ -709,6 +709,10 @@ subroutine crest_search_multimd_init2(env,mddats,nsim)
       mtds(i)%alpha = env%metadexp(i)
       mtds(i)%cvdump_fs = float(env%mddump)
       mtds(i)%mtdtype = cv_rmsd
+      mtds(i)%com_bias = env%mtd_com_bias
+      mtds(i)%com_factor = env%mtd_com_factor
+      mtds(i)%com_width = env%mtd_com_width
+      mtds(i)%com_mass_weighted = env%mtd_com_mass_weighted
 
       mddats(i)%npot = 1
       allocate (mddats(i)%mtd(1),source=mtds(i))
@@ -942,6 +946,17 @@ subroutine parallel_md_block_printout(MD,vz)
       write (stdout,'(2x,"|   Vbias exponent (α)   :",f8.4," bohr⁻²   |")') MD%mtd(1)%alpha
     else
       write (stdout,'(2x,"|   Vbias exponent (α)   :",f8.4,"          |")') MD%mtd(1)%alpha
+    end if
+    if (MD%mtd(1)%com_bias) then
+      write (stdout,'(2x,"|   COM bias enabled                        |")')
+      write (stdout,'(2x,"|   COM factor /Eh       :",f12.6,"          |")') MD%mtd(1)%com_factor
+      write (stdout,'(2x,"|   COM width /bohr^-2   :",f12.6,"          |")') MD%mtd(1)%com_width
+      write (stdout,'(2x,"|   COM mass weighted    :",l8,"              |")') MD%mtd(1)%com_mass_weighted
+      if (allocated(MD%mtd(1)%atinclude)) then
+        write (stdout,'(2x,"|   COM selected atoms   :",i8,"              |")') count(MD%mtd(1)%atinclude)
+      else
+        write (stdout,'(2x,"|   COM selected atoms   : all                 |")')
+      end if
     end if
   end if
 
