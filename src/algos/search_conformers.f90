@@ -34,10 +34,12 @@ subroutine crest_search_imtdgc(env,tim)
   use iomod
   use utilities
   use cregen_interface
+  use nci_input_ensemble, only: load_nci_input_ensemble
   implicit none
   type(systemdata),intent(inout) :: env
   type(timer),intent(inout)      :: tim
   type(coord) :: mol,molnew
+  type(coord),allocatable :: nci_input_mols(:),mtd_mols(:)
   integer :: i,j,k,l,io,ich,m
   logical :: pr,wr
 !===========================================================!
@@ -46,7 +48,9 @@ subroutine crest_search_imtdgc(env,tim)
   type(shakedata) :: shk
 
   type(mddata),allocatable :: mddats(:)
-  integer :: nsim,nallout
+  integer,allocatable :: bias_indices(:),input_indices(:)
+  integer :: nsim,nallout,ninputs,nbias,nbias_check
+  integer :: iinput,ibias,ijob
 
   real(wp) :: energy,gnorm
   real(wp),allocatable :: grad(:,:)
@@ -73,6 +77,15 @@ subroutine crest_search_imtdgc(env,tim)
   write (stdout,*) 'Input structure:'
   call mol%append(stdout)
   write (stdout,*)
+
+!>--- load any additional NCI starting structures. The ordinary
+!>--- single-input path remains authoritative unless more than one
+!>--- consistently prepared structure is returned.
+  ninputs = 1
+  if (env%NCI) then
+    call load_nci_input_ensemble(env,mol,nci_input_mols,ninputs)
+    if (ninputs > 1) call crest_write_nci_input_starts(nci_input_mols,ninputs)
+  end if
 
 !>--- sets the MD length according to a flexibility measure
   call md_length_setup(env) 
@@ -110,14 +123,62 @@ subroutine crest_search_imtdgc(env,tim)
     write(stdout,'(1x,a)') '------------------------------'
 
     call env%ref%to(mol)
-    nsim = -1 !>--- enambles automatic MTD setup in init routines
-    call crest_search_multimd_init(env,mol,mddat,nsim)
-    allocate (mddats(nsim), source=mddat)
-    call crest_search_multimd_init2(env,mddats,nsim)
+    if (start.and.i == 1.and.ninputs > 1) then
+!>---- The first NCI batch is the Cartesian product of input structures
+!>---- and bias configurations. Keep input structures as the outer index
+!>---- so the job order and the persisted provenance map are deterministic.
+      nbias = -1 !> automatic MTD setup and bias count
+      call crest_search_multimd_init(env,nci_input_mols(1),mddat,nbias)
+      nsim = ninputs*nbias
+      allocate (mddats(nsim),mtd_mols(nsim))
+      allocate (bias_indices(nsim),input_indices(nsim))
 
-    call tim%start(2,'Metadynamics (MTD)')
-    call crest_search_multimd(env,mol,mddats,nsim)
-    call tim%stop(2)
+      ijob = 0
+      do iinput = 1,ninputs
+!>------ SHAKE constraints contain geometry-dependent reference lengths,
+!>------ so initialize a distinct MD state for every input structure.
+        if (iinput > 1) then
+          nbias_check = nbias
+          call crest_search_multimd_init(env,nci_input_mols(iinput),mddat,nbias_check)
+          if (nbias_check /= nbias) then
+            error stop 'NCI multi-input bias count changed during job initialization.'
+          end if
+          mddat%simtype = type_mtd
+        end if
+        do ibias = 1,nbias
+          ijob = ijob+1
+          mtd_mols(ijob) = nci_input_mols(iinput)
+          mddats(ijob) = mddat
+          input_indices(ijob) = iinput
+          bias_indices(ijob) = ibias
+        end do
+      end do
+      if (ijob /= nsim) error stop 'NCI multi-input Cartesian job construction failed.'
+
+      call crest_search_multimd_init2_mapped(env,mddats,nsim,bias_indices,input_indices)
+      call crest_write_nci_mtd_jobs(mddats,nsim)
+
+      write (stdout,'(1x,a,i0,a,i0,a,i0,a)') &
+      & 'NCI first MTD batch: ',ninputs,' inputs x ',nbias, &
+      & ' biases = ',nsim,' trajectories'
+      call tim%start(2,'Metadynamics (MTD)')
+      call crest_search_multimd2(env,mtd_mols,mddats,nsim)
+      call tim%stop(2)
+      call crest_write_nci_mtd_jobs(mddats,nsim)
+
+      deallocate (mtd_mols,bias_indices,input_indices)
+    else
+!>---- Preserve the established path exactly for one input and for all
+!>---- subsequent iterations after the first multi-input NCI batch.
+      nsim = -1 !>--- enables automatic MTD setup in init routines
+      call crest_search_multimd_init(env,mol,mddat,nsim)
+      allocate (mddats(nsim),source=mddat)
+      call crest_search_multimd_init2(env,mddats,nsim)
+
+      call tim%start(2,'Metadynamics (MTD)')
+      call crest_search_multimd(env,mol,mddats,nsim)
+      call tim%stop(2)
+    end if
 !>--- a file called crest_dynamics.trj should have been written
     ensnam = 'crest_dynamics.trj'
 !>--- deallocate for next iteration
@@ -247,6 +308,68 @@ subroutine crest_search_imtdgc(env,tim)
 !==========================================================!
   return
 end subroutine crest_search_imtdgc
+
+!========================================================================================!
+subroutine crest_write_nci_input_starts(mols,ninputs)
+!**************************************************************************************!
+!* Preserve the exact, consistently transformed/preoptimized structures used to build
+!* the first multi-input MTD batch. The job TSV maps each of these input IDs to six jobs.
+!**************************************************************************************!
+  use strucrd, only: coord
+  implicit none
+  integer,intent(in) :: ninputs
+  type(coord),intent(in) :: mols(ninputs)
+  type(coord) :: tmp
+  integer :: ich,io,i
+  character(len=80) :: comment
+
+  open (newunit=ich,file='crest_nci_input_starts.xyz',status='replace', &
+  & action='write',iostat=io)
+  if (io /= 0) error stop 'Could not write crest_nci_input_starts.xyz'
+  do i = 1,ninputs
+    tmp = mols(i)
+    write (comment,'(a,i0)') 'NCI input_structure_id=',i
+    tmp%comment = trim(comment)
+    call tmp%append(ich)
+    call tmp%deallocate()
+  end do
+  close (ich)
+end subroutine crest_write_nci_input_starts
+
+!========================================================================================!
+subroutine crest_write_nci_mtd_jobs(mddats,nsim)
+!**************************************************************************************!
+!* Persist the first multi-input NCI MTD job mapping outside MDFILES. MDFILES is
+!* recreated by later MTD iterations, while this run-root manifest remains available
+!* for provenance and post-run diagnostics.
+!**************************************************************************************!
+  use dynamics_module, only: mddata
+  implicit none
+  integer,intent(in) :: nsim
+  type(mddata),intent(in) :: mddats(nsim)
+  integer :: ich,io,i
+  character(len=1) :: tab
+
+  tab = achar(9)
+  open (newunit=ich,file='crest_nci_mtd_jobs.tsv',status='replace', &
+  & action='write',iostat=io)
+  if (io /= 0) then
+    error stop 'Could not write crest_nci_mtd_jobs.tsv'
+  end if
+
+  write (ich,'(a)') 'global_job_id'//tab//'input_structure_id'//tab// &
+  & 'bias_configuration_id'//tab//'kpush'//tab//'alpha'//tab// &
+  & 'trajectory'//tab//'restart'//tab//'termination_status'
+  do i = 1,nsim
+    write (ich,'(i0,a,i0,a,i0,a,es24.16e3,a,es24.16e3,a,a,a,a,a,i0)') &
+    & mddats(i)%md_index,tab,mddats(i)%input_structure_id,tab, &
+    & mddats(i)%bias_configuration_id,tab, &
+    & mddats(i)%mtd(1)%kpush,tab,mddats(i)%mtd(1)%alpha,tab, &
+    & trim(mddats(i)%trajectoryfile),tab,trim(mddats(i)%restartfile),tab, &
+    & mddats(i)%termination_status
+  end do
+  close (ich)
+end subroutine crest_write_nci_mtd_jobs
 
 !========================================================================================!
 !>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>><<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<!
@@ -620,4 +743,3 @@ subroutine crest_newcross3(env)
     enddo
   end do
 end subroutine crest_newcross3
-

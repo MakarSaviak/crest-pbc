@@ -22,6 +22,21 @@
 >
 > This is research-fork functionality and is not part of an official `crest-lab/crest` release.
 
+> [!NOTE]
+> **Experimental multi-input NCI extension**
+>
+> The [`feature/nci-multi-input-com-cv-reseed`](https://github.com/MakarSaviak/crest-pbc/tree/feature/nci-multi-input-com-cv-reseed) branch extends the docking branch above. In NCI mode only, a positional concatenated XYZ is interpreted as an ensemble of starting structures. The first MTD stage runs the explicit Cartesian product of all supplied structures and the standard NCI bias configurations through one global parallel executor. Later iterations and all optimization, CREGEN, and postprocessing stages retain the normal single-workflow behavior.
+>
+> Every first-stage trajectory has independent coordinates, MD/bias/CV/SHAKE state, trajectory and restart files, plus an auditable input/bias mapping in `crest_nci_mtd_jobs.tsv`. `-TMD` remains the total MTD-stage CPU budget; for GFN-FF, the executor assigns one CPU to each concurrent trajectory. A one-frame XYZ follows the established single-input path unchanged. Automatic multi-frame interpretation is deliberately restricted to `--nci`.
+
+Example:
+
+```bash
+crest placements.xyz --nci -gfnff -T 128 -TMD 30 [other NCI options]
+```
+
+For five input structures and the standard six NCI bias configurations, the first stage contains 30 MTD trajectories. This extension uses the ordinary, non-symmetry-aware COM CV inherited from the docking branch.
+
 CREST (originally abbreviated from ***C***onformer-***R***otamer ***E***nsemble ***S***ampling ***T***ool) is a program for the automated exploration of the low-energy molecular chemical space.
 It functions as an OMP scheduler for calculations with efficient force-field and semiempirical quantum mechanical methods such as xTB, and provides
 a variety of capabilities for creation and analysis of structure ensembles.

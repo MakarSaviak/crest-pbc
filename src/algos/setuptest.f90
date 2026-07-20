@@ -280,12 +280,27 @@ subroutine trialOPT_calculator(env)
   type(coord) :: mol,molopt
   type(calcdata) :: tmpcalc
   integer :: io,T,Tn
+  integer :: j
   real(wp) :: energy
   real(wp),allocatable :: grd(:,:)
-  logical :: success,pr,wr
+  logical :: success,pr,wr,all_gfnff,has_active_calc
 
 !>--- get all available threads
-  call new_ompautoset(env,'max',0,T,Tn)
+  all_gfnff = .true.
+  has_active_calc = .false.
+  do j = 1,env%calc%ncalculations
+    if (env%calc%calcs(j)%active) then
+      has_active_calc = .true.
+      if (env%calc%calcs(j)%id /= jobtype%gfnff) all_gfnff = .false.
+    end if
+  end do
+  all_gfnff = all_gfnff.and.has_active_calc
+  if (env%NCI.and.all_gfnff) then
+!>--- GFN-FF is fastest with one thread for a single calculation.
+    call new_ompautoset(env,'serial',0,T,Tn)
+  else
+    call new_ompautoset(env,'max',0,T,Tn)
+  end if
 
 !>--- small header
   write (stdout,*)
@@ -302,6 +317,9 @@ subroutine trialOPT_calculator(env)
   pr = .false. !> stdout printout
   wr = .true.  !> write crestopt.log
   call optimize_geometry(mol,molopt,tmpcalc,energy,grd,pr,wr,io)
+
+!>--- Restore the global thread pool for the following parallel workflow.
+  if (env%NCI.and.all_gfnff) call new_ompautoset(env,'max',0,T,Tn)
 
 !>--- check success 
   success = (io == 0)

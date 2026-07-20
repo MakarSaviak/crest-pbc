@@ -57,6 +57,9 @@ module dynamics_module
     logical :: requested = .false.
 
     integer :: md_index = 0      !> some index for parallelization
+    integer :: input_structure_id = 1 !> source structure used for this MD job
+    integer :: bias_configuration_id = 0 !> source metadynamics bias configuration
+    integer :: termination_status = -1 !> dynamics return code (-1 means not run)
     integer :: simtype = type_md !> type of the molecular dynamics simulation
     logical :: restart = .false.
     character(len=:),allocatable :: restartfile
