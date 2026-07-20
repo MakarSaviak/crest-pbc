@@ -18,7 +18,7 @@
 > - `-TMD <threads>`, providing a separate total thread budget for MD/MTD sampling while `-T` remains the budget for other workflow stages;
 > - an ordinary, non-symmetry-aware center-of-mass collective variable for the selected `$metadyn` atoms, with configurable bias factor, width, and mass weighting;
 > - corrected MTD iteration reseeding from the current selected reference (`env%ref`) instead of stale initial coordinates;
-> - full-size CREGEN sorting scratch space for large ensembles.
+> - safe full-system CREGEN sorting buffer when `--subrmsd` is used.
 >
 > This is research-fork functionality and is not part of an official `crest-lab/crest` release.
 
