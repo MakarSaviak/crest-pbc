@@ -12,6 +12,22 @@
 
 </div>
 
+> [!IMPORTANT]
+> **NCI host–guest docking branch**
+>
+> For NCI host–guest docking and conformational sampling, use [`feature/com-cv-nci-reference-reseed`](https://github.com/MakarSaviak/crest-pbc/tree/feature/com-cv-nci-reference-reseed).
+>
+> This branch is intentionally based on **CREST 3.0.1** and extends the `fixed-tmd` branch. Its validated implementation revision is [`2d6ee48`](https://github.com/MakarSaviak/crest-pbc/commit/2d6ee4820d0807e7d5861acef238a8f8cab8c748).
+>
+> It includes:
+>
+> - `-TMD <threads>`, providing a separate total thread budget for MD/MTD sampling while `-T` remains the budget for other workflow stages;
+> - an ordinary, non-symmetry-aware center-of-mass collective variable for the selected `$metadyn` atoms, with configurable bias factor, width, and mass weighting;
+> - corrected MTD iteration reseeding from the current selected reference (`env%ref`) instead of stale initial coordinates;
+> - full-size CREGEN sorting scratch space for large ensembles.
+>
+> This is research-fork functionality and is not part of an official `crest-lab/crest` release.
+
 CREST (abbreviated from ***C***onformer-***R***otamer ***E***nsemble ***S***ampling ***T***ool) is a program for the automated exploration of the low-energy molecular chemical space.
 It functions as an OMP scheduler for calculations with efficient force-field and semiempirical quantum mechanical methods such as xTB, and provides
 a variety of capabilities for creation and analysis of structure ensembles.<br> See our recent publication in *J. Chem. Phys.* for a feature overview: [**https://doi.org/10.1063/5.0197592**](https://doi.org/10.1063/5.0197592)
