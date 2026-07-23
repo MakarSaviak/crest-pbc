@@ -127,7 +127,7 @@ module modelhessian_core
   &                 1.36_wp,1.43_wp,1.46_wp,1.58_wp,1.48_wp,1.57_wp ] ! Nh-Og
 !&>
 
-  public :: ddvopt,mh_lindh_d2,mh_lindh,mh_swart
+  public :: ddvopt,ddvopt_free,mh_lindh_d2,mh_lindh,mh_swart
 
 !==============================================================================!
 contains  !> MODULE PROCEDURES START HERE
@@ -664,6 +664,542 @@ contains  !> MODULE PROCEDURES START HERE
       ind = jnd(max(ixyz(i,iatom),ixyz(j,jatom)),min(ixyz(i,iatom),ixyz(j,jatom)))
     end function ind
   end subroutine ddvopt
+
+!========================================================================================!
+  subroutine ddvopt_free(Cart,nAtoms,Hess,iANr,mhset,freezelist)
+    Implicit Integer(i - n)
+    Implicit Real(wp) (a - h,o - z)
+    type(mhparam) :: mhset
+
+    real(wp) :: s6
+    real(wp) :: rcut
+
+    Real(wp) :: Cart(3,nAtoms),rij(3),rjk(3),rkl(3), &
+   &       Hess(0:),si(3),sj(3),sk(3), &
+   &       sl(3),sm(3),x(2),y(2),z(2), &
+   &       xyz(3,4),C(3,4),Dum(3,4,3,4)
+    Integer iANr(nAtoms)
+    logical,intent(in) :: freezelist(nAtoms)
+    integer :: fmap(nAtoms),nf,ia
+
+! include  "common/ddvdt.inc" (molpro 2002.6)
+    Real(wp) :: rAV(3,3),aAV(3,3), &
+   &       B_Str(6),A_Bend(2),A_Trsn(2),A_StrH(2), &
+   &       rkr,rkf,A_Str,RF_Const, &
+   &       wthr
+
+    Data rAv/1.3500d+00,2.1000d+00,2.5300d+00, &
+   &         2.1000d+00,2.8700d+00,3.4000d+00, &
+   &         2.5300d+00,3.4000d+00,3.4000d+00/
+    Data aAv/1.0000d+00,0.3949d+00,0.3949d+00, &
+   &         0.3949d+00,0.2800d+00,0.2800d+00, &
+   &         0.3949d+00,0.2800d+00,0.2800d+00/
+!org  Data rkr,rkf,rkt/0.4500D+00,0.1500D+00,0.5000D-02/
+    Data rkr,rkf,rkt/0.4000D+00,0.1300D+00,0.7500D-02/
+    Data A_Str/1.734d0/
+    Data B_Str/-.244d0,0.352d0,1.085d0,0.660d0,1.522d0,2.068d0/
+    Data A_Bend/0.160d0,0.250d0/
+    Data A_Trsn/0.0023d0,0.07d0/
+    Data A_StrH/0.3601d0,1.944d0/
+    Data RF_Const/1.0D-2/
+    Data wthr/0.2/
+
+!cc VDWx-Parameters (Grimme) used for vdw-correction of model hessian
+    real(wp) :: alphavdw,damp,c6k,c6l,c66,vdw(3,3),dr(3)
+    integer :: kxyz,lxyz
+!cc End: VDWx ccccccccccccccccc
+
+    !> BLAS
+    external :: dcopy
+
+    s6 = mhset%s6
+    rcut = mhset%rcut
+
+!
+!------- Statement functions
+!
+!      ixyz(i,iAtom) = (iAtom-1)*3 + i
+!      Jnd(i,j) = i*(i-1)/2 +j
+!      Ind(i,iAtom,j,jAtom)=Jnd(Max(ixyz(i,iAtom),ixyz(j,jAtom)), &
+!     &                         Min(ixyz(i,iAtom),ixyz(j,jAtom)))
+!end
+
+    Fact = One
+!hjw threshold reduced
+    rZero = 1.0d-10
+    n3 = 3 * nAtoms
+    fmap = 0
+    nf = 0
+    do ia=1,nAtoms
+      if (.not.freezelist(ia)) then
+        nf=nf+1
+        fmap(ia)=nf
+      end if
+    end do
+    if (ubound(Hess,1) /= (3*nf)*(3*nf+1)/2) then
+      error stop 'ddvopt_free: inconsistent packed Hessian size'
+    end if
+    Hess = 0.0d0
+
+!
+!     Hessian for tension
+!
+    Do kAtom = 1,nAtoms
+      kr = iTabRow(iANr(kAtom))
+!        If (kr.eq.0) Go To 5
+
+      Do lAtom = 1,kAtom - 1
+        lr = iTabRow(iANr(lAtom))
+!           If (lr.eq.0) Go To 10
+        xkl = Cart(1,kAtom) - Cart(1,lAtom)
+        ykl = Cart(2,kAtom) - Cart(2,lAtom)
+        zkl = Cart(3,kAtom) - Cart(3,lAtom)
+        rkl2 = xkl**2 + ykl**2 + zkl**2
+        r0 = rAv(kr,lr)
+        alpha = aAv(kr,lr)
+
+!cccccc VDWx ccccccccccccccccccccccccccccccccc
+        c6k = c6(iANr(katom))
+        c6l = c6(iANr(latom))
+        c66 = sqrt(c6k * c6l)
+        Rv = (vander(iANr(katom)) + vander(iANr(latom))) / bohr
+
+        call getvdwxx(xkl,ykl,zkl,c66,s6,Rv,vdw(1,1))
+        call getvdwxy(xkl,ykl,zkl,c66,s6,Rv,vdw(1,2))
+        call getvdwxy(xkl,zkl,ykl,c66,s6,Rv,vdw(1,3))
+        call getvdwxx(ykl,xkl,zkl,c66,s6,Rv,vdw(2,2))
+        call getvdwxy(ykl,zkl,xkl,c66,s6,Rv,vdw(2,3))
+        call getvdwxx(zkl,xkl,ykl,c66,s6,Rv,vdw(3,3))
+!cccccc Ende VDWx ccccccccccccccccccccccccccccccc
+
+        gamma = rkr * Exp(alpha * r0**2)
+! not better: *sqrt(abs(wb(kAtom,lAtom)))
+        gmm = gamma * Exp(-alpha * rkl2)
+        Hxx = gmm * xkl * xkl / rkl2 - vdw(1,1)
+        Hxy = gmm * xkl * ykl / rkl2 - vdw(1,2)
+        Hxz = gmm * xkl * zkl / rkl2 - vdw(1,3)
+        Hyy = gmm * ykl * ykl / rkl2 - vdw(2,2)
+        Hyz = gmm * ykl * zkl / rkl2 - vdw(2,3)
+        Hzz = gmm * zkl * zkl / rkl2 - vdw(3,3)
+
+!
+        Hess(Ind(1,kAtom,1,kAtom)) = Hess(Ind(1,kAtom,1,kAtom)) + Hxx
+        Hess(Ind(2,kAtom,1,kAtom)) = Hess(Ind(2,kAtom,1,kAtom)) + Hxy
+        Hess(Ind(2,kAtom,2,kAtom)) = Hess(Ind(2,kAtom,2,kAtom)) + Hyy
+        Hess(Ind(3,kAtom,1,kAtom)) = Hess(Ind(3,kAtom,1,kAtom)) + Hxz
+        Hess(Ind(3,kAtom,2,kAtom)) = Hess(Ind(3,kAtom,2,kAtom)) + Hyz
+        Hess(Ind(3,kAtom,3,kAtom)) = Hess(Ind(3,kAtom,3,kAtom)) + Hzz
+!
+        Hess(Ind(1,kAtom,1,lAtom)) = Hess(Ind(1,kAtom,1,lAtom)) - Hxx
+        Hess(Ind(1,kAtom,2,lAtom)) = Hess(Ind(1,kAtom,2,lAtom)) - Hxy
+        Hess(Ind(1,kAtom,3,lAtom)) = Hess(Ind(1,kAtom,3,lAtom)) - Hxz
+        Hess(Ind(2,kAtom,1,lAtom)) = Hess(Ind(2,kAtom,1,lAtom)) - Hxy
+        Hess(Ind(2,kAtom,2,lAtom)) = Hess(Ind(2,kAtom,2,lAtom)) - Hyy
+        Hess(Ind(2,kAtom,3,lAtom)) = Hess(Ind(2,kAtom,3,lAtom)) - Hyz
+        Hess(Ind(3,kAtom,1,lAtom)) = Hess(Ind(3,kAtom,1,lAtom)) - Hxz
+        Hess(Ind(3,kAtom,2,lAtom)) = Hess(Ind(3,kAtom,2,lAtom)) - Hyz
+        Hess(Ind(3,kAtom,3,lAtom)) = Hess(Ind(3,kAtom,3,lAtom)) - Hzz
+!
+        Hess(Ind(1,lAtom,1,lAtom)) = Hess(Ind(1,lAtom,1,lAtom)) + Hxx
+        Hess(Ind(2,lAtom,1,lAtom)) = Hess(Ind(2,lAtom,1,lAtom)) + Hxy
+        Hess(Ind(2,lAtom,2,lAtom)) = Hess(Ind(2,lAtom,2,lAtom)) + Hyy
+        Hess(Ind(3,lAtom,1,lAtom)) = Hess(Ind(3,lAtom,1,lAtom)) + Hxz
+        Hess(Ind(3,lAtom,2,lAtom)) = Hess(Ind(3,lAtom,2,lAtom)) + Hyz
+        Hess(Ind(3,lAtom,3,lAtom)) = Hess(Ind(3,lAtom,3,lAtom)) + Hzz
+!
+10      Continue
+      End Do
+
+5     Continue
+    End Do
+
+!
+!     Hessian for bending
+!
+    Do mAtom = 1,nAtoms
+      mr = iTabRow(iANr(mAtom))
+!        If (mr.eq.0) Go To 20
+      Do iAtom = 1,nAtoms
+        If (iAtom .eq. mAtom) Go To 30
+        ir = iTabRow(iANr(iAtom))
+!          If (ir.eq.0) Go To 30
+        if (rcutoff(cart,iatom,matom,rcut)) cycle
+!          if(wb(iatom,matom).lt.wthr) cycle
+        Do jAtom = 1,iAtom - 1
+          If (jAtom .eq. mAtom) Go To 40
+          jr = iTabRow(iANr(jAtom))
+!           If (jr.eq.0) Go To 40
+          if (rcutoff(cart,jatom,iatom,rcut)) cycle
+          if (rcutoff(cart,jatom,matom,rcut)) cycle
+!           if(wb(jatom,iatom).lt.wthr) cycle
+!           if(wb(jatom,matom).lt.wthr) cycle
+
+          xmi = (Cart(1,iAtom) - Cart(1,mAtom))
+          ymi = (Cart(2,iAtom) - Cart(2,mAtom))
+          zmi = (Cart(3,iAtom) - Cart(3,mAtom))
+          rmi2 = xmi**2 + ymi**2 + zmi**2
+          rmi = sqrt(rmi2)
+          r0mi = rAv(mr,ir)
+          ami = aAv(mr,ir)
+!
+          xmj = (Cart(1,jAtom) - Cart(1,mAtom))
+          ymj = (Cart(2,jAtom) - Cart(2,mAtom))
+          zmj = (Cart(3,jAtom) - Cart(3,mAtom))
+          rmj2 = xmj**2 + ymj**2 + zmj**2
+          rmj = sqrt(rmj2)
+          r0mj = rAv(mr,jr)
+          amj = aAv(mr,jr)
+!
+!---------- Test if zero angle
+!
+          Test = xmi * xmj + ymi * ymj + zmi * zmj
+          Test = Test / (rmi * rmj)
+          If (Test .eq. One) Go To 40
+!
+          xij = (Cart(1,jAtom) - Cart(1,iAtom))
+          yij = (Cart(2,jAtom) - Cart(2,iAtom))
+          zij = (Cart(3,jAtom) - Cart(3,iAtom))
+          rij2 = xij**2 + yij**2 + zij**2
+          rrij = sqrt(rij2)
+!
+          alpha = rkf * exp((ami * r0mi**2 + amj * r0mj**2))
+!
+          r = sqrt(rmj2 + rmi2)
+          gij = alpha * exp(-(ami * rmi2 + amj * rmj2))
+!           Write (*,*) ' gij=',gij
+          rL2 = (ymi * zmj - zmi * ymj)**2 + (zmi * xmj - xmi * zmj)**2 + &
+   &         (xmi * ymj - ymi * xmj)**2
+!hjw modified
+          if (rL2 .lt. 1.d-14) then
+            rL = 0
+          else
+            rL = sqrt(rL2)
+          end if
+!
+          if ((rmj .gt. rZero) .and. (rmi .gt. rZero) .and. &
+   &                                (rrij .gt. rZero)) Then
+            SinPhi = rL / (rmj * rmi)
+            rmidotrmj = xmi * xmj + ymi * ymj + zmi * zmj
+            CosPhi = rmidotrmj / (rmj * rmi)
+!
+!-------------None linear case
+!
+            If (SinPhi .gt. rZero) Then
+!               Write (*,*) ' None linear case'
+              si(1) = (xmi / rmi * cosphi - xmj / rmj) / (rmi * sinphi)
+              si(2) = (ymi / rmi * cosphi - ymj / rmj) / (rmi * sinphi)
+              si(3) = (zmi / rmi * cosphi - zmj / rmj) / (rmi * sinphi)
+              sj(1) = (cosphi * xmj / rmj - xmi / rmi) / (rmj * sinphi)
+              sj(2) = (cosphi * ymj / rmj - ymi / rmi) / (rmj * sinphi)
+              sj(3) = (cosphi * zmj / rmj - zmi / rmi) / (rmj * sinphi)
+              sm(1) = -si(1) - sj(1)
+              sm(2) = -si(2) - sj(2)
+              sm(3) = -si(3) - sj(3)
+              Do icoor = 1,3
+                Do jCoor = 1,3
+                  If (mAtom .gt. iAtom) Then
+                    Hess(Ind(icoor,mAtom,jcoor,iAtom)) = &
+  &                        Hess(Ind(icoor,mAtom,jcoor,iAtom)) &
+  &                        + gij * sm(icoor) * si(jcoor)
+                  else
+                    Hess(Ind(icoor,iAtom,jcoor,mAtom)) = &
+   &                        Hess(Ind(icoor,iAtom,jcoor,mAtom)) &
+   &                        + gij * si(icoor) * sm(jcoor)
+                  End If
+                  If (mAtom .gt. jAtom) Then
+                    Hess(Ind(icoor,mAtom,jcoor,jAtom)) = &
+ &                        Hess(Ind(icoor,mAtom,jcoor,jAtom)) &
+ &                        + gij * sm(icoor) * sj(jcoor)
+                  else
+                    Hess(Ind(icoor,jAtom,jcoor,mAtom)) = &
+   &                        Hess(Ind(icoor,jAtom,jcoor,mAtom)) &
+   &                        + gij * sj(icoor) * sm(jcoor)
+                  End If
+                  If (iAtom .gt. jAtom) Then
+                    Hess(Ind(icoor,iAtom,jcoor,jAtom)) = &
+ &                        Hess(Ind(icoor,iAtom,jcoor,jAtom)) &
+ &                        + gij * si(icoor) * sj(jcoor)
+                  else
+                    Hess(Ind(icoor,jAtom,jcoor,iAtom)) = &
+ &                        Hess(Ind(icoor,jAtom,jcoor,iAtom)) &
+ &                        + gij * sj(icoor) * si(jcoor)
+                  End If
+                End Do
+              End Do
+              Do icoor = 1,3
+                Do jCoor = 1,icoor
+                  Hess(Ind(icoor,iAtom,jcoor,iAtom)) = &
+   &                        Hess(Ind(icoor,iAtom,jcoor,iAtom)) &
+   &                        + gij * si(icoor) * si(jcoor)
+                  Hess(Ind(icoor,mAtom,jcoor,mAtom)) = &
+   &                        Hess(Ind(icoor,mAtom,jcoor,mAtom)) &
+   &                        + gij * sm(icoor) * sm(jcoor)
+                  Hess(Ind(icoor,jAtom,jcoor,jAtom)) = &
+   &                        Hess(Ind(icoor,jAtom,jcoor,jAtom)) &
+   &                        + gij * sj(icoor) * sj(jcoor)
+
+!
+                End Do
+              End Do
+            Else
+!
+!----------------Linear case
+!
+              if ((abs(ymi) .gt. rZero) .or. &
+&                 (abs(xmi) .gt. rZero)) Then
+                x(1) = -ymi
+                y(1) = xmi
+                z(1) = Zero
+                x(2) = -xmi * zmi
+                y(2) = -ymi * zmi
+                z(2) = xmi * xmi + ymi * ymi
+              Else
+                x(1) = One
+                y(1) = Zero
+                z(1) = Zero
+                x(2) = Zero
+                y(2) = One
+                z(2) = Zero
+              End If
+              Do i = 1,2
+                r1 = sqrt(x(i)**2 + y(i)**2 + z(i)**2)
+                cosThetax = x(i) / r1
+                cosThetay = y(i) / r1
+                cosThetaz = z(i) / r1
+                si(1) = -cosThetax / rmi
+                si(2) = -cosThetay / rmi
+                si(3) = -cosThetaz / rmi
+                sj(1) = -cosThetax / rmj
+                sj(2) = -cosThetay / rmj
+                sj(3) = -cosThetaz / rmj
+                sm(1) = -(si(1) + sj(1))
+                sm(2) = -(si(2) + sj(2))
+                sm(3) = -(si(3) + sj(3))
+!
+                Do icoor = 1,3
+                  Do jCoor = 1,3
+                    If (mAtom .gt. iAtom) Then
+                      Hess(Ind(icoor,mAtom,jcoor,iAtom)) = &
+ &                        Hess(Ind(icoor,mAtom,jcoor,iAtom)) &
+ &                         + gij * sm(icoor) * si(jcoor)
+                    else
+                      Hess(Ind(icoor,iAtom,jcoor,mAtom)) = &
+&                        Hess(Ind(icoor,iAtom,jcoor,mAtom)) &
+&                         + gij * si(icoor) * sm(jcoor)
+                    End If
+                    If (mAtom .gt. jAtom) Then
+                      Hess(Ind(icoor,mAtom,jcoor,jAtom)) = &
+ &                        Hess(Ind(icoor,mAtom,jcoor,jAtom)) &
+ &                         + gij * sm(icoor) * sj(jcoor)
+                    else
+                      Hess(Ind(icoor,jAtom,jcoor,mAtom)) = &
+ &                        Hess(Ind(icoor,jAtom,jcoor,mAtom)) &
+ &                         + gij * sj(icoor) * sm(jcoor)
+                    End If
+                    If (iAtom .gt. jAtom) Then
+                      Hess(Ind(icoor,iAtom,jcoor,jAtom)) = &
+&                        Hess(Ind(icoor,iAtom,jcoor,jAtom)) &
+&                         + gij * si(icoor) * sj(jcoor)
+                    else
+                      Hess(Ind(icoor,jAtom,jcoor,iAtom)) = &
+&                        Hess(Ind(icoor,jAtom,jcoor,iAtom)) &
+&                         + gij * sj(icoor) * si(jcoor)
+                    End If
+                  End Do
+                End Do
+                Do icoor = 1,3
+                  Do jCoor = 1,icoor
+                    Hess(Ind(icoor,iAtom,jcoor,iAtom)) = &
+&                        Hess(Ind(icoor,iAtom,jcoor,iAtom)) &
+&                         + gij * si(icoor) * si(jcoor)
+                    Hess(Ind(icoor,mAtom,jcoor,mAtom)) = &
+&                        Hess(Ind(icoor,mAtom,jcoor,mAtom)) &
+&                         + gij * sm(icoor) * sm(jcoor)
+                    Hess(Ind(icoor,jAtom,jcoor,jAtom)) = &
+&                         Hess(Ind(icoor,jAtom,jcoor,jAtom)) &
+&                         + gij * sj(icoor) * sj(jcoor)
+                  End Do
+                End Do
+              End Do
+            End If
+          End If
+!
+40        Continue
+        End Do
+30      Continue
+      End Do
+20    Continue
+    End Do
+!
+!     Hessian for torsion
+!
+    Do jAtom = 1,nAtoms
+      jr = iTabRow(iANr(jAtom))
+!       If (jr.eq.0) Go To 444
+!
+      Call DCopy(3,Cart(1,jAtom),1,xyz(1,2),1)
+!
+      Do kAtom = 1,nAtoms
+        If (kAtom .eq. jAtom) Go To 111
+        kr = iTabRow(iANr(kAtom))
+!          If (kr.eq.0) Go To 111
+
+        if (rcutoff(cart,katom,jatom,rcut)) cycle
+!          if(wb(katom,jatom).lt.wthr) cycle
+!
+        Call DCopy(3,Cart(1,kAtom),1,xyz(1,3),1)
+!
+        Do iAtom = 1,nAtoms
+          ij_ = nAtoms * (jAtom - 1) + iAtom
+          If (iAtom .eq. jAtom) Go To 333
+          If (iAtom .eq. kAtom) Go To 333
+          ir = iTabRow(iANr(iAtom))
+!             If (ir.eq.0) Go To 333
+!
+          if (rcutoff(cart,iatom,katom,rcut)) cycle
+          if (rcutoff(cart,iatom,jatom,rcut)) cycle
+!             if(wb(iatom,katom).lt.wthr) cycle
+!             if(wb(iatom,jatom).lt.wthr) cycle
+
+          Call DCopy(3,Cart(1,iAtom),1,xyz(1,1),1)
+!
+          Do lAtom = 1,nAtoms
+            lk_ = nAtoms * (kAtom - 1) + lAtom
+            If (ij_ .le. lk_) Go To 222
+            If (lAtom .eq. iAtom) Go To 222
+            If (lAtom .eq. jAtom) Go To 222
+            If (lAtom .eq. kAtom) Go To 222
+            lr = iTabRow(iANr(lAtom))
+!                If (lr.eq.0) Go To 222
+!
+            if (rcutoff(cart,latom,iatom,rcut)) cycle
+            if (rcutoff(cart,latom,katom,rcut)) cycle
+            if (rcutoff(cart,latom,jatom,rcut)) cycle
+!                if(wb(latom,iatom).lt.wthr) cycle
+!                if(wb(latom,katom).lt.wthr) cycle
+!                if(wb(latom,jatom).lt.wthr) cycle
+
+            Call DCopy(3,Cart(1,lAtom),1,xyz(1,4),1)
+!
+            rij(1) = Cart(1,iAtom) - Cart(1,jAtom)
+            rij(2) = Cart(2,iAtom) - Cart(2,jAtom)
+            rij(3) = Cart(3,iAtom) - Cart(3,jAtom)
+            rij0 = rAv(ir,jr)**2
+            aij = aAv(ir,jr)
+!
+            rjk(1) = Cart(1,jAtom) - Cart(1,kAtom)
+            rjk(2) = Cart(2,jAtom) - Cart(2,kAtom)
+            rjk(3) = Cart(3,jAtom) - Cart(3,kAtom)
+            rjk0 = rAv(jr,kr)**2
+            ajk = aAv(jr,kr)
+!
+            rkl(1) = Cart(1,kAtom) - Cart(1,lAtom)
+            rkl(2) = Cart(2,kAtom) - Cart(2,lAtom)
+            rkl(3) = Cart(3,kAtom) - Cart(3,lAtom)
+            rkl0 = rAv(kr,lr)**2
+            akl = aAv(kr,lr)
+!
+            rij2 = rij(1)**2 + rij(2)**2 + rij(3)**2
+            rjk2 = rjk(1)**2 + rjk(2)**2 + rjk(3)**2
+            rkl2 = rkl(1)**2 + rkl(2)**2 + rkl(3)**2
+!              Allow only angles in the range of 35-145
+            A35 = (35.0D0 / 180.D0) * Pi
+            CosFi_Max = Cos(A35)
+            CosFi2 = (rij(1) * rjk(1) + rij(2) * rjk(2) + rij(3) * rjk(3)) &
+  &               / Sqrt(rij2 * rjk2)
+            If (Abs(CosFi2) .gt. CosFi_Max) Go To 222
+            CosFi3 = (rkl(1) * rjk(1) + rkl(2) * rjk(2) + rkl(3) * rjk(3)) &
+  &               / Sqrt(rkl2 * rjk2)
+            If (Abs(CosFi3) .gt. CosFi_Max) Go To 222
+
+            beta = rkt * &
+  &                       exp((aij * rij0 + ajk * rjk0 + akl * rkl0))
+            tij = beta * exp(-(aij * rij2 + ajk * rjk2 + akl * rkl2))
+
+            Call Trsn(xyz,4,Tau,C,.False.,.False.,'        ', &
+  &                  Dum,.False.)
+            Call DCopy(3,C(1,1),1,si,1)
+            Call DCopy(3,C(1,2),1,sj,1)
+            Call DCopy(3,C(1,3),1,sk,1)
+            Call DCopy(3,C(1,4),1,sl,1)
+!
+!-------------Off diagonal block
+!
+            Do icoor = 1,3
+              Do jCoor = 1,3
+                Hess(Ind(icoor,iAtom,jcoor,jAtom)) = &
+    &           Hess(Ind(icoor,iAtom,jcoor,jAtom)) &
+    &            + tij * si(icoor) * sj(jcoor)
+                Hess(Ind(icoor,iAtom,jcoor,kAtom)) = &
+    &           Hess(Ind(icoor,iAtom,jcoor,kAtom)) &
+    &            + tij * si(icoor) * sk(jcoor)
+                Hess(Ind(icoor,iAtom,jcoor,lAtom)) = &
+    &           Hess(Ind(icoor,iAtom,jcoor,lAtom)) &
+    &            + tij * si(icoor) * sl(jcoor)
+                Hess(Ind(icoor,jAtom,jcoor,kAtom)) = &
+    &           Hess(Ind(icoor,jAtom,jcoor,kAtom)) &
+    &            + tij * sj(icoor) * sk(jcoor)
+                Hess(Ind(icoor,jAtom,jcoor,lAtom)) = &
+    &           Hess(Ind(icoor,jAtom,jcoor,lAtom)) &
+    &            + tij * sj(icoor) * sl(jcoor)
+                Hess(Ind(icoor,kAtom,jcoor,lAtom)) = &
+    &           Hess(Ind(icoor,kAtom,jcoor,lAtom)) &
+    &            + tij * sk(icoor) * sl(jcoor)
+
+              End Do
+            End Do
+!
+!-------------Diagonal block
+!
+            Do icoor = 1,3
+              Do jCoor = 1,icoor
+                Hess(Ind(icoor,iAtom,jcoor,iAtom)) = &
+    &           Hess(Ind(icoor,iAtom,jcoor,iAtom)) &
+    &            + tij * si(icoor) * si(jcoor)
+                Hess(Ind(icoor,jAtom,jcoor,jAtom)) = &
+    &           Hess(Ind(icoor,jAtom,jcoor,jAtom)) &
+    &            + tij * sj(icoor) * sj(jcoor)
+                Hess(Ind(icoor,kAtom,jcoor,kAtom)) = &
+    &           Hess(Ind(icoor,kAtom,jcoor,kAtom)) &
+    &            + tij * sk(icoor) * sk(jcoor)
+                Hess(Ind(icoor,lAtom,jcoor,lAtom)) = &
+    &           Hess(Ind(icoor,lAtom,jcoor,lAtom)) &
+    &            + tij * sl(icoor) * sl(jcoor)
+
+!
+              End Do
+            End Do
+222         Continue
+          End Do        ! lAtom
+333       Continue
+        End Do          ! iAtom
+111     Continue
+      End Do             ! kAtom
+444   Continue
+    End Do               ! jAtom
+    Return
+
+  contains
+    function ixyz(i,iatom)
+      integer :: ixyz
+      integer,intent(in) :: i,iatom
+      ixyz = (fmap(iatom) - 1) * 3 + i
+    end function ixyz
+    function jnd(i,j)
+      integer :: jnd
+      integer,intent(in) :: i,j
+      jnd = i * (i - 1) / 2 + j
+    end function jnd
+    function ind(i,iatom,j,jatom)
+      integer :: ind
+      integer,intent(in) :: i,iatom,j,jatom
+      if (freezelist(iatom) .or. freezelist(jatom)) then
+        ind = 0
+      else
+        ind = jnd(max(ixyz(i,iatom),ixyz(j,jatom)),min(ixyz(i,iatom),ixyz(j,jatom)))
+      end if
+    end function ind
+  end subroutine ddvopt_free
 
 !========================================================================================!
 !########################################################################################!

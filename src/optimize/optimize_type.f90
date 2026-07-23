@@ -22,7 +22,7 @@
 !================================================================================!
 module optimize_type
   use iso_fortran_env,only:wp => real64
-  use optimize_maths,only:detrotra8
+  use optimize_maths,only:detrotra8,trproj_free
   implicit none
 
   public :: optimizer
@@ -59,6 +59,7 @@ module optimize_type
     procedure :: deallocate => deallocate_anc
     procedure :: write => write_anc
     procedure :: new => generate_anc_blowup
+    procedure :: new_frozen => generate_anc_frozen_reduced
     procedure :: get_cartesian
   end type optimizer
 
@@ -97,7 +98,7 @@ contains  !> MODULE PROCEDURES START HERE
     if (present(hlow)) self%hlow = hlow
     if (present(hmax)) self%hmax = hmax
     allocate (self%hess(nvar*(nvar+1)/2),source=0.0_wp)
-    allocate (self%B(n3,n3),source=0.0_wp)
+    allocate (self%B(n3,nvar),source=0.0_wp)
     allocate (self%eigv(n3),source=0.0_wp)
     allocate (self%coord(nvar),source=0.0_wp)
     allocate (self%xyz(3,n),source=0.0_wp)
@@ -298,6 +299,103 @@ contains  !> MODULE PROCEDURES START HERE
 
 !========================================================================================!
 
+subroutine generate_anc_frozen_reduced(self,xyz,hess,freezelist,pr,fail)
+   implicit none
+   class(optimizer),intent(inout) :: self
+   real(wp),intent(in) :: xyz(3,self%n)
+   real(wp),intent(in) :: hess(:)
+   logical,intent(in) :: freezelist(self%n)
+   logical,intent(in) :: pr
+   logical,intent(out) :: fail
+   real(wp),parameter :: thr1=1.0e-10_wp, thr2=1.0e-11_wp
+   integer,parameter :: maxtry=4
+   integer :: nfree3,i,j,ii,jj,p,q,atom,c,itry,nvar,info,lwork,liwork
+   integer,allocatable :: idx(:),iwork(:)
+   real(wp) :: elow,damp,thr
+   real(wp),allocatable :: hpack(:),hfree(:,:),eigfree(:),aux(:)
+   external :: dsyevd
+
+   fail=.false.; self%xyz=xyz
+   nfree3=3*count(.not.freezelist)
+   if (nfree3-self%nvar /= 3) then
+      if (pr) write(*,*) 'reduced ANC dimension mismatch:',nfree3,self%nvar
+      fail=.true.; return
+   end if
+   allocate(idx(nfree3)); p=0
+   do atom=1,self%n
+      if (.not.freezelist(atom)) then
+         do c=1,3
+            p=p+1; idx(p)=3*(atom-1)+c
+         end do
+      end if
+   end do
+   allocate(hpack(nfree3*(nfree3+1)/2),source=0.0_wp)
+   if (size(hess) == size(hpack)) then
+      hpack=hess
+   else if (size(hess) == self%n3*(self%n3+1)/2) then
+      p=0
+      do i=1,nfree3
+         ii=idx(i)
+         do j=1,i
+            jj=idx(j); p=p+1
+            if (ii >= jj) then; q=ii*(ii-1)/2+jj
+            else; q=jj*(jj-1)/2+ii
+            end if
+            hpack(p)=hess(q)
+         end do
+      end do
+   else
+      if (pr) write(*,*) 'reduced ANC Hessian size mismatch:',size(hess)
+      fail=.true.; deallocate(idx,hpack); return
+   end if
+   call trproj_free(self%n,xyz,hpack,freezelist)
+   allocate(hfree(nfree3,nfree3),source=0.0_wp); p=0
+   do i=1,nfree3
+      do j=1,i
+         p=p+1; hfree(i,j)=hpack(p); hfree(j,i)=hpack(p)
+      end do
+   end do
+   allocate(eigfree(nfree3),source=0.0_wp)
+   lwork=1+6*nfree3+2*nfree3**2; liwork=8*nfree3
+   allocate(aux(lwork),source=0.0_wp); allocate(iwork(liwork),source=0)
+   call dsyevd('V','U',nfree3,hfree,nfree3,eigfree,aux,lwork,iwork,liwork,info)
+   deallocate(aux,iwork,hpack)
+   if (info /= 0) then
+      if (pr) write(*,*) 'reduced DSYEVD failed with info=',info
+      fail=.true.; deallocate(idx,hfree,eigfree); return
+   end if
+   thr=thr2; elow=minval(eigfree,mask=(abs(eigfree)>thr1))
+   damp=max(self%hlow-elow,0.0_wp)
+   where(abs(eigfree)>thr2) eigfree=eigfree+damp
+   self%eigv=0.0_wp; self%eigv(1:nfree3)=eigfree
+   if (pr) then
+      write(*,*) 'Projected frozen-host ANC dimension ',nfree3,' -> ',self%nvar
+      write(*,*) 'Shifting diagonal of reduced Hessian by ',damp
+   end if
+   fail=.true.
+   get_anc: do itry=1,maxtry
+      self%B=0.0_wp; self%hess=0.0_wp; nvar=0
+      do i=nfree3,1,-1
+         if (abs(eigfree(i))>thr .and. nvar<self%nvar) then
+            nvar=nvar+1; self%B(idx,nvar)=hfree(:,i)
+            self%hess(nvar+nvar*(nvar-1)/2)=min(max(eigfree(i),self%hlow),self%hmax)
+         end if
+      end do
+      if (nvar /= self%nvar) then; thr=thr*0.1_wp; cycle get_anc
+      end if
+      fail=.false.; exit get_anc
+   end do get_anc
+   if (fail) then
+      if (pr) write(*,*) 'reduced nvar, requested nvar',nvar,self%nvar
+      deallocate(idx,hfree,eigfree); return
+   end if
+   call sort(self%n3,self%nvar,self%hess,self%B)
+   self%coord=0.0_wp
+   deallocate(idx,hfree,eigfree)
+end subroutine generate_anc_frozen_reduced
+
+!========================================================================================!
+
   subroutine generate_anc_packed(self,xyz,hess,pr,fail)
     implicit none
     class(optimizer),intent(inout) :: self
@@ -399,7 +497,7 @@ contains  !> MODULE PROCEDURES START HERE
     integer :: ii,k,j,m,i
     integer,intent(in)    :: nat3,nvar
     real(wp),intent(inout) :: hess(nvar*(nvar+1)/2)
-    real(wp),intent(inout) :: b(nat3,nat3)
+    real(wp),intent(inout) :: b(nat3,nvar)
     real(wp) :: pp,sc1
     real(wp),allocatable   :: edum(:)
     allocate (edum(nvar),source=0.0_wp)

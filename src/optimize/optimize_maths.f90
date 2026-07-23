@@ -32,6 +32,7 @@ module optimize_maths
     module procedure :: trproj_frozen
   end interface
   public :: detrotra8
+  public :: trproj_free
   public :: solver_sdavidson
   public :: solver_ddavidson
   public :: solver_sspevx
@@ -121,6 +122,47 @@ contains !> MODULE PROCEDURES START HERE
       if (j+1 < last) call detrotra_qsort(a,j+1,last,ind)
     end subroutine detrotra_qsort
   end subroutine detrotra8
+
+!========================================================================================!
+
+  subroutine trproj_free(natoms,xyz,hess,freezelist)
+    implicit none
+    integer,intent(in) :: natoms
+    logical,intent(in) :: freezelist(natoms)
+    real(wp),intent(in) :: xyz(3,natoms)
+    real(wp),intent(inout) :: hess(:)
+    integer :: i, ifree, base, nfree3
+    real(wp) :: xm,ym,zm
+    real(wp),allocatable :: fmat(:,:)
+
+    nfree3 = 3*count(.not.freezelist)
+    if (size(hess) /= nfree3*(nfree3+1)/2) then
+      error stop 'trproj_free: inconsistent packed Hessian dimension'
+    end if
+    xm = sum(xyz(1,:))/real(natoms,wp)
+    ym = sum(xyz(2,:))/real(natoms,wp)
+    zm = sum(xyz(3,:))/real(natoms,wp)
+    allocate(fmat(nfree3,3),source=0.0_wp)
+    ifree = 0
+    do i = 1,natoms
+      if (.not.freezelist(i)) then
+        ifree = ifree+1
+        base = 3*(ifree-1)
+        fmat(base+1,1) = 0.0_wp
+        fmat(base+2,1) = -(xyz(3,i)-zm)
+        fmat(base+3,1) =  (xyz(2,i)-ym)
+        fmat(base+1,2) =  (xyz(3,i)-zm)
+        fmat(base+2,2) = 0.0_wp
+        fmat(base+3,2) = -(xyz(1,i)-xm)
+        fmat(base+1,3) = -(xyz(2,i)-ym)
+        fmat(base+2,3) =  (xyz(1,i)-xm)
+        fmat(base+3,3) = 0.0_wp
+      end if
+    end do
+    call dblckmgs(nfree3,3,nfree3,fmat)
+    call dsyprj(nfree3,3,fmat,nfree3,hess)
+    deallocate(fmat)
+  end subroutine trproj_free
 
 !========================================================================================!
 
@@ -258,7 +300,7 @@ contains !> MODULE PROCEDURES START HERE
 
     !> do projection
     call dsyprj(nat3,nprj,fmat,nat3,hess)
-    
+
     !$omp critical
     deallocate (fmat)
     !$omp end critical

@@ -93,7 +93,7 @@ contains  !> MODULE PROCEDURES START HERE
     real(wp) :: step,amu2au,au2cm,dumi,dumj,damp,hlow,edum,s6,thr
     real(wp) :: maxdispl,gthr,ethr,hmax,energy,rij(3),t1,t0,w1,w0
     real(wp) :: rot(3),gnorm
-    integer :: n3,i,j,k,l,jjj,ic,jc,ia,ja,ii,jj,info,nat3,info2
+    integer :: n3,i,j,k,l,jjj,ic,jc,ia,ja,ii,jj,info,nat3,info2,nfree3
     integer :: nvar,iter,nread,maxcycle,maxmicro,itry,maxopt,iupdat,iii
     integer :: id,ihess,error
     integer :: ilog
@@ -161,7 +161,12 @@ contains  !> MODULE PROCEDURES START HERE
 
 !>--- initialize OPT object
     !$omp critical
-    allocate (h(nat3,nat3),hess(nat3*(nat3+1)/2),eig(nat3))
+    if (calc%nfreeze > 0) then
+      nfree3 = 3*(mol%nat-calc%nfreeze)
+      allocate (hess(nfree3*(nfree3+1)/2))
+    else
+      allocate (h(nat3,nat3),hess(nat3*(nat3+1)/2),eig(nat3))
+    end if
     call OPT%allocate(mol%nat,nvar,hlow,hmax)
     allocate (molopt%at(mol%nat),molopt%xyz(3,mol%nat))
     !$omp end critical
@@ -203,27 +208,23 @@ contains  !> MODULE PROCEDURES START HERE
 !>======================================================================
 !>--- generate model Hessian
       if (pr) write (*,'(/,''generating ANC from model Hessian ...'')')
-      call modhes(calc,mhset,molopt%nat,molopt%xyz,molopt%at,hess,pr)
-
-!>--- project trans. and rot. from Hessian
-      if (.not.linear) then
-        if (calc%nfreeze == 0) then
-          call trproj(molopt%nat,nat3,molopt%xyz,hess,.false.,0,pmode,1)  !> normal
-        else
-          call trproj(molopt%nat,nat3,molopt%xyz,hess,.false.,calc%freezelist) !> fozen atoms
-        end if
-      end if
-
-!>--- ANC generation (requires blowup)
-      k = 0
-      do i = 1,nat3
-        do j = 1,i
-          k = k+1
-          h(i,j) = hess(k)
-          h(j,i) = hess(k)
+      if (calc%nfreeze > 0) then
+        call modhes_free(calc,mhset,molopt%nat,molopt%xyz,molopt%at, &
+          calc%freezelist,hess,pr)
+        call OPT%new_frozen(molopt%xyz,hess,calc%freezelist,pr,fail)
+      else
+        call modhes(calc,mhset,molopt%nat,molopt%xyz,molopt%at,hess,pr)
+        if (.not.linear) call trproj(molopt%nat,nat3,molopt%xyz,hess,.false.,0,pmode,1)
+        k = 0
+        do i = 1,nat3
+          do j = 1,i
+            k = k+1
+            h(i,j) = hess(k)
+            h(j,i) = hess(k)
+          end do
         end do
-      end do
-      call OPT%new(molopt%xyz,h,pr,linear,fail)
+        call OPT%new(molopt%xyz,h,pr,linear,fail)
+      end if
       if (fail) then
         iostatus = -1
         exit ANC_microiter
