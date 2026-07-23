@@ -57,6 +57,7 @@ srcs += files(
   'minitools.f90',
   'miscdata.f90',
   'ncigeo.f90',
+  'nci_input_ensemble.f90',
   'ompmklset.F90',
   'printouts.f90',
   'prmat.f90',

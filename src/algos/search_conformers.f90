@@ -35,10 +35,12 @@ subroutine crest_search_imtdgc(env,tim)
   use utilities
   use cregen_interface
   use crest_restartlog
+  use nci_input_ensemble,only:load_nci_input_ensemble,write_nci_input_starts,write_nci_mtd_jobs
   implicit none
   type(systemdata),intent(inout) :: env
   type(timer),intent(inout)      :: tim
   type(coord) :: mol,molnew
+  type(coord),allocatable :: nci_input_mols(:),mtd_mols(:)
   integer :: i,j,k,l,io,ich,m
   logical :: pr,wr,doreturn
 !===========================================================!
@@ -47,7 +49,9 @@ subroutine crest_search_imtdgc(env,tim)
   type(shakedata) :: shk
 
   type(mddata),allocatable :: mddats(:)
-  integer :: nsim,nallout
+  integer,allocatable :: bias_indices(:),input_indices(:)
+  integer :: nsim,nallout,ninputs,nbias,nbias_check
+  integer :: iinput,ibias,ijob
 
   real(wp) :: energy,gnorm
   real(wp),allocatable :: grad(:,:)
@@ -96,6 +100,14 @@ subroutine crest_search_imtdgc(env,tim)
 !>--- saftey terminations
   call crest_sampling_skip(env,doreturn)
   if (doreturn) return
+
+!>--- In NCI mode only, load additional positional XYZ frames for the first
+!>--- MTD stage. A one-frame XYZ leaves the upstream path unchanged.
+  ninputs = 1
+  if (env%NCI .and. .not.do_restart) then
+    call load_nci_input_ensemble(env,mol,nci_input_mols,ninputs)
+    if (ninputs > 1) call write_nci_input_starts(nci_input_mols)
+  end if
 
 !>--- sets the MD length according to a flexibility measure
   call md_length_setup(env)
@@ -162,14 +174,52 @@ subroutine crest_search_imtdgc(env,tim)
         !> Always seed a new MTD iteration from the currently selected reference,
         !> not from stale coordinates left from the original input or prior loop.
         call env%ref%to(mol)
-        nsim = -1 !>--- enambles automatic MTD setup in init routines
-        call crest_search_multimd_init(env,mol,mddat,nsim)
-        allocate (mddats(nsim),source=mddat)
-        call crest_search_multimd_init2(env,mddats,nsim)
+        if (start .and. i == 1 .and. ninputs > 1) then
+          nbias = -1
+          call crest_search_multimd_init(env,nci_input_mols(1),mddat,nbias)
+          nsim = ninputs*nbias
+          allocate (mddats(nsim),mtd_mols(nsim))
+          allocate (bias_indices(nsim),input_indices(nsim))
 
-        call tim%start(2,'Metadynamics (MTD)')
-        call crest_search_multimd(env,mol,mddats,nsim)
-        call tim%stop(2)
+          ijob = 0
+          do iinput = 1,ninputs
+            if (iinput > 1) then
+              nbias_check = nbias
+              call crest_search_multimd_init(env,nci_input_mols(iinput),mddat,nbias_check)
+              if (nbias_check /= nbias) then
+                error stop 'NCI multi-input bias count changed during job initialization.'
+              end if
+              mddat%simtype = type_mtd
+            end if
+            do ibias = 1,nbias
+              ijob = ijob+1
+              mtd_mols(ijob) = nci_input_mols(iinput)
+              mddats(ijob) = mddat
+              input_indices(ijob) = iinput
+              bias_indices(ijob) = ibias
+            end do
+          end do
+          if (ijob /= nsim) error stop 'NCI multi-input Cartesian job construction failed.'
+
+          call crest_search_multimd_init2_mapped(env,mddats,nsim,bias_indices,input_indices)
+          call write_nci_mtd_jobs(mddats)
+          write (stdout,'(1x,a,i0,a,i0,a,i0,a)') 'NCI first MTD batch: ',ninputs, &
+            ' inputs x ',nbias,' biases = ',nsim,' trajectories'
+          call tim%start(2,'Metadynamics (MTD)')
+          call crest_search_multimd2(env,mtd_mols,mddats,nsim)
+          call tim%stop(2)
+          call write_nci_mtd_jobs(mddats)
+          deallocate (mtd_mols,bias_indices,input_indices)
+        else
+          nsim = -1 !>--- enables automatic MTD setup in init routines
+          call crest_search_multimd_init(env,mol,mddat,nsim)
+          allocate (mddats(nsim),source=mddat)
+          call crest_search_multimd_init2(env,mddats,nsim)
+
+          call tim%start(2,'Metadynamics (MTD)')
+          call crest_search_multimd(env,mol,mddats,nsim)
+          call tim%stop(2)
+        end if
 !>--- a file called crest_dynamics.trj.xyz should have been written
         ensnam = 'crest_dynamics.trj.xyz'
         if (allocated(mddats)) deallocate (mddats)

@@ -60,6 +60,7 @@ list(APPEND srcs
   "${dir}/minitools.f90"
   "${dir}/miscdata.f90"
   "${dir}/ncigeo.f90"
+  "${dir}/nci_input_ensemble.f90"
   "${dir}/ompmklset.F90"
   "${dir}/printouts.f90"
   "${dir}/prmat.f90"
