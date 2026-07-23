@@ -1,0 +1,50 @@
+[submodule "subprojects/gfn0"]
+	path = subprojects/gfn0
+	url = https://github.com/pprcht/gfn0.git
+    branch = main
+[submodule "subprojects/toml-f"]
+	path = subprojects/toml-f
+	url = https://github.com/toml-f/toml-f.git
+    branch = main
+[submodule "subprojects/gfnff"]
+	path = subprojects/gfnff
+	url = https://github.com/pprcht/gfnff.git
+    branch = master 
+[submodule "subprojects/lwoniom"]
+	path = subprojects/lwoniom
+	url = https://github.com/crest-lab/lwoniom
+    branch = main
+[submodule "subprojects/test-drive"]
+	path = subprojects/test-drive
+	url = https://github.com/fortran-lang/test-drive.git
+[submodule "subprojects/tblite"]
+	path = subprojects/tblite
+	url = https://github.com/tblite/tblite.git
+  branch = main
+[submodule "subprojects/pvol"]
+	path = subprojects/pvol
+  url = https://github.com/pprcht/libpvol.git
+  branch = build-update
+[submodule "subprojects/fmlip_relay"]
+	path = subprojects/fmlip_relay
+	url = https://github.com/pprcht/fmlip-relay.git
+[submodule "subprojects/dftd4"]
+	path = subprojects/dftd4
+	url = https://github.com/dftd4/dftd4
+	branch = main
+[submodule "subprojects/mctc-lib"]
+	path = subprojects/mctc-lib
+	url = https://github.com/grimme-lab/mctc-lib.git
+[submodule "subprojects/mstore"]
+	path = subprojects/mstore
+	url = https://github.com/grimme-lab/mstore
+[submodule "subprojects/multicharge"]
+	path = subprojects/multicharge
+	url = https://github.com/grimme-lab/multicharge
+[submodule "subprojects/s-dftd3"]
+	path = subprojects/s-dftd3
+	url = https://github.com/dftd3/simple-dftd3
+[submodule "subprojects/ddx"]
+	path = subprojects/ddx
+	url = https://github.com/ddsolvation/ddX.git
+	branch = main

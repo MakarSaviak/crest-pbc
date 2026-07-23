@@ -1,0 +1,52 @@
+# This file is part of gfnff.
+# SPDX-Identifier: LGPL-3.0-or-later
+
+# ── Parallelism ────────────────────────────────────────────────────────────────
+option('openmp',
+  type    : 'boolean',
+  value   : true,
+  yield   : true,   # inherit from parent project (e.g. crest) when a subproject
+  description : 'Enable OpenMP parallelisation',
+)
+
+# ── LAPACK / BLAS provider ─────────────────────────────────────────────────────
+option('lapack',
+  type    : 'combo',
+  choices : ['auto', 'openblas', 'mkl', 'netlib', 'custom'],
+  value   : 'auto',
+  yield   : true,
+  description : 'LAPACK/BLAS provider',
+)
+option('lapack_libs',
+  type    : 'array',
+  value   : [],
+  yield   : true,
+  description : 'Library names for lapack=custom',
+)
+option('blas_libs',
+  type    : 'array',
+  value   : [],
+  yield   : true,
+  description : 'Library names for lapack=custom (BLAS side)',
+)
+
+# ── Static binary ──────────────────────────────────────────────────────────────
+option('static',
+  type    : 'boolean',
+  value   : false,
+  yield   : true,
+  description : 'Attempt a fully static binary',
+)
+
+# ── Optional features ──────────────────────────────────────────────────────────
+option('build_exe',
+  type    : 'boolean',
+  value   : false,
+  description : 'Build the standalone gfnff app',
+)
+
+option('tests',
+  type    : 'boolean',
+  value   : true,
+  description : 'Build unit tests',
+)

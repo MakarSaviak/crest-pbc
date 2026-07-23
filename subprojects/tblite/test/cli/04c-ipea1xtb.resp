@@ -1,0 +1,6 @@
+$ORIGIN/03-ser-xar.sdf
+--no-restart
+--method
+ipea1
+--grad
+--silent

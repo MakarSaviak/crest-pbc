@@ -1,0 +1,145 @@
+name: CI
+on:
+  push:
+    branches:
+      - main
+    tags:
+      - 'v*'
+  pull_request:
+    branches:
+      - main
+  schedule:
+    - cron: '00 04 * * 1' # 4am every Monday
+  workflow_dispatch:
+
+concurrency:
+  # Skip intermediate builds: always.
+  # Cancel intermediate builds: only if it is a pull request build.
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ startsWith(github.ref, 'refs/pull/') }}
+
+jobs:
+  #
+  # Fortran-side build and tests
+  #
+  build:
+    name: Build, Test, Install
+    runs-on: ubuntu-latest
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v2.0.0
+    - name: create build dir
+      run: cmake -E make_directory build
+    - name: build, test and install
+      run: |
+        sudo apt-get update
+        sudo apt-get install libblas-dev liblapack-dev
+        cd build
+        cmake -G "Unix Makefiles" -DCMAKE_Fortran_COMPILER="gfortran" -DCMAKE_INSTALL_PREFIX="/tmp/libddx" -DCMAKE_BUILD_TYPE=Release ..
+        make
+        ctest -VV
+        make install
+    - name: Run example
+      run: ./build/examples/run_ddx
+    - name: Run example
+      run: ./build/examples/run_ddx_low_level
+    - name: Test installation
+      run: |
+        mkdir /tmp/test
+        mv cmake/testddXinstall.cmake /tmp/test/CMakeLists.txt
+        cp tests/ddx_core.f90 /tmp/test/dd_core.f90
+        cd /tmp/test
+        mkdir build
+        cd build
+        cmake -DddX_DIR="/tmp/libddx/lib/ddX" ..
+        make
+
+  meson-test:
+    name: Meson Build and Standalone Tests
+    runs-on: ubuntu-latest
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v2.0.0
+    - name: Install dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y meson ninja-build libblas-dev liblapack-dev
+    - name: Configure and build with Meson
+      run: |
+        meson setup build
+        ninja -C build
+    - name: Run standalone tests
+      run: |
+        meson test -C build --no-rebuild \
+          ddX:cosmo \
+          ddX:cosmo_fmm \
+          ddX:cosmo_incore \
+          ddX:pcm_fmm \
+          ddX:pcm \
+          ddX:pcm_incore \
+          ddX:lpb \
+          ddX:lpb_fmm \
+          ddX:lpb_incore
+
+  fpm-test:
+    name: Fortran package manager build and standalone tests
+    runs-on: ubuntu-latest
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v2.0.0
+    - name: Install dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y libblas-dev liblapack-dev
+    - name: Install fpm
+      run: |
+        curl -L https://github.com/fortran-lang/fpm/releases/download/v0.13.0/fpm-0.13.0-linux-x86_64-gcc-12 -o fpm
+        chmod +x fpm
+        sudo mv fpm /usr/local/bin/fpm
+    - name: Configure and build with FPM
+      run: |
+        fpm build
+    - name: Run a selection of standalone tests
+      run: |
+        fpm test --target fpm_wrapper_standalone
+
+  #
+  # Python-side tests
+  #
+  python:
+    name: Python tests on ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - {os: ubuntu-latest}
+          - {os: macos-latest}
+    steps:
+      - uses: actions/checkout@v2
+      - uses: actions/setup-python@v2
+        with:
+          python-version: '3.8'
+      - uses: fortran-lang/setup-fortran@main
+        id: setup-fortran
+        with:
+          compiler: gcc
+          version: 11
+        if: contains( matrix.os, 'macos')
+      - name: Install system dependencies on macOS
+        run:  brew install ninja
+        if: contains( matrix.os, 'macos')
+      - name: Install BLAS and LAPACK
+        run: |
+          sudo apt-get update
+          sudo apt-get install libblas-dev liblapack-dev
+        if: contains( matrix.os, 'ubuntu')
+      - name: Install python dependencies
+        run: |
+          python -m pip install --user wheel pybind11
+          python -m pip install --user -e .[test]
+      - name: Run python tests
+        run: |
+          python -m pytest src
+      - name: Run example
+        run: python examples/run_ddx.py

@@ -1,0 +1,40 @@
+[build-system]
+requires      = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name        = "fmlip-relay"
+version     = "0.1.0"
+description = "Persistent ML potential server for Fortran clients"
+readme      = "README.md"
+license     = { file = "LICENSE" }
+authors     = [{name = "Philipp Pracht"}]
+requires-python = ">=3.10"
+
+dependencies = [
+    "numpy>=1.24",
+]
+
+[project.optional-dependencies]
+mace = [
+    "mace-torch",
+    "ase>=3.22",
+]
+uma = [
+    "fairchem-core>=2.0",
+    "ase>=3.22",
+]
+dev = [
+    "pytest",
+    "pytest-cov",
+]
+
+[project.scripts]
+fmlip-relay-server = "fmlip_relay.__main__:main"
+fmlip-relay-check = "fmlip_relay.check:main"
+
+[tool.setuptools.packages.find]
+where = ["src/python"]
+
+[tool.setuptools.package-dir]
+"" = "src/python"

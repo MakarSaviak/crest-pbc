@@ -1,0 +1,927 @@
+# This file is part of tblite.
+# SPDX-Identifier: LGPL-3.0-or-later
+#
+# tblite is free software: you can redistribute it and/or modify it under
+# the terms of the GNU Lesser General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# tblite is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU Lesser General Public License for more details.
+#
+# You should have received a copy of the GNU Lesser General Public License
+# along with tblite.  If not, see <https://www.gnu.org/licenses/>.
+"""
+Thin wrapper around CFFI extension module tblite.
+
+This module mainly acts as a guard for importing the libtblite extension and
+also provides some FFI based wappers for memory handling.
+"""
+
+import functools
+import sys
+from typing import Any, Callable, Dict, Optional, Union
+
+import numpy as np
+
+try:
+    from ._libtblite import ffi, lib
+except ImportError as e:
+    raise ImportError("tblite C extension unimportable, cannot use C-API") from e
+
+from .exceptions import TBLiteRuntimeError, TBLiteValueError
+
+
+def get_version() -> tuple:
+    """Return the current API version from tblite.
+    For easy usage in C the API version is provided as
+
+    10000 * major + 100 * minor + patch
+
+    For Python we want something that looks like a semantic version again.
+    """
+    version = lib.tblite_get_version()
+    return (
+        version // 10000,
+        version % 10000 // 100,
+        version % 100,
+    )
+
+
+def _delete_error(error) -> None:
+    """Delete a tblite error handler object"""
+    ptr = ffi.new("tblite_error *")
+    ptr[0] = error
+    lib.tblite_delete_error(ptr)
+
+
+def new_error():
+    """Create new tblite error handler object"""
+    return ffi.gc(lib.tblite_new_error(), _delete_error)
+
+
+def error_check(func):
+    """Handle errors for library functions that require an error handle"""
+
+    @functools.wraps(func)
+    def handle_error(*args, **kwargs):
+        """Run function and than compare context"""
+        _err = new_error()
+        value = func(_err, *args, **kwargs)
+        if lib.tblite_check_error(_err):
+            _message = ffi.new("char[]", 512)
+            lib.tblite_get_error(_err, _message, ffi.NULL)
+            raise TBLiteRuntimeError(ffi.string(_message).decode())
+        return value
+
+    return handle_error
+
+
+@ffi.def_extern()
+def logger_callback(error, message, nchar, data):
+    """Custom logger callback to write output in a Python friendly way"""
+    try:
+        callback = ffi.from_handle(data)
+        callback(ffi.unpack(message, nchar).decode())
+    except Exception as e:
+        error_message = ffi.new("char[]", str(e).encode())
+        lib.tblite_set_error(
+            error,
+            error_message,
+            ffi.NULL,
+        )
+
+
+def context_check(func):
+    """Handle errors for library functions that require a context handle"""
+
+    @functools.wraps(func)
+    def handle_context_error(ctx, *args, **kwargs):
+        """Run function and than compare context"""
+        if isinstance(ctx, tuple):
+            ctx, _ = ctx
+        value = func(ctx, *args, **kwargs)
+        if lib.tblite_check_context(ctx):
+            _message = ffi.new("char[]", 512)
+            lib.tblite_get_context_error(ctx, _message, ffi.NULL)
+            raise TBLiteRuntimeError(ffi.string(_message).decode())
+        return value
+
+    return handle_context_error
+
+
+def _delete_context(context) -> None:
+    """Delete a tblite context handler object"""
+    ptr = ffi.new("tblite_context *")
+    ptr[0] = context
+    lib.tblite_delete_context(ptr)
+
+
+def new_context(color: bool = True, logger: Callable[[str], None] = print):
+    """Create new tblite context handler object"""
+    ctx = ffi.gc(lib.tblite_new_context(), _delete_context)
+    handle = ffi.new_handle(logger)
+    context_check(lib.tblite_set_context_logger)(ctx, lib.logger_callback, handle)
+    if color and sys.stdout.isatty():
+        context_check(lib.tblite_set_context_color)(ctx, 1)
+    return ctx, handle
+
+
+def _delete_structure(mol) -> None:
+    """Delete molecular structure data"""
+    ptr = ffi.new("tblite_structure *")
+    ptr[0] = mol
+    lib.tblite_delete_structure(ptr)
+
+
+def new_structure(natoms, numbers, positions, charge, uhf, lattice, periodic):
+    """Create new molecular structure data"""
+    return ffi.gc(
+        error_check(lib.tblite_new_structure)(
+            natoms,
+            numbers,
+            positions,
+            charge,
+            uhf,
+            lattice,
+            periodic,
+        ),
+        _delete_structure,
+    )
+
+
+update_structure_geometry = error_check(lib.tblite_update_structure_geometry)
+update_structure_charge = error_check(lib.tblite_update_structure_charge)
+update_structure_uhf = error_check(lib.tblite_update_structure_uhf)
+
+
+def _delete_table(table) -> None:
+    """Delete a tblite data table object"""
+    ptr = ffi.new("tblite_table *")
+    ptr[0] = table
+    lib.tblite_delete_table(ptr)
+
+
+def new_table():
+    """Create a tblite data table object"""
+    return ffi.gc(lib.tblite_new_table(ffi.NULL), _delete_table)
+
+
+def _delete_array(array) -> None:
+    """Delete a tblite data array object"""
+    ptr = ffi.new("tblite_array *")
+    ptr[0] = array
+    lib.tblite_delete_array(ptr)
+
+
+def new_array():
+    """Create a tblite data array object"""
+    return ffi.gc(lib.tblite_new_array(), _delete_array)
+
+
+table_set_double = error_check(lib.tblite_table_set_double)
+table_set_int64_t = error_check(lib.tblite_table_set_int64_t)
+table_set_bool = error_check(lib.tblite_table_set_bool)
+table_set_char = error_check(lib.tblite_table_set_char)
+table_set_array = error_check(lib.tblite_table_set_array)
+table_get_type = error_check(lib.tblite_table_get_type)
+table_get_n_keys = error_check(lib.tblite_table_get_n_keys)
+table_get_table = error_check(lib.tblite_table_get_table)
+table_get_array = error_check(lib.tblite_table_get_array)
+array_push_back_double = error_check(lib.tblite_array_push_back_double)
+array_push_back_int64_t = error_check(lib.tblite_array_push_back_int64_t)
+array_push_back_bool = error_check(lib.tblite_array_push_back_bool)
+array_push_back_char = error_check(lib.tblite_array_push_back_char)
+array_size = error_check(lib.tblite_array_size)
+array_get_type = error_check(lib.tblite_array_get_type)
+
+
+def table_get_bool(table, key):
+    """Read a boolean value from a tblite table entry."""
+    if isinstance(key, str):
+        key = key.encode("utf-8")
+    value = ffi.new("bool *")
+    error_check(lib.tblite_table_get_bool)(table, key, value)
+    return bool(value[0])
+
+
+def table_get_int64_t(table, key):
+    """Read an integer value from a tblite table entry."""
+    if isinstance(key, str):
+        key = key.encode("utf-8")
+    value = ffi.new("int64_t *")
+    error_check(lib.tblite_table_get_int64_t)(table, key, value)
+    return int(value[0])
+
+
+def table_get_double(table, key):
+    """Read a floating-point value from a tblite table entry."""
+    if isinstance(key, str):
+        key = key.encode("utf-8")
+    value = ffi.new("double *")
+    error_check(lib.tblite_table_get_double)(table, key, value)
+    return float(value[0])
+
+
+def table_get_char(table, key):
+    """Read a string value from a tblite table entry."""
+    if isinstance(key, str):
+        key = key.encode("utf-8")
+    value = ffi.new("char[]", 512)
+    error_check(lib.tblite_table_get_char)(table, key, value, 512)
+    return ffi.string(value).decode("utf-8")
+
+
+def table_get_key(table, index):
+    """Read a key name from a tblite table by index."""
+    value = ffi.new("char[]", 512)
+    error_check(lib.tblite_table_get_key)(table, index, value, 512)
+    return ffi.string(value)
+
+
+def array_get_double(array, index):
+    """Read a floating-point value from a tblite array entry."""
+    value = ffi.new("double *")
+    error_check(lib.tblite_array_get_double)(array, index, value)
+    return float(value[0])
+
+
+def array_get_int64_t(array, index):
+    """Read an integer value from a tblite array entry."""
+    value = ffi.new("int64_t *")
+    error_check(lib.tblite_array_get_int64_t)(array, index, value)
+    return int(value[0])
+
+
+def array_get_bool(array, index):
+    """Read a boolean value from a tblite array entry."""
+    value = ffi.new("bool *")
+    error_check(lib.tblite_array_get_bool)(array, index, value)
+    return bool(value[0])
+
+
+def array_get_char(array, index):
+    """Read a string value from a tblite array entry."""
+    value = ffi.new("char[]", 512)
+    error_check(lib.tblite_array_get_char)(array, index, value, 512)
+    return ffi.string(value).decode("utf-8")
+
+
+def table_add_table(table, key):
+    """Create a child table attached to an existing table object."""
+    if isinstance(key, str):
+        key = key.encode("utf-8")
+    return ffi.gc(
+        error_check(lib.tblite_table_add_table)(table, key),
+        _delete_table,
+    )
+
+
+def _delete_param(param) -> None:
+    """Delete a tblite parametrization record object"""
+    ptr = ffi.new("tblite_param *")
+    ptr[0] = param
+    lib.tblite_delete_param(ptr)
+
+
+def new_param():
+    """Create a tblite data table object"""
+    return ffi.gc(lib.tblite_new_param(), _delete_param)
+
+
+load_param = error_check(lib.tblite_load_param)
+dump_param = error_check(lib.tblite_dump_param)
+dump_table = error_check(lib.tblite_dump_table)
+export_gfn2_param = error_check(lib.tblite_export_gfn2_param)
+export_gfn1_param = error_check(lib.tblite_export_gfn1_param)
+export_ipea1_param = error_check(lib.tblite_export_ipea1_param)
+
+
+def _is_scalar(value) -> bool:
+    """Check whether a value should be treated as a scalar for table conversion."""
+    return isinstance(value, (str, bytes, bool, int, float, np.integer, np.floating, np.bool_))
+
+
+def _to_python_scalar(value):
+    """Convert numpy scalar values to plain Python scalars."""
+    if isinstance(value, np.generic):
+        return value.item()
+    return value
+
+
+def _set_scalar(table, key, value) -> None:
+    """Set a scalar value in a table."""
+    if isinstance(key, str):
+        key = key.encode("utf-8")
+    if isinstance(value, bool) or isinstance(value, np.bool_):
+        ptr = ffi.new("bool[]", [bool(value)])
+        table_set_bool(table, key, ptr, 0)
+    elif isinstance(value, (int, np.integer)) and not isinstance(value, bool):
+        ptr = ffi.new("int64_t[]", [int(value)])
+        table_set_int64_t(table, key, ptr, 0)
+    elif isinstance(value, (float, np.floating)):
+        ptr = ffi.new("double[]", [float(value)])
+        table_set_double(table, key, ptr, 0)
+    elif isinstance(value, (str, bytes)):
+        if isinstance(value, bytes):
+            value = value.decode("utf-8")
+        ptr = ffi.new("char[]", value.encode("utf-8"))
+        table_set_char(table, key, ffi.cast("char(*)[]", ptr), 0)
+    else:
+        raise TBLiteValueError(f"Unsupported scalar type {type(value)!r}")
+
+
+def _set_sequence(table, key, values) -> None:
+    """Set a sequence of scalars as a table array entry."""
+    if isinstance(key, str):
+        key = key.encode("utf-8")
+    if len(values) == 0:
+        raise TBLiteValueError("Empty sequences are not supported in parametrization tables")
+
+    normalized = []
+    for value in values:
+        if isinstance(value, np.ndarray):
+            if value.ndim == 0:
+                value = value.item()
+            else:
+                raise TBLiteValueError("Only one-dimensional arrays are supported")
+        if isinstance(value, (list, tuple)):
+            raise TBLiteValueError("Nested sequences are not supported in parametrization tables")
+        normalized.append(_to_python_scalar(value))
+
+    if all(isinstance(value, bool) or isinstance(value, np.bool_) for value in normalized):
+        array = new_array()
+        for value in normalized:
+            array_push_back_bool(array, bool(value))
+        table_set_array(table, key, array)
+    elif all(isinstance(value, (int, np.integer)) and not isinstance(value, bool) for value in normalized):
+        array = new_array()
+        for value in normalized:
+            array_push_back_int64_t(array, int(value))
+        table_set_array(table, key, array)
+    elif all(isinstance(value, (float, np.floating)) for value in normalized):
+        array = new_array()
+        for value in normalized:
+            array_push_back_double(array, float(value))
+        table_set_array(table, key, array)
+    elif all(isinstance(value, (str, bytes)) for value in normalized):
+        array = new_array()
+        for value in normalized:
+            if isinstance(value, str):
+                value = value.encode("utf-8")
+            array_push_back_char(array, ffi.new("char[]", value))
+        table_set_array(table, key, array)
+    else:
+        raise TBLiteValueError("Mixed or unsupported sequence types are not supported")
+
+
+def dict_to_table(data: Dict[str, Any]) -> Any:
+    """Convert a nested Python mapping into a tblite table object."""
+    if not isinstance(data, dict):
+        raise TBLiteValueError("Expected a dictionary for parametrization data")
+
+    table = new_table()
+
+    def _populate(target, mapping):
+        for key, value in mapping.items():
+            if isinstance(value, dict):
+                child = table_add_table(target, str(key))
+                _populate(child, value)
+            elif isinstance(value, (list, tuple, np.ndarray)):
+                _set_sequence(target, str(key), list(value))
+            elif _is_scalar(value):
+                _set_scalar(target, str(key), value)
+            else:
+                raise TBLiteValueError(f"Unsupported value type {type(value)!r}")
+
+    _populate(table, data)
+    return table
+
+
+def _table_to_python(table: Any) -> Any:
+    """Convert a tblite table object into nested Python data structures."""
+    if table is None:
+        raise TBLiteValueError("Table object is missing")
+
+    nkeys = table_get_n_keys(table)
+    data = {}
+    for index in range(1, nkeys + 1):
+        key = table_get_key(table, index)
+        kind = table_get_type(table, key)
+
+        if kind == 0:
+            raise TBLiteValueError(f"Unsupported table entry type for key {key!r}")
+        if kind == 1:
+            value = table_get_bool(table, key)
+        elif kind == 2:
+            value = table_get_int64_t(table, key)
+        elif kind == 3:
+            value = table_get_double(table, key)
+        elif kind == 4:
+            value = table_get_char(table, key)
+        elif kind == 5:
+            array = table_get_array(table, key)
+            size = array_size(array)
+            values = []
+            for entry in range(1, size + 1):
+                entry_kind = array_get_type(array, entry)
+                if entry_kind == 1:
+                    values.append(array_get_bool(array, entry))
+                elif entry_kind == 2:
+                    values.append(array_get_int64_t(array, entry))
+                elif entry_kind == 3:
+                    values.append(array_get_double(array, entry))
+                elif entry_kind == 4:
+                    values.append(array_get_char(array, entry))
+                else:
+                    raise TBLiteValueError("Only scalar array entries are supported")
+            value = values
+        elif kind == 6:
+            child = table_get_table(table, key)
+            value = _table_to_python(child)
+        else:
+            raise TBLiteValueError(f"Unsupported table entry kind {kind}")
+
+        data[key.decode("utf-8") if isinstance(key, bytes) else key] = value
+
+    return data
+
+
+def table_to_dict(table: Any) -> Dict[str, Any]:
+    """Convert a tblite table object into a nested Python mapping."""
+    return _table_to_python(table)
+
+
+def _delete_result(result) -> None:
+    """Delete a tblite result container object"""
+    ptr = ffi.new("tblite_result *")
+    ptr[0] = result
+    lib.tblite_delete_result(ptr)
+
+
+def new_result():
+    """Create new tblite result container object"""
+    return ffi.gc(lib.tblite_new_result(), _delete_result)
+
+
+def copy_result(res):
+    """Create new tblite result container object as copy of an existing result"""
+    return ffi.gc(lib.tblite_copy_result(res), _delete_result)
+
+
+def get_number_of_atoms(res) -> int:
+    """Retrieve number of atoms from result container"""
+    _natoms = ffi.new("int *")
+    error_check(lib.tblite_get_result_number_of_atoms)(res, _natoms)
+    return _natoms[0]
+
+
+def get_number_of_orbitals(res) -> int:
+    """Retrieve number of orbitals from result container"""
+    _norb = ffi.new("int *")
+    error_check(lib.tblite_get_result_number_of_orbitals)(res, _norb)
+    return _norb[0]
+
+
+def get_number_of_spins(res) -> int:
+    """Retrieve number of spins from result container"""
+    _nspin = ffi.new("int *")
+    error_check(lib.tblite_get_result_number_of_spins)(res, _nspin)
+    return _nspin[0]
+
+
+def get_energy(res) -> np.ndarray:
+    """Retrieve energy from result container"""
+    _energy = np.array(0.0)
+    error_check(lib.tblite_get_result_energy)(
+        res, ffi.cast("double*", _energy.ctypes.data)
+    )
+    return _energy
+
+
+def get_energies(res) -> np.ndarray:
+    """Retrieve atom-resolved energies from result container"""
+    _energies = np.zeros((get_number_of_atoms(res),))
+    error_check(lib.tblite_get_result_energies)(
+        res, ffi.cast("double*", _energies.ctypes.data)
+    )
+    return _energies
+
+
+def get_gradient(res) -> np.ndarray:
+    """Retrieve gradient from result container"""
+    _gradient = np.zeros((get_number_of_atoms(res), 3))
+    error_check(lib.tblite_get_result_gradient)(
+        res, ffi.cast("double*", _gradient.ctypes.data)
+    )
+    return _gradient
+
+
+def get_virial(res) -> np.ndarray:
+    """Retrieve virial from result container"""
+    _virial = np.zeros((3, 3))
+    error_check(lib.tblite_get_result_virial)(
+        res, ffi.cast("double*", _virial.ctypes.data)
+    )
+    return _virial
+
+
+def get_charges(res) -> np.ndarray:
+    """Retrieve atomic charges from result container"""
+    _charges = np.zeros((get_number_of_atoms(res),))
+    error_check(lib.tblite_get_result_charges)(
+        res, ffi.cast("double*", _charges.ctypes.data)
+    )
+    return _charges
+
+
+def get_bond_orders(res) -> np.ndarray:
+    """Retrieve Wiberg / Mayer bond orders from result container"""
+    _dict = get_post_processing_dict(res=res)
+    if "bond-orders" not in _dict:
+        raise TBLiteValueError(
+            "Bond-orders were not calculated. By default they are computed."
+        )
+    _bond_orders = _dict["bond-orders"]
+    return _bond_orders
+
+
+def get_dipole(res) -> np.ndarray:
+    """Retrieve dipole moment from post processing dictionary"""
+    _dict = get_post_processing_dict(res=res)
+    if "molecular-dipole" not in _dict:
+        raise TBLiteValueError(
+            "Molecular dipole was not calculated. By default it is computed."
+        )
+    _dipole = _dict["molecular-dipole"]
+    return _dipole
+
+
+def get_quadrupole(res) -> np.ndarray:
+    """Retrieve quadrupole moment from post processing dictionary"""
+    _dict = get_post_processing_dict(res=res)
+    if "molecular-quadrupole" not in _dict:
+        raise TBLiteValueError(
+            "Molecular quadrupole was not calculated. By default it is computed."
+        )
+    _quadrupole = _dict["molecular-quadrupole"]
+    return _quadrupole
+
+
+def get_orbital_energies(res) -> np.ndarray:
+    """Retrieve orbital energies from result container"""
+    _norb = get_number_of_orbitals(res)
+    _nspin = get_number_of_spins(res)
+    _emo = np.zeros((_nspin, _norb))
+    error_check(lib.tblite_get_result_orbital_energies)(
+        res, ffi.cast("double*", _emo.ctypes.data)
+    )
+    if _nspin == 1:
+        return np.squeeze(_emo, axis=0)
+    return _emo
+
+
+def get_orbital_occupations(res) -> np.ndarray:
+    """Retrieve orbital occupations from result container"""
+    _norb = get_number_of_orbitals(res)
+    _nspin = get_number_of_spins(res)
+    _occ = np.zeros((2, _norb))
+    error_check(lib.tblite_get_result_orbital_occupations)(
+        res, ffi.cast("double*", _occ.ctypes.data)
+    )
+    if _nspin == 1:
+        return np.sum(_occ, axis=0)
+    return _occ
+
+
+def load_wavefunction(res, filename: str) -> None:
+    _filename = ffi.new("char[]", filename.encode("ascii"))
+    error_check(lib.tblite_load_result_wavefunction)(res, _filename)
+
+
+def save_wavefunction(res, filename: str) -> None:
+    _filename = ffi.new("char[]", filename.encode("ascii"))
+    error_check(lib.tblite_save_result_wavefunction)(res, _filename)
+
+
+def _get_ao_matrix(getter, is_spin_dependent: bool):
+    """Correctly set allocation for matrix objects before querying the getter"""
+
+    @functools.wraps(getter)
+    def with_allocation(res):
+        """Get a matrix property from the results object"""
+        _norb = get_number_of_orbitals(res)
+        _nspin = get_number_of_spins(res) if is_spin_dependent else 1
+
+        # (_norb, _norb, _nspin) in col-major -> (_nspin, _norb, _norb) in row-major
+        # this will allow us to extract alpha- and beta matrices as mat[0] and mat[1]
+        _mat = np.zeros((_nspin, _norb, _norb))
+        error_check(getter)(res, ffi.cast("double*", _mat.ctypes.data))
+
+        # Transpose actual matrix from col-major to row-major
+        # -> important for orbital coefficients
+        _mat = np.swapaxes(_mat, 1, 2)
+
+        if _nspin == 1:
+            return np.squeeze(_mat, axis=0)
+        return _mat
+
+    return with_allocation
+
+
+get_orbital_coefficients = _get_ao_matrix(
+    lib.tblite_get_result_orbital_coefficients, True
+)
+get_density_matrix = _get_ao_matrix(lib.tblite_get_result_density_matrix, True)
+get_overlap_matrix = _get_ao_matrix(lib.tblite_get_result_overlap_matrix, False)
+get_hamiltonian_matrix = _get_ao_matrix(lib.tblite_get_result_hamiltonian_matrix, False)
+
+
+def _delete_calculator(calc) -> None:
+    """Delete a tblite calculator object"""
+    ptr = ffi.new("tblite_calculator *")
+    ptr[0] = calc
+    lib.tblite_delete_calculator(ptr)
+
+
+@context_check
+def new_gfn2_calculator(ctx, mol, cfg=None):
+    """Create new tblite calculator loaded with GFN2-xTB parametrization data"""
+    return ffi.gc(
+        lib.tblite_new_gfn2_calculator(ctx, mol, tblite_xtb_config(cfg)),
+        _delete_calculator,
+    )
+
+
+@context_check
+def new_gfn1_calculator(ctx, mol, cfg=None):
+    """Create new tblite calculator loaded with GFN1-xTB parametrization data"""
+    return ffi.gc(
+        lib.tblite_new_gfn1_calculator(ctx, mol, tblite_xtb_config(cfg)),
+        _delete_calculator,
+    )
+
+
+@context_check
+def new_ipea1_calculator(ctx, mol, cfg=None):
+    """Create new tblite calculator loaded with IPEA1-xTB parametrization data"""
+    return ffi.gc(
+        lib.tblite_new_ipea1_calculator(ctx, mol, tblite_xtb_config(cfg)),
+        _delete_calculator,
+    )
+
+
+@context_check
+def new_xtb_calculator(ctx, mol, param, cfg=None):
+    """Create new tblite calculator from parametrization records"""
+    return ffi.gc(
+        lib.tblite_new_xtb_calculator(ctx, mol, param, tblite_xtb_config(cfg)),
+        _delete_calculator,
+    )
+
+
+def tblite_xtb_config(config: Optional[Dict[str, Any]] = None):
+    if config is None:
+        return ffi.NULL
+
+    SUPPORTED_KEYS = {"smooth_cutoff": 0.05}
+
+    if set(config.keys()) - set(SUPPORTED_KEYS.keys()):
+        raise TBLiteValueError(
+            f"Unsupported configuration keys: {set(config.keys()) - set(SUPPORTED_KEYS.keys())}. "
+            f"Supported keys are: {SUPPORTED_KEYS.keys()}."
+        )
+
+    return ffi.new(
+        "tblite_xtb_config *",
+        {
+            key: config.get(key, default)
+            for key, default in SUPPORTED_KEYS.items()
+        }
+    )
+
+
+def get_calculator_shell_map(ctx, calc) -> np.ndarray:
+    """Retrieve index mapping from shells to atomic centers"""
+    _nsh = ffi.new("int *")
+    context_check(lib.tblite_get_calculator_shell_count)(ctx, calc, _nsh)
+    _map = np.zeros((_nsh[0],), dtype=np.int32)
+    context_check(lib.tblite_get_calculator_shell_map)(
+        ctx, calc, ffi.cast("int*", _map.ctypes.data)
+    )
+    return _map
+
+
+def _delete_double_dictionary(calc) -> None:
+    """Delete a tblite double dictionary object"""
+    ptr = ffi.new("tblite_double_dictionary *")
+    ptr[0] = calc
+    lib.tblite_delete_double_dictionary(ptr)
+
+
+def get_post_processing_dict(res) -> Dict[str, np.ndarray]:
+    """Retrieve the dictionary containing all post processing results"""
+    _dict = ffi.gc(
+        error_check(lib.tblite_get_post_processing_dict)(res),
+        _delete_double_dictionary,
+    )
+    _nentries = error_check(lib.tblite_get_n_entries_dict)(_dict)
+    _dict_py = {}
+    for i in range(1, _nentries + 1):
+        _index = ffi.new("const int*", i)
+
+        _dim1 = ffi.new("int*")
+        _dim2 = ffi.new("int*")
+        _dim3 = ffi.new("int*")
+        error_check(lib.tblite_get_array_size_index)(_dict, _index, _dim1, _dim2, _dim3)
+        if _dim3[0] == 0:
+            if _dim2[0] == 0:
+                _array = np.zeros((_dim1[0],))
+            else:
+                _array = np.zeros((_dim1[0], _dim2[0]))
+        else:
+            _array = np.zeros((_dim1[0], _dim2[0], _dim3[0]))
+
+        error_check(lib.tblite_get_array_entry_index)(
+            _dict, _index, ffi.cast("double*", _array.ctypes.data)
+        )
+        _message = ffi.new("char[]", 512)
+        error_check(lib.tblite_get_label_entry_index)(_dict, _index, _message, ffi.NULL)
+        label = ffi.string(_message).decode()
+        _dict_py[label] = _array
+    return _dict_py
+
+
+def get_calculator_angular_momenta(ctx, calc) -> np.ndarray:
+    """Retrieve angular momenta of shells"""
+    _nsh = ffi.new("int *")
+    context_check(lib.tblite_get_calculator_shell_count)(ctx, calc, _nsh)
+    _am = np.zeros((_nsh[0],), dtype=np.int32)
+    context_check(lib.tblite_get_calculator_angular_momenta)(
+        ctx, calc, ffi.cast("int*", _am.ctypes.data)
+    )
+    return _am
+
+
+def get_calculator_orbital_map(ctx, calc) -> np.ndarray:
+    """Retrieve index mapping from atomic orbitals to shells"""
+    _nao = ffi.new("int *")
+    context_check(lib.tblite_get_calculator_orbital_count)(ctx, calc, _nao)
+    _map = np.zeros((_nao[0],), dtype=np.int32)
+    context_check(lib.tblite_get_calculator_orbital_map)(
+        ctx, calc, ffi.cast("int*", _map.ctypes.data)
+    )
+    return _map
+
+
+set_calculator_max_iter = context_check(lib.tblite_set_calculator_max_iter)
+set_calculator_accuracy = context_check(lib.tblite_set_calculator_accuracy)
+set_calculator_mixer_damping = context_check(lib.tblite_set_calculator_mixer_damping)
+set_calculator_mixer_memory = context_check(lib.tblite_set_calculator_mixer_memory)
+set_calculator_guess = context_check(lib.tblite_set_calculator_guess)
+set_calculator_temperature = context_check(lib.tblite_set_calculator_temperature)
+set_calculator_save_integrals = context_check(lib.tblite_set_calculator_save_integrals)
+
+
+def set_calculator_mixer(ctx, calc, mixer):
+    """Set the SCF mixer."""
+    if isinstance(mixer, str):
+        mixer_name = mixer
+    elif isinstance(mixer, (tuple, list)) and len(mixer) == 1:
+        mixer_name = mixer[0]
+    else:
+        raise TBLiteValueError("Expected mixer as a string")
+
+    mixer_map = {
+        "broyden": lib.TBLITE_MIXER_BROYDEN,
+    }
+    try:
+        mixer_value = mixer_map[mixer_name]
+    except KeyError as exc:
+        raise TBLiteValueError(f"Unknown SCF mixer '{mixer_name}'") from exc
+
+    context_check(lib.tblite_set_calculator_mixer)(ctx, calc, mixer_value)
+
+
+def set_calculator_temperature_annealing(ctx, calc, annealing):
+    """Set electronic-temperature annealing as start or (start, hold, cycles)."""
+    if isinstance(annealing, (tuple, list)):
+        if len(annealing) != 3:
+            raise TBLiteValueError("Expected annealing as start or (start, hold, cycles)")
+        initial_etemp, hold, cycles = annealing
+    else:
+        initial_etemp, hold, cycles = annealing, 50, 50
+
+    context_check(lib.tblite_set_calculator_temperature_annealing)(
+        ctx, calc, initial_etemp, int(hold), int(cycles)
+    )
+
+
+@context_check
+def post_processing_push_back(ctx, calc, mol, s):
+    _string = ffi.new("char[]", s.encode("ascii"))
+    lib.tblite_push_back_post_processing_str(ctx, calc, mol, _string)
+
+
+@context_check
+def set_calculator_verbosity(ctx, calc, verbosity: int):
+    """Set verbosity in context associated with calculator"""
+    lib.tblite_set_context_verbosity(ctx, verbosity)
+
+
+get_singlepoint = context_check(lib.tblite_get_singlepoint)
+
+
+def _delete_container(cont) -> None:
+    """Delete a tblite container object"""
+    ptr = ffi.new("tblite_container *")
+    ptr[0] = cont
+    lib.tblite_delete_container(ptr)
+
+
+def new_electric_field(ctx, mol, calc, efield):
+    """Create new tblite electric field object"""
+    return lib.tblite_new_electric_field(efield)
+
+
+_state_enum = {
+    "gsolv": 1,
+    "bar1mol": 2,
+    "reference": 3,
+}
+
+_born_enum = {
+    "still": 1,
+    "p16": 2,
+}
+
+_ddx_model_enum = {
+    "cosmo": 100,
+    "cpcm": 101,
+    "pcm": 200,
+  }
+
+
+def new_alpb_solvation(
+    ctx, mol, calc, solvent: str, state: str = "gsolv", *, version: int
+):
+    """Create new tblite ALPB solvation object"""
+    _solvent = ffi.new("char[]", solvent.encode("ascii"))
+    _version = 10 + version
+    return error_check(lib.tblite_new_alpb_solvation_solvent)(
+        mol, _solvent, _version, _state_enum[state]
+    )
+
+
+def new_gbsa_solvation(
+    ctx, mol, calc, solvent: str, state: str = "gsolv", *, version: int
+):
+    """Create new tblite GBSA solvation object"""
+    _solvent = ffi.new("char[]", solvent.encode("ascii"))
+    _version = 20 + version
+    return error_check(lib.tblite_new_alpb_solvation_solvent)(
+        mol, _solvent, _version, _state_enum[state]
+    )
+
+
+def new_gbe_solvation(ctx, mol, calc, epsilon: float, born: str):
+    """Create new tblite GBE solvation object"""
+    return error_check(lib.tblite_new_gb_solvation_epsilon)(
+        mol, float(epsilon), 10, _born_enum[born]
+    )
+
+
+def new_gb_solvation(ctx, mol, calc, epsilon: float, born: str):
+    """Create new tblite GB solvation object"""
+    return error_check(lib.tblite_new_gb_solvation_epsilon)(
+        mol, float(epsilon), 20, _born_enum[born]
+    )
+
+
+def new_ddx_solvation(ctx, mol, calc, solvent_or_epsilon: Union[str, float], model: str):
+    """Create new tblite ddX (COSMO, CPCM, or PCM) solvation object"""
+    if isinstance(solvent_or_epsilon, str):
+        _solvent = ffi.new("char[]", solvent_or_epsilon.encode("ascii"))
+        return error_check(lib.tblite_new_ddx_solvation_solvent)(
+            mol, _solvent, _ddx_model_enum[model]
+        )
+
+    return error_check(lib.tblite_new_ddx_solvation_epsilon)(
+        mol, float(solvent_or_epsilon), _ddx_model_enum[model]
+    )
+
+
+@context_check
+def new_spin_polarization(ctx, mol, calc, wscale: float = 1.0):
+    """Create new tblite spin polarization object"""
+    return lib.tblite_new_spin_polarization(ctx, mol, calc, wscale)
+
+
+@context_check
+def calculator_push_back(ctx, calc, cont) -> None:
+    """Add container to calculator object."""
+    ptr = ffi.new("tblite_container *")
+    ptr[0] = cont
+    lib.tblite_calculator_push_back(ctx, calc, ptr)

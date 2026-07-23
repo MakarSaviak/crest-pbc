@@ -1,0 +1,25 @@
+# This file is part of fmlip-relay.
+# SPDX-Identifier: MIT
+
+# ── Parallelism ────────────────────────────────────────────────────────────────
+option('openmp',
+  type        : 'boolean',
+  value       : true,
+  yield       : true,
+  description : 'Enable OpenMP (parallel server instances)',
+)
+
+# ── Static binary ──────────────────────────────────────────────────────────────
+option('static',
+  type        : 'boolean',
+  value       : false,
+  yield       : true,
+  description : 'Attempt a fully static binary',
+)
+
+# ── Optional features ──────────────────────────────────────────────────────────
+option('build_example',
+  type        : 'boolean',
+  value       : false,
+  description : 'Build the example executable',
+)
