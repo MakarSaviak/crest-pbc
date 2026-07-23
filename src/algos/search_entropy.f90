@@ -170,6 +170,9 @@ subroutine crest_search_entropy(env,tim)
           & ' from existing trajectory/ensemble'
         ensnam = trim(rdat%last_file)
       else
+        !> Always seed a new MTD iteration from the currently selected reference,
+        !> not from stale coordinates left from the original input or prior loop.
+        call env%ref%to(mol)
         nsim = -1 !>--- enambles automatic MTD setup in init routines
         call crest_search_multimd_init(env,mol,mddat,nsim)
         allocate (mddats(nsim),source=mddat)

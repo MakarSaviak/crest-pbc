@@ -1,0 +1,7 @@
+$metadyn
+  atoms: 1-6
+  com_bias: true
+  com_factor: 0.020
+  com_width: 0.15
+  com_mass_weighted: false
+$end

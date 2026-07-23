@@ -97,7 +97,8 @@ contains  !> MODULE PROCEDURES START HERE
         call get_xtb_fix_block(env%calc,mol,blk)
       case ('metadyn')
         call get_xtb_metadyn_block(env%calc,mol,env%mtd_kscal, &
-        & env%includeRMSD,env%rednat,blk)
+        & env%includeRMSD,env%rednat,blk,env%mtd_com_bias, &
+        & env%mtd_com_factor,env%mtd_com_width,env%mtd_com_mass_weighted)
       case default
         write (stdout,'(a,a,a)') 'xtb-style input block: "$',trim(hdr),'" not defined for CREST'
       end select
@@ -528,7 +529,8 @@ contains  !> MODULE PROCEDURES START HERE
     end if
   end subroutine get_xtb_fix_block
 
-  subroutine get_xtb_metadyn_block(calc,mol,mtd_kscal,includeRMSD,rednat,blk)
+  subroutine get_xtb_metadyn_block(calc,mol,mtd_kscal,includeRMSD,rednat,blk, &
+  & mtd_com_bias,mtd_com_factor,mtd_com_width,mtd_com_mass_weighted)
 !**************************************
 !* This is a reader for the $metadyn block
 !***************************************
@@ -540,6 +542,8 @@ contains  !> MODULE PROCEDURES START HERE
     integer,allocatable,intent(inout) :: includeRMSD(:)
     integer,intent(inout) :: rednat
     type(datablock),intent(in),target :: blk
+    logical,intent(inout),optional :: mtd_com_bias,mtd_com_mass_weighted
+    real(wp),intent(inout),optional :: mtd_com_factor,mtd_com_width
     !> LOCAL
     integer :: i,j,k,io
     type(keyvalue),pointer :: kv
@@ -580,6 +584,32 @@ contains  !> MODULE PROCEDURES START HERE
           do j = 1,mol%nat
             if (i1 == mol%at(j)) pairwise(j) = .true.
           end do
+        end if
+
+      case ('com_bias','com bias')
+        if (present(mtd_com_bias)) then
+          call parse_xtb_logical(kv%rawvalue,mtd_com_bias,io)
+          if (io /= 0) error stop '**ERROR** invalid $metadyn com_bias value'
+        end if
+
+      case ('com_factor','com factor')
+        if (present(mtd_com_factor)) then
+          read (kv%rawvalue,*,iostat=io) rdum
+          if (io /= 0.or.rdum < 0.0_wp) error stop '**ERROR** $metadyn com_factor must be non-negative'
+          mtd_com_factor = rdum
+        end if
+
+      case ('com_width','com width')
+        if (present(mtd_com_width)) then
+          read (kv%rawvalue,*,iostat=io) rdum
+          if (io /= 0.or.rdum <= 0.0_wp) error stop '**ERROR** $metadyn com_width must be positive'
+          mtd_com_width = rdum
+        end if
+
+      case ('com_mass_weighted','com mass weighted')
+        if (present(mtd_com_mass_weighted)) then
+          call parse_xtb_logical(kv%rawvalue,mtd_com_mass_weighted,io)
+          if (io /= 0) error stop '**ERROR** invalid $metadyn com_mass_weighted value'
         end if
 
       case ('kscal')
@@ -904,6 +934,27 @@ contains  !> MODULE PROCEDURES START HERE
     hdr = trim(atmp)
     return
   end subroutine clearxtbheader
+
+
+!============================================================================!
+  subroutine parse_xtb_logical(raw,value,io)
+    character(len=*),intent(in) :: raw
+    logical,intent(out) :: value
+    integer,intent(out) :: io
+    character(len=:),allocatable :: tmp
+
+    tmp = trim(adjustl(lowercase(raw)))
+    io = 0
+    select case (tmp)
+    case ('true','.true.','t','yes','y','on','1')
+      value = .true.
+    case ('false','.false.','f','no','n','off','0')
+      value = .false.
+    case default
+      value = .false.
+      io = 1
+    end select
+  end subroutine parse_xtb_logical
 
 !============================================================================!
 

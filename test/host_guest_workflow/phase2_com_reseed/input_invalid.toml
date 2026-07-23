@@ -1,0 +1,13 @@
+runtype = "mtd"
+input = "struc.xyz"
+threads = 1
+[[calculation.level]]
+method = "gfnff"
+[dynamics]
+length_ps = 0.001
+[[dynamics.meta]]
+type = "rmsd"
+dump_fs = 1.0
+com_bias = true
+com_factor = 0.01
+com_width = -0.1

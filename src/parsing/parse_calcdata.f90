@@ -1420,6 +1420,18 @@ contains !> MODULE PROCEDURES START HERE
       mtd%cvdump_fs = kv%value_f*1000.0_wp
     case ('ramp')
       mtd%ramp = kv%value_f
+    case ('com_factor','com_amplitude')
+      if (kv%value_f < 0.0_wp) error stop '**ERROR** COM MTD factor must be non-negative'
+      mtd%com_factor = kv%value_f
+    case ('com_width')
+      if (kv%value_f <= 0.0_wp) error stop '**ERROR** COM MTD width must be positive'
+      mtd%com_width = kv%value_f
+
+!>--- logicals
+    case ('com_bias')
+      mtd%com_bias = kv%value_b
+    case ('com_mass_weighted')
+      mtd%com_mass_weighted = kv%value_b
 
 !>--- strings
     case ('type')

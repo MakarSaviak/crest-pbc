@@ -59,7 +59,9 @@ contains  !> Unit tests for the metadynamics RMSD bias potential
     new_unittest("RMSD-MTD gradient (FD, subset)  ",test_mtd_rmsd_grad_subset), &
     new_unittest("RMSD-MTD gradient (FD, PBC/MIC) ",test_mtd_rmsd_grad_pbc), &
     new_unittest("RMSD-MTD large box == gas phase ",test_mtd_rmsd_pbc_largebox_eq_gas), &
-    new_unittest("RMSD-MTD minimum-image wrapping ",test_mtd_rmsd_pbc_wrap) &
+    new_unittest("RMSD-MTD minimum-image wrapping ",test_mtd_rmsd_pbc_wrap), &
+    new_unittest("COM-MTD rigid translation          ",test_mtd_com_translation), &
+    new_unittest("COM-MTD gradient (FD, subset)     ",test_mtd_com_grad_subset) &
     ]
 !&>
   end subroutine collect_metadynamics
@@ -267,6 +269,115 @@ contains  !> Unit tests for the metadynamics RMSD bias potential
       pot%cvxyz(:,j,1) = mol%xyz(:,j)+shiftvec
     end do
   end subroutine setup_single_ref
+
+!========================================================================================!
+!> Set up a small deterministic COM-bias probe. The COM reference is cached
+!> exactly as it would be after snapshot deposition, while RMSD kpush is zero so
+!> the direct COM tests remain independent of the RMSD implementation.
+  subroutine setup_com_probe(mol,pot,mass_weighted,subset)
+    type(coord),intent(out) :: mol
+    type(mtdpot),intent(out) :: pot
+    logical,intent(in) :: mass_weighted,subset
+    integer :: j
+
+    mol%nat = 3
+    allocate (mol%at(3),source=0)
+    allocate (mol%xyz(3,3),source=0.0_wp)
+    mol%at = [1,8,6]
+    mol%xyz(:,1) = [0.0_wp,0.0_wp,0.0_wp]
+    mol%xyz(:,2) = [1.2_wp,0.1_wp,0.0_wp]
+    mol%xyz(:,3) = [-0.4_wp,1.1_wp,0.3_wp]
+
+    pot%mtdtype = cv_rmsd
+    pot%kpush = 0.0_wp
+    pot%alpha = 0.6_wp
+    pot%cvdump_fs = 1.0_wp
+    pot%com_bias = .true.
+    pot%com_factor = 0.08_wp
+    pot%com_width = 0.35_wp
+    pot%com_mass_weighted = mass_weighted
+    if (subset) then
+      allocate (pot%atinclude(3),source=.false.)
+      pot%atinclude(1:2) = .true.
+    end if
+
+    call mtd_ini(mol,pot,1.0_wp,0.003_wp,.false.)
+    pot%ncur = 1
+    pot%damp = 1.0_wp
+    pot%cvxyz(:,:,1) = mol%xyz
+    pot%cvcom(:,1) = 0.0_wp
+    do j = 1,mol%nat
+      pot%cvcom(:,1) = pot%cvcom(:,1)+pot%com_weights(j)*mol%xyz(:,j)
+    end do
+  end subroutine setup_com_probe
+
+!========================================================================================!
+!> A rigid translation must be invisible to RMSD but explicitly penalized by
+!> the ordinary COM hill. Check both the energy and the atom-resolved gradient.
+  subroutine test_mtd_com_translation(error)
+    type(error_type),allocatable,intent(out) :: error
+    type(coord) :: mol,probe
+    type(mtdpot) :: pot
+    real(wp) :: e,eref,dx,dedr
+    real(wp),allocatable :: grd(:,:)
+    integer :: j
+
+    call setup_com_probe(mol,pot,.false.,.false.)
+    probe = mol
+    dx = 0.7_wp
+    probe%xyz(1,:) = probe%xyz(1,:)+dx
+    allocate (grd(3,mol%nat),source=0.0_wp)
+    call calc_com_mtd(probe,pot,e,grd)
+
+    eref = pot%com_factor*exp(-pot%com_width*dx*dx)
+    call check(error,e,eref,thr=1.0e-12_wp)
+    if (allocated(error)) return
+    dedr = -2.0_wp*pot%com_width*eref*dx
+    do j = 1,mol%nat
+      call check(error,grd(1,j),pot%com_weights(j)*dedr,thr=1.0e-12_wp)
+      if (allocated(error)) return
+      call check(error,grd(2,j),0.0_wp,thr=1.0e-12_wp)
+      if (allocated(error)) return
+      call check(error,grd(3,j),0.0_wp,thr=1.0e-12_wp)
+      if (allocated(error)) return
+    end do
+  end subroutine test_mtd_com_translation
+
+!========================================================================================!
+!> Mass-weighted selected-atom COM forces are checked against central finite
+!> differences. The excluded atom must receive exactly zero COM force.
+  subroutine test_mtd_com_grad_subset(error)
+    type(error_type),allocatable,intent(out) :: error
+    type(coord) :: mol,probe,tmp
+    type(mtdpot) :: pot
+    real(wp),allocatable :: grd(:,:),gdum(:,:)
+    real(wp) :: e,ep,em,gfd
+    integer :: i,j
+
+    call setup_com_probe(mol,pot,.true.,.true.)
+    probe = mol
+    probe%xyz(:,1) = probe%xyz(:,1)+[0.3_wp,-0.2_wp,0.1_wp]
+    probe%xyz(:,2) = probe%xyz(:,2)+[-0.1_wp,0.25_wp,-0.05_wp]
+    probe%xyz(:,3) = probe%xyz(:,3)+[2.0_wp,-1.0_wp,0.7_wp]
+    allocate (grd(3,mol%nat),gdum(3,mol%nat),source=0.0_wp)
+    call calc_com_mtd(probe,pot,e,grd)
+
+    call check(error,maxval(abs(grd(:,3))),0.0_wp,thr=1.0e-14_wp)
+    if (allocated(error)) return
+    tmp = probe
+    do i = 1,mol%nat
+      do j = 1,3
+        tmp%xyz(j,i) = probe%xyz(j,i)+fdstep
+        call calc_com_mtd(tmp,pot,ep,gdum)
+        tmp%xyz(j,i) = probe%xyz(j,i)-fdstep
+        call calc_com_mtd(tmp,pot,em,gdum)
+        tmp%xyz(j,i) = probe%xyz(j,i)
+        gfd = (ep-em)/(2.0_wp*fdstep)
+        call check(error,grd(j,i),gfd,thr=1.0e-8_wp)
+        if (allocated(error)) return
+      end do
+    end do
+  end subroutine test_mtd_com_grad_subset
 
 !========================================================================================!
 !> Shared helper: compare calc_mtd's analytical gradient to central finite

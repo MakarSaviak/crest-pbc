@@ -24,6 +24,7 @@ module metadynamics_module
 
   use crest_parameters
   use strucrd
+  use atmasses, only : ams
 
   implicit none
 
@@ -46,6 +47,14 @@ module metadynamics_module
 
     real(wp) :: kpush = 1.0_wp
     real(wp) :: alpha = 1.0_wp
+
+    !>--- optional translation-sensitive COM bias paired with RMSD MTD
+    logical  :: com_bias = .false.
+    real(wp) :: com_factor = 0.0_wp     !> Gaussian amplitude / Eh
+    real(wp) :: com_width = 0.05_wp     !> Gaussian width / Bohr^-2
+    logical  :: com_mass_weighted = .true.
+    real(wp),allocatable :: com_weights(:) !> normalized selected-atom weights
+    real(wp),allocatable :: cvcom(:,:)      !> cached COM of deposited references (3,nref)
 
     !>--- regular MTD, some CV
     real(wp),allocatable :: cv(:) !list of cv values at each timestep
@@ -75,6 +84,7 @@ module metadynamics_module
   public :: mtd_ini
   public :: cv_dump
   public :: calc_mtd
+  public :: calc_com_mtd
 
 !========================================================================================!
 !========================================================================================!
@@ -105,6 +115,15 @@ contains  !> MODULE PROCEDURES START HERE
       write (stdout,'(1X,17("─"))')
     end if
 
+    if (pot%com_bias) then
+      if (pot%com_factor < 0.0_wp) error stop '**ERROR** COM MTD factor must be non-negative'
+      if (pot%com_width <= 0.0_wp) error stop '**ERROR** COM MTD width must be positive'
+      if (allocated(pot%atinclude)) then
+        if (count(pot%atinclude) < 1) error stop '**ERROR** COM MTD atom selection is empty'
+      end if
+      call setup_com_weights(mol,pot)
+    end if
+
     dum1 = anint((mdlength*1000.0_wp)/tstep)
     idum1 = nint(dum1)
 
@@ -126,6 +145,10 @@ contains  !> MODULE PROCEDURES START HERE
       if (pot%maxsave == 0) pot%maxsave = nint(dum1)
       if (allocated(pot%cvxyz)) deallocate (pot%cvxyz)
       allocate (pot%cvxyz(3,mol%nat,pot%maxsave),source=0.0_wp)
+      if (pot%com_bias) then
+        if (allocated(pot%cvcom)) deallocate (pot%cvcom)
+        allocate (pot%cvcom(3,pot%maxsave),source=0.0_wp)
+      end if
       !>--- automatic ramp parameter (acounted for both different MD time steps and CV dump steps)
       !> (should yield damp≈0.5 for cvdumpstep/2, but is at least 0.03 as in xtb)
       if (pot%ramp <= 0.0_wp) then !> only if not set by the user
@@ -167,6 +190,13 @@ contains  !> MODULE PROCEDURES START HERE
       do i = 1,nall
         call rmsdcv_perturb(nat,pot%cvxyz(:,:,i))
       end do
+      if (pot%com_bias) then
+        if (allocated(pot%cvcom)) deallocate (pot%cvcom)
+        allocate (pot%cvcom(3,nall),source=0.0_wp)
+        do i = 1,nall
+          call compute_weighted_com(pot%cvxyz(:,:,i),pot%com_weights,pot%cvcom(:,i))
+        end do
+      end if
       pot%ncur = nall    !> will not change
       pot%maxsave = nall !> won't change either
       if (pot%ramp <= 0.0_wp) then          !> only if not set by the user
@@ -198,12 +228,18 @@ contains  !> MODULE PROCEDURES START HERE
     if (allocated(self%atinclude)) deallocate (self%atinclude)
     if (allocated(self%cv)) deallocate (self%cv)
     if (allocated(self%cvgrd)) deallocate (self%cvgrd)
+    if (allocated(self%com_weights)) deallocate (self%com_weights)
+    if (allocated(self%cvcom)) deallocate (self%cvcom)
 
     self%mtdtype = 0
     self%nmax = 0
     self%ncur = 0
     self%kpush = 1.0_wp
     self%alpha = 1.0_wp
+    self%com_bias = .false.
+    self%com_factor = 0.0_wp
+    self%com_width = 0.05_wp
+    self%com_mass_weighted = .true.
     self%cvdump = 0 !xyz dump counter
     self%cvdump_fs = 0.0_wp !xyz dump frequency (in fs)
     self%cvdumpstep = 0 !xyz dump frequency (in MD steps)
@@ -235,6 +271,12 @@ contains  !> MODULE PROCEDURES START HERE
     end select
     write (iunit,'("  kpush /Eh",t25,":",f10.4)') self%kpush
     write (iunit,'("  alpha /Bohr⁻²",t28,":",f10.4)') self%alpha
+    if (self%com_bias) then
+      write (iunit,'("  COM bias",t25,":",1x,a)') 'enabled'
+      write (iunit,'("  COM factor /Eh",t25,":",f10.5)') self%com_factor
+      write (iunit,'("  COM width /Bohr⁻²",t28,":",f10.5)') self%com_width
+      write (iunit,'("  COM mass weighted",t25,":",l10)') self%com_mass_weighted
+    end if
 
     select case (self%mtdtype)
     case (cv_rmsd)
@@ -282,6 +324,12 @@ contains  !> MODULE PROCEDURES START HERE
         if (pot%ncur == 1) then
           !>--- The first one should be sligthly distorted
           call rmsdcv_perturb(mol%nat,pot%cvxyz(:,:,pot%ncur))
+        end if
+        if (pot%com_bias) then
+          if (.not.allocated(pot%cvcom)) then
+            allocate (pot%cvcom(3,pot%maxsave),source=0.0_wp)
+          end if
+          call compute_weighted_com(pot%cvxyz(:,:,pot%ncur),pot%com_weights,pot%cvcom(:,pot%ncur))
         end if
         if (pr) then
           write (stdout,'(2x,"adding snapshot to metadynamics bias, now at ",i0," CVs")') pot%ncur
@@ -343,7 +391,8 @@ contains  !> MODULE PROCEDURES START HERE
     type(mtdpot) :: pot
     real(wp),intent(out) :: emtd
     real(wp),intent(out) :: grdmtd(3,mol%nat)
-    real(wp) :: dum
+    real(wp) :: dum,ecom
+    real(wp) :: grdcom(3,mol%nat)
     emtd = 0.0_wp
     grdmtd = 0.0_wp
 
@@ -355,11 +404,21 @@ contains  !> MODULE PROCEDURES START HERE
       dum = float(pot%cvdump)
       call calc_damp(pot,cv_rmsd,dum)
       call calc_rmsd_mtd(mol,pot,emtd,grdmtd)
+      if (pot%com_bias) then
+        call calc_com_mtd(mol,pot,ecom,grdcom)
+        emtd = emtd+ecom
+        grdmtd = grdmtd+grdcom
+      end if
 
     case (cv_rmsd_static)
       dum = float(pot%cvdump)
       call calc_damp(pot,cv_rmsd_static,dum)
       call calc_rmsd_mtd(mol,pot,emtd,grdmtd)
+      if (pot%com_bias) then
+        call calc_com_mtd(mol,pot,ecom,grdcom)
+        emtd = emtd+ecom
+        grdmtd = grdmtd+grdcom
+      end if
 
     case default
       emtd = 0.0_wp
@@ -529,6 +588,94 @@ contains  !> MODULE PROCEDURES START HERE
     deallocate (refmols,ccaches)
     return
   end subroutine calc_rmsd_mtd
+
+!========================================================================================!
+  subroutine setup_com_weights(mol,pot)
+!***********************************************************************
+!* Build normalized weights for the selected COM atoms. The selected
+!* atom mask is identical to the RMSD-MTD mask. Atomic masses are used
+!* by default; centroid weighting can be requested explicitly.
+!***********************************************************************
+    type(coord),intent(in) :: mol
+    type(mtdpot),intent(inout) :: pot
+    integer :: j
+    real(wp) :: wsum
+
+    if (allocated(pot%com_weights)) deallocate (pot%com_weights)
+    allocate (pot%com_weights(mol%nat),source=0.0_wp)
+    do j = 1,mol%nat
+      if (allocated(pot%atinclude)) then
+        if (.not.pot%atinclude(j)) cycle
+      end if
+      if (pot%com_mass_weighted) then
+        if (mol%at(j) < 1.or.mol%at(j) > size(ams)) then
+          error stop '**ERROR** invalid atomic number in COM MTD selection'
+        end if
+        pot%com_weights(j) = ams(mol%at(j))
+      else
+        pot%com_weights(j) = 1.0_wp
+      end if
+    end do
+    wsum = sum(pot%com_weights)
+    if (wsum <= tiny(1.0_wp)) error stop '**ERROR** empty or zero-mass COM MTD selection'
+    pot%com_weights = pot%com_weights/wsum
+  end subroutine setup_com_weights
+
+!========================================================================================!
+  pure subroutine compute_weighted_com(xyz,weights,com)
+    real(wp),intent(in) :: xyz(:,:)
+    real(wp),intent(in) :: weights(:)
+    real(wp),intent(out) :: com(3)
+    integer :: j
+    com = 0.0_wp
+    do j = 1,size(weights)
+      if (weights(j) > 0.0_wp) com = com+weights(j)*xyz(:,j)
+    end do
+  end subroutine compute_weighted_com
+
+!========================================================================================!
+  subroutine calc_com_mtd(mol,pot,ebias,grdmtd)
+!***********************************************************************
+!* Translation-sensitive Gaussian COM bias paired with deposited RMSD
+!* structures. Reference COMs are cached when snapshots are deposited,
+!* reducing each force call from O(nref*nat) to O(nref+nat).
+!***********************************************************************
+    type(coord),intent(in) :: mol
+    type(mtdpot),intent(in) :: pot
+    real(wp),intent(out) :: ebias
+    real(wp),intent(out) :: grdmtd(3,mol%nat)
+    real(wp) :: rnow(3),dr(3),dedr(3),dedr_sum(3),ecom,damp
+    integer :: i,j
+
+    ebias = 0.0_wp
+    grdmtd = 0.0_wp
+    if (.not.pot%com_bias) return
+    if (pot%com_factor <= tiny(1.0_wp)) return
+    if (pot%com_width <= 0.0_wp) error stop '**ERROR** COM MTD width must be positive'
+    if (pot%ncur < 1) return
+    if (.not.allocated(pot%com_weights)) error stop '**ERROR** COM MTD weights not initialized'
+    if (.not.allocated(pot%cvcom)) error stop '**ERROR** COM MTD reference cache not initialized'
+    if (size(pot%cvcom,2) < pot%ncur) error stop '**ERROR** COM MTD reference cache is incomplete'
+
+    call compute_weighted_com(mol%xyz,pot%com_weights,rnow)
+    dedr_sum = 0.0_wp
+    do i = 1,pot%ncur
+      dr = rnow-pot%cvcom(:,i)
+      ecom = pot%com_factor*exp(-pot%com_width*dot_product(dr,dr))
+      damp = 1.0_wp
+      if (i == pot%ncur.or.pot%mtdtype == cv_rmsd_static) damp = pot%damp
+      ecom = ecom*damp
+      ebias = ebias+ecom
+      dedr = -2.0_wp*pot%com_width*ecom*dr
+      dedr_sum = dedr_sum+dedr
+    end do
+
+    do j = 1,mol%nat
+      if (pot%com_weights(j) > 0.0_wp) then
+        grdmtd(:,j) = pot%com_weights(j)*dedr_sum
+      end if
+    end do
+  end subroutine calc_com_mtd
 
 !========================================================================================!
   subroutine calc_std_mtd(mol,pot,cvt,ebias,grdmtd)

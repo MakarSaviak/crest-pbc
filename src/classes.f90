@@ -459,6 +459,10 @@ module crest_data
     real(wp),allocatable :: metadexp(:)
     integer,allocatable  :: metadlist(:)
     real(wp) :: mtd_kscal = 1.0_wp !> globally scale kpush for all metadynamics
+    logical  :: mtd_com_bias = .false. !> add translation-sensitive COM hills to generated RMSD MTDs
+    real(wp) :: mtd_com_factor = 0.0_wp !> COM Gaussian amplitude / Eh
+    real(wp) :: mtd_com_width = 0.05_wp !> COM Gaussian width / Bohr^-2
+    logical  :: mtd_com_mass_weighted = .true. !> mass-weighted COM; false means centroid
 
     character(len=:),allocatable :: mtdstaticfile
     integer :: nstatic
@@ -1278,6 +1282,10 @@ contains  !> MODULE PROCEDURES START HERE
     self%microopt = src%microopt
     self%s6opt    = src%s6opt
     self%mtd_kscal = src%mtd_kscal
+    self%mtd_com_bias = src%mtd_com_bias
+    self%mtd_com_factor = src%mtd_com_factor
+    self%mtd_com_width = src%mtd_com_width
+    self%mtd_com_mass_weighted = src%mtd_com_mass_weighted
     self%nstatic  = src%nstatic
 
 ! ── METADYN allocatable arrays ────────────────────────────────────────────────
