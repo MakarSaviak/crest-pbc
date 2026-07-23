@@ -35,8 +35,10 @@ module crest_restartlog
     integer  :: main_iter = 0    !> env%nreset at checkpoint
     integer  :: mtd_iter  = 0    !> last completed MTD iteration index
     integer  :: nmetadyn  = 0    !> env%nmetadyn (trimmed after first MTD pass)
+    integer  :: target_mtd_iter = 0 !> total requested MTD iterations for staged restart
     character(len=64)  :: stage        = 'none'
     character(len=512) :: last_file    = ''   !> last CREGEN-sorted file written
+    character(len=512) :: settings_file = '' !> TOML settings file to reparse on special restart
     real(wp) :: elowest   = 0.0_wp
     real(wp) :: eprivious = 0.0_wp
   end type restart_data
@@ -64,7 +66,8 @@ contains !> MODULE PROCEDURES START HERE
 !========================================================================================!
 
   subroutine write_restart_log(runtype,stage,main_iter,mtd_iter,nmetadyn, &
-    &                          elowest,eprivious,last_file_in)
+    &                          elowest,eprivious,last_file_in, &
+    &                          target_mtd_iter_in,settings_file_in)
 !*************************************************************
 !* Write a text-based checkpoint to crest.restart.
 !* Called after each MTD iteration and after collectcre.
@@ -83,7 +86,14 @@ contains !> MODULE PROCEDURES START HERE
     integer,intent(in)          :: runtype,main_iter,mtd_iter,nmetadyn
     character(len=*),intent(in) :: stage,last_file_in
     real(wp),intent(in)         :: elowest,eprivious
-    integer :: ich,io
+    integer,intent(in),optional :: target_mtd_iter_in
+    character(len=*),intent(in),optional :: settings_file_in
+    integer :: ich,io,target_mtd_iter
+    character(len=512) :: settings_file
+    target_mtd_iter = 0
+    settings_file = ''
+    if (present(target_mtd_iter_in)) target_mtd_iter = target_mtd_iter_in
+    if (present(settings_file_in)) settings_file = trim(settings_file_in)
     open(newunit=ich,file=restart_file,status='replace',iostat=io)
     if (io /= 0) then
       write(stdout,'(a)') '**WARNING** could not write crest.restart'
@@ -95,8 +105,12 @@ contains !> MODULE PROCEDURES START HERE
     write(ich,'(a,1x,i0)') 'main_iter', main_iter
     write(ich,'(a,1x,i0)') 'mtd_iter',  mtd_iter
     write(ich,'(a,1x,i0)') 'nmetadyn',  nmetadyn
+    write(ich,'(a,1x,i0)') 'target_mtd_iter', target_mtd_iter
     write(ich,'(a,1x,a)')  'stage',     trim(stage)
     write(ich,'(a,1x,a)')  'last_file', trim(last_file_in)
+    if (len_trim(settings_file) > 0) then
+      write(ich,'(a,1x,a)') 'settings_file', trim(settings_file)
+    end if
     write(ich,'(a,1x,f25.15)') 'elowest',   elowest
     write(ich,'(a,1x,f25.15)') 'eprivious', eprivious
     close(ich)
@@ -147,10 +161,14 @@ contains !> MODULE PROCEDURES START HERE
         read(val,*,iostat=io) rdat%mtd_iter
       case('nmetadyn')
         read(val,*,iostat=io) rdat%nmetadyn
+      case('target_mtd_iter')
+        read(val,*,iostat=io) rdat%target_mtd_iter
       case('stage')
         rdat%stage = trim(val)
       case('last_file')
         rdat%last_file = trim(val)
+      case('settings_file')
+        rdat%settings_file = trim(val)
       case('elowest')
         read(val,*,iostat=io) rdat%elowest
       case('eprivious')
@@ -192,6 +210,12 @@ contains !> MODULE PROCEDURES START HERE
     end if
     if (len_trim(rdat%last_file) > 0) then
       write(stdout,'(1x,a,a)')   '  last file: ',trim(rdat%last_file)
+    end if
+    if (rdat%target_mtd_iter > 0) then
+      write(stdout,'(1x,a,i0)')  '  target MTD iterations: ',rdat%target_mtd_iter
+    end if
+    if (len_trim(rdat%settings_file) > 0) then
+      write(stdout,'(1x,a,a)')   '  settings : ',trim(rdat%settings_file)
     end if
     write(stdout,'(1x,a,f20.10)') '  elowest  : ',rdat%elowest
     write(stdout,'(1x,a)') repeat(':',w)

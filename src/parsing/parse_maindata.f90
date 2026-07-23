@@ -125,6 +125,9 @@ contains   !> MODULE PROCEDURES START HERE
       if (val < 1) error stop '**ERROR** threads_md must be a positive integer'
       env%ThreadsMD = val
       env%threadsmdsetmanual = .true.
+    case ('mrest','maxrestart','mtd_iterations','iterations')
+      if (val < 1) error stop '**ERROR** mtd_iterations must be a positive integer'
+      env%Maxrestart = val
     case default
       rd = .false.
     end select
@@ -328,6 +331,8 @@ contains   !> MODULE PROCEDURES START HERE
       env%checktopo = .not.val
     case ('multilevelopt')
       env%multilevelopt = val
+    case ('external_rerank','external-rerank')
+      env%external_rerank = val
     case ('refine_presort')
       env%refine_presort = val
 

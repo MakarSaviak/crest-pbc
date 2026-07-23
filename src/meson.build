@@ -45,6 +45,7 @@ srcs += files(
   'confparse.f90',
   'crest_pars.f90',
   'eval_timer.f90',
+  'external_rerank_restart.f90',
   'filemod.f90',
   'flexi.F90',
   'freqmasses.f90',

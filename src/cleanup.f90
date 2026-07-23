@@ -68,7 +68,7 @@ subroutine custom_cleanup(env)
     call rmrf('MDFILES')
     call rmrf('OPTIM')
     call rmrf('PROP')
-    call rmrfw('.cre_')
+    if (.not.env%external_rerank) call rmrfw('.cre_')
     call rmrf('cregen_*.tmp')
     call rmrf('MDFILES')
     if(allocated(env%calc%calcs))then

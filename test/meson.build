@@ -16,6 +16,7 @@ tests = [
   'graphs',
   'ddx',
   'external',
+  'external_restart',
 ]
 
 test_srcs = files(

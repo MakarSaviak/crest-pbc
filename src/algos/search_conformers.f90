@@ -36,6 +36,7 @@ subroutine crest_search_imtdgc(env,tim)
   use cregen_interface
   use crest_restartlog
   use nci_input_ensemble,only:load_nci_input_ensemble,write_nci_input_starts,write_nci_mtd_jobs
+  use external_rerank_restart,only:validate_external_rerank_seed
   implicit none
   type(systemdata),intent(inout) :: env
   type(timer),intent(inout)      :: tim
@@ -66,7 +67,7 @@ subroutine crest_search_imtdgc(env,tim)
   logical :: start,lower
 !===========================================================!
   type(restart_data) :: rdat
-  logical :: do_restart,skip_mtdloop,skip_collect,firstiter,fex
+  logical :: do_restart,skip_mtdloop,skip_collect,firstiter,fex,special_external_restart
 !===========================================================!
 !>--- printout header
   write (stdout,*)
@@ -79,10 +80,19 @@ subroutine crest_search_imtdgc(env,tim)
   do_restart = .false.
   skip_mtdloop = .false.
   skip_collect = .false.
+  special_external_restart = .false.
   if (env%allowrestart .and. restart_file_exists()) then
     call read_restart_log(rdat)
     if (rdat%runtype == crest_imtd .and. rdat%stage /= 'done') then
+      if (trim(rdat%stage) == 'awaiting_external_rerank'.and. &
+        & .not.env%restart_requested) then
+        write(stdout,'(a)') '**ERROR** external-rerank checkpoint requires an explicit --restart command'
+        call creststop(status_input)
+      end if
       do_restart = .true.
+      special_external_restart = &
+        & trim(rdat%stage) == 'awaiting_external_rerank'.or. &
+        & trim(rdat%stage) == 'external_seed_loaded'
       call print_restart_info(rdat)
       !> skip entire mtdloop and collectcre only when past the MTD loop
       skip_mtdloop = (rdat%stage == 'post_collect')
@@ -101,6 +111,27 @@ subroutine crest_search_imtdgc(env,tim)
   call crest_sampling_skip(env,doreturn)
   if (doreturn) return
 
+!>--- staged external reranking requires a reproducible TOML settings source.
+!>--- The special restart reparses this file before the positional seed is read.
+  if (env%external_rerank.and..not.do_restart) then
+    if (env%Maxrestart < 2) then
+      error stop '**ERROR** external reranking requires at least two MTD iterations'
+    end if
+    if (.not.allocated(env%input_settings_file)) then
+      error stop '**ERROR** external reranking requires a TOML input file'
+    end if
+  end if
+
+!>--- Validate the replacement seed before any trial MTD or calculator work.
+!>--- The check is topology-only and uses TOML GFN-FF fragments to ignore
+!>--- inter-fragment contacts; host coordinates may change.
+  if (special_external_restart) then
+    call validate_external_rerank_seed(env,rdat)
+    call write_restart_log(crest_imtd,'external_seed_loaded',rdat%main_iter, &
+      & rdat%mtd_iter,rdat%nmetadyn,rdat%elowest,rdat%eprivious, &
+      & trim(rdat%last_file),rdat%target_mtd_iter,trim(rdat%settings_file))
+  end if
+
 !>--- In NCI mode only, load additional positional XYZ frames for the first
 !>--- MTD stage. A one-frame XYZ leaves the upstream path unchanged.
   ninputs = 1
@@ -114,7 +145,7 @@ subroutine crest_search_imtdgc(env,tim)
 !>--- create the MD calculator saved to env
   call env_to_mddat(env)
 
-  if (env%performMTD) then
+  if (env%performMTD.and..not.do_restart) then
 !>--- (optional) calculate a short 1ps test MTD to check settings
     call tim%start(1,'Trial metadynamics (MTD)')
     call trialmd(env)
@@ -132,6 +163,7 @@ subroutine crest_search_imtdgc(env,tim)
     env%elowest  = rdat%elowest
     env%eprivious = rdat%eprivious
     env%nmetadyn = rdat%nmetadyn
+    if (rdat%target_mtd_iter > 0) env%Maxrestart = rdat%target_mtd_iter
     start = .false.
   end if
   MAINLOOP: do
@@ -156,6 +188,8 @@ subroutine crest_search_imtdgc(env,tim)
       if (do_restart) then
         if (rdat%stage == 'mtd_loop' .and. i <= rdat%mtd_iter) cycle mtdloop
         if (rdat%stage == 'mtd_trj'  .and. i <  rdat%mtd_iter) cycle mtdloop
+        if ((rdat%stage == 'awaiting_external_rerank'.or. &
+          &  rdat%stage == 'external_seed_loaded').and.i <= rdat%mtd_iter) cycle mtdloop
       end if
 
       write (stdout,*)
@@ -260,8 +294,18 @@ subroutine crest_search_imtdgc(env,tim)
         call clean_V2i
       end if
 !>--- checkpoint after this MTD iteration (nmetadyn already updated above)
-      call write_restart_log(crest_imtd,'mtd_loop',env%nreset,i, &
-        &  env%nmetadyn,env%elowest,env%eprivious,trim(str))
+      if (firstiter.and.env%external_rerank) then
+        call write_restart_log(crest_imtd,'awaiting_external_rerank',env%nreset,i, &
+          & env%nmetadyn,env%elowest,env%eprivious,trim(str),env%Maxrestart, &
+          & trim(env%input_settings_file))
+        write(stdout,'(/,1x,a)') 'External-rerank checkpoint reached after iteration 1.'
+        write(stdout,'(1x,a)') 'Select a source conformer externally, then continue with:'
+        write(stdout,'(3x,a)') 'crest crest-best-external.xyz --restart'
+        return
+      else
+        call write_restart_log(crest_imtd,'mtd_loop',env%nreset,i, &
+          & env%nmetadyn,env%elowest,env%eprivious,trim(str))
+      end if
 !>-- always do two cycles of MTDs
       if (firstiter) cycle mtdloop
 !=========================================================!

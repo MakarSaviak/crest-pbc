@@ -432,6 +432,7 @@ module crest_data
     character(len=512) :: scratchdir = ''    !> path to the scratch directory
     character(len=:),allocatable :: cmd
     character(len=:),allocatable :: inputcoords
+    character(len=:),allocatable :: input_settings_file !> TOML settings source used for restartable workflows
     character(len=:),allocatable :: wbofile
     character(len=:),allocatable :: atlist
     character(len=:),allocatable :: chargesfilename
@@ -587,6 +588,8 @@ module crest_data
     logical :: autothreads = .true.  !> automatically determine threads
     logical :: autozsort = .false.   !> do the ZSORT in the beginning ?
     logical :: allowrestart = .true. !> allow restart in crest algos?
+    logical :: restart_requested = .false. !> explicit --restart request
+    logical :: external_rerank = .false. !> pause after iteration 1 for external seed selection
     logical :: better = .false.      !> found a better conformer and restart in V1
     logical :: ceh_guess = .false.   !> use CEH guess in tblite or gfnff, if available
     logical :: spin_polarized = .false. !> enable spin-polarized calculations
@@ -1260,6 +1263,7 @@ contains  !> MODULE PROCEDURES START HERE
     if (allocated(src%solv))            self%solv           = src%solv
     if (allocated(src%cmd))             self%cmd            = src%cmd
     if (allocated(src%inputcoords))     self%inputcoords    = src%inputcoords
+    if (allocated(src%input_settings_file)) self%input_settings_file = src%input_settings_file
     if (allocated(src%wbofile))         self%wbofile        = src%wbofile
     if (allocated(src%atlist))          self%atlist         = src%atlist
     if (allocated(src%chargesfilename)) self%chargesfilename = src%chargesfilename
@@ -1416,6 +1420,8 @@ contains  !> MODULE PROCEDURES START HERE
     self%autothreads    = src%autothreads
     self%autozsort      = src%autozsort
     self%allowrestart   = src%allowrestart
+    self%restart_requested = src%restart_requested
+    self%external_rerank = src%external_rerank
     self%better         = src%better
     self%ceh_guess      = src%ceh_guess
     self%spin_polarized = src%spin_polarized

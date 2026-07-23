@@ -15,6 +15,7 @@ set(
   "graphs"
   "ddx"
   "external"
+  "external_restart"
 )
 set(
   test-srcs

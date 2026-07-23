@@ -57,16 +57,17 @@ subroutine parseflags(env,arg,nra)
   character(len=1024) :: cmd
   character(len=512) :: atmp,btmp
   character(len=:),allocatable :: ctmp,dtmp
-  integer :: i,j,k,l,io,ich,idum
+  integer :: i,j,k,l,io,ich,idum,external_pos
   real(wp) :: rdum
   integer :: ctype
-  logical :: ex,bondconst,presetok
+  logical :: ex,bondconst,presetok,special_external_restart
   character(len=:),allocatable :: argument
   logical,allocatable :: processedarg(:)
   logical,allocatable :: atlist(:)
   character(len=:),allocatable :: arg1,arg2,arg3
   character(len=:),allocatable :: hybrid_quality,hybrid_workhorse
   character(len=4) :: hybrid_mode
+  type(restart_data) :: parse_rdat
 
   allocate (xx(10),floats(3),strings(3))
   ctmp = ''
@@ -142,6 +143,8 @@ subroutine parseflags(env,arg,nra)
   env%autothreads = .true.       !> automatically determine optimal parameters omp and MAXRUN
   env%threadssetmanual = .false. !> did the user set the #threads manually?
   env%threadsmdsetmanual = .false. !> did the user set the MD/MTD thread budget?
+  env%restart_requested = .false.
+  env%external_rerank = .false.
 
   env%scratch = .false.          !> use scratch directory?
   call getcwd(env%homedir)       !> original directory
@@ -346,11 +349,68 @@ subroutine parseflags(env,arg,nra)
   env%properties2 = p_none  !> backup for env%properties
   env%iterativeV2 = .true.  !> iterative crest V2 version
   env%preopt = .true.
-!>--- check for (TOML) input file
-  call find_input_file(arg,nra,idum)
-  if (idum .ne. 0) then
-    call parseinputfile(env,trim(arg(idum)))
-    processedarg(idum) = .true.
+!>--- Explicit restart request is inspected before normal TOML discovery.
+!>--- For the external-rerank checkpoint, the original TOML file is restored
+!>--- from crest.restart and the positional structure is used only as the new
+!>--- geometry. Scientific settings (including GFN-FF fragments) are therefore
+!>--- parsed exactly as in iteration 1.
+  special_external_restart = .false.
+  external_pos = 0
+  do i = 1,nra
+    if (trim(arg(i)) == '--restart'.or.trim(arg(i)) == '-restart') then
+      env%restart_requested = .true.
+      processedarg(i) = .true.
+    end if
+  end do
+  if (env%restart_requested.and.restart_file_exists()) then
+    call read_restart_log(parse_rdat)
+    special_external_restart = &
+      & trim(parse_rdat%stage) == 'awaiting_external_rerank'.or. &
+      & trim(parse_rdat%stage) == 'external_seed_loaded'
+  end if
+
+  if (special_external_restart) then
+    if (len_trim(parse_rdat%settings_file) == 0) then
+      write (stdout,'(a)') '**ERROR** external-rerank restart lacks its original TOML settings file'
+      call creststop(status_input)
+    end if
+    inquire(file=trim(parse_rdat%settings_file),exist=ex)
+    if (.not.ex) then
+      write (stdout,'(a,a)') '**ERROR** restart TOML settings file not found: ', &
+        & trim(parse_rdat%settings_file)
+      call creststop(status_input)
+    end if
+    call parseinputfile(env,trim(parse_rdat%settings_file))
+    env%input_settings_file = trim(parse_rdat%settings_file)
+    env%external_rerank = .true.
+    env%preopt = .false. !> preserve the supplied external seed exactly until validation
+    if (parse_rdat%target_mtd_iter > 0) env%Maxrestart = parse_rdat%target_mtd_iter
+
+    do i = 1,nra
+      if (processedarg(i)) cycle
+      if (len_trim(arg(i)) == 0) cycle
+      if (arg(i)(1:1) == '-') cycle
+      inquire(file=trim(arg(i)),exist=ex)
+      if (ex.and.index(lowercase(trim(arg(i))),'.toml') == 0) then
+        external_pos = i
+        exit
+      end if
+    end do
+    if (external_pos == 0) then
+      write (stdout,'(a)') '**ERROR** external-rerank restart requires a positional seed structure'
+      call creststop(status_input)
+    end if
+    if (allocated(env%inputcoords)) deallocate(env%inputcoords)
+    env%inputcoords = trim(arg(external_pos))
+    processedarg(external_pos) = .true.
+  else
+!>--- normal TOML input discovery
+    call find_input_file(arg,nra,idum)
+    if (idum .ne. 0) then
+      call parseinputfile(env,trim(arg(idum)))
+      env%input_settings_file = trim(arg(idum))
+      processedarg(idum) = .true.
+    end if
   end if
 
 !>--- first arg loop
@@ -1773,6 +1833,14 @@ subroutine parseflags(env,arg,nra)
       case ('-norestart')
         processedarg(i) = .true.
         env%allowrestart = .false.
+
+      case ('-restart')
+        processedarg(i) = .true.
+        env%restart_requested = .true.
+
+      case ('-external-rerank','-external_rerank')
+        processedarg(i) = .true.
+        env%external_rerank = .true.
 
       case ('-readbias')
         processedarg(i) = .true.

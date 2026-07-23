@@ -48,6 +48,7 @@ list(APPEND srcs
   "${dir}/confparse.f90"
   "${dir}/crest_pars.f90"
   "${dir}/eval_timer.f90"
+  "${dir}/external_rerank_restart.f90"
   "${dir}/filemod.f90"
   "${dir}/flexi.F90"
   "${dir}/freqmasses.f90"
