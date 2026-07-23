@@ -153,6 +153,10 @@ For QCG calculations additionally cite:
   Number of CPU threads.
   If not set, read from *OMP_NUM_THREADS*.
 
+*-TMD* _int_::
+  Override the total CPU thread budget used during MD/MTD sampling only.
+  Other workflow stages continue to use the global *-T* budget.
+
 *-chrg* _int_::
   Molecular charge.
 

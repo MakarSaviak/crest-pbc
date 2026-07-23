@@ -136,10 +136,12 @@ subroutine parseflags(env,arg,nra)
 !&<
 !>--- parallelization stuff
   env%Threads = 1                !> total number of threads
+  env%ThreadsMD = 0              !> optional total threads for MD/MTD only
   env%MAXRUN = 1                 !> number of parallel xtb jobs
   env%omp = 1                    !> # of OMP_NUM_THREADS and MKL_NUMTHREADS to be used
   env%autothreads = .true.       !> automatically determine optimal parameters omp and MAXRUN
   env%threadssetmanual = .false. !> did the user set the #threads manually?
+  env%threadsmdsetmanual = .false. !> did the user set the MD/MTD thread budget?
 
   env%scratch = .false.          !> use scratch directory?
   call getcwd(env%homedir)       !> original directory
@@ -2325,6 +2327,23 @@ subroutine parseflags(env,arg,nra)
         env%threadssetmanual = .true.
         write (stdout,'(2x,a,1x,i0,1x,a)') trim(arg(i)),nint(xx(1)), &
         &     '(CPUs/Threads selected)'
+
+      case ('-TMD','-tmd','--tmd-threads') !> total thread budget for MD/MTD only
+        processedarg(i) = .true.
+        call readl(arg1,xx,j)
+        if (j > 0) then
+          processedarg(i+1) = .true.
+        else
+          call parseflags_missing(argument)
+        end if
+        if (xx(1) < 1.0d0.or.abs(xx(1)-dnint(xx(1))) > 1.0d-10) then
+          write (stdout,'(2x,a)') '**ERROR** -TMD requires a positive integer thread budget.'
+          call creststop(status_input)
+        end if
+        env%ThreadsMD = nint(xx(1))
+        env%threadsmdsetmanual = .true.
+        write (stdout,'(2x,a,1x,i0,1x,a)') trim(arg(i)),env%ThreadsMD, &
+        &     '(CPUs/Threads selected for MD/MTD)'
 
       case ('-omp-nested')  !> allow nested OpenMP threading (ON by default)
         processedarg(i) = .true.

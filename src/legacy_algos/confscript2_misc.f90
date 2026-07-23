@@ -303,14 +303,17 @@ subroutine MetaMD_para_OMP(env)
 
   type(systemdata) :: env
 
-  integer :: i,vz,T,Tn
+  integer :: i,vz,T,Tn,Trestore,Tnrestore,thread_save
   real(wp) :: time
   character(len=512) :: thispath,tmppath
   character(len=512) :: jobcall
   character(len=80)  :: fname,pipe,atmp,btmp
   integer :: dum,io
-  logical :: ex
+  logical :: ex,use_tmd_threads
 
+  use_tmd_threads = env%threadsmdsetmanual.and.env%ThreadsMD > 0
+  thread_save = env%Threads
+  if (use_tmd_threads) env%Threads = env%ThreadsMD
   call new_ompautoset(env,'auto',env%nmetadyn,T,Tn)
 
   time = env%mdtime !for some reason this is necessary
@@ -381,6 +384,11 @@ subroutine MetaMD_para_OMP(env)
 
   if (.not.env%keepModef) then
     call cleanMTD
+  end if
+
+  if (use_tmd_threads) then
+    env%Threads = thread_save
+    call new_ompautoset(env,'max',0,Trestore,Tnrestore)
   end if
 
 end subroutine MetaMD_para_OMP

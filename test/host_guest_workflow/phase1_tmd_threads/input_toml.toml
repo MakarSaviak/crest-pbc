@@ -1,0 +1,14 @@
+runtype = "search_1"
+input = "struc.xyz"
+threads = 4
+threads_md = 2
+
+[[calculation.level]]
+method = "gfnff"
+
+[dynamics]
+length_ps = 0.010
+tstep = 1.0
+temperature = 300.0
+dump = 5.0
+shake = 0

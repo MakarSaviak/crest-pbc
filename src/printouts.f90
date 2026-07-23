@@ -248,6 +248,7 @@ subroutine confscript_morehelp(flag)
     fw = 22
     call help_section('Molecular system:')
     call help_opt('-T <int>',fw,'Number of CPU threads (or read from OMP_NUM_THREADS)')
+    call help_opt('-TMD <int>',fw,'Total CPU thread budget used only for MD/MTD sampling')
     call help_opt('-chrg <int>',fw,"Molecular charge")
     call help_opt('-uhf <int>',fw,'Unpaired electrons (N_alpha - N_beta)')
     call help_opt('-mult <int>',fw,'Spin multiplicity (2S+1 = uhf+1)')

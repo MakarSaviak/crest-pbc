@@ -121,6 +121,10 @@ contains   !> MODULE PROCEDURES START HERE
       env%Threads = val
       env%autothreads = .true.
       env%threadssetmanual = .true.
+    case ('threads_md','tmd_threads','md_threads')
+      if (val < 1) error stop '**ERROR** threads_md must be a positive integer'
+      env%ThreadsMD = val
+      env%threadsmdsetmanual = .true.
     case default
       rd = .false.
     end select

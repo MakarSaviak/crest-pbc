@@ -218,6 +218,9 @@ subroutine crest_dry_run(env,tim)
   call getcwd(dumstr)
   write (stdout,'(2x,a,t25,": ",a)') 'Working directory',trim(dumstr)
   write (stdout,'(2x,a,t25,": ",i0)') 'CPUs / threads',env%threads
+  if (env%threadsmdsetmanual) then
+    write (stdout,'(2x,a,t25,": ",i0)') 'MD/MTD CPU threads',env%ThreadsMD
+  end if
   write (stdout,*)
 
 !========================================================================================!
