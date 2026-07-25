@@ -1,0 +1,198 @@
+pha*t16)*repab
+-        erep = erep+t26/rab !energy
+-        if (present(frozen_mask)) then
+-          if (frozen_mask(iat).and.frozen_mask(jat)) cycle
+-        end if
+-        t27 = t26*(1.5d0*alpha*t16+1.0d0)/t19
++        erep = erep+t26/rab
++        t27 = t26*(1.5_wp*alpha*t16+1.0_wp)/t19
+         if (present(frozen_mask)) then
+           if (.not.frozen_mask(iat)) then
+             g(1,iat) = g(1,iat)-dx*t27
+@@ -572,10 +1075,21 @@ contains  !> MODULE PROCEDURES START HERE
+ 
+ !      if (pr) call timer%measure(8,'bend and torsion')
+     if (topo%nangl .gt. 0) then
++      if (work%static_cache_valid) then
++        eangl = eangl+work%cached_angle_total
++        nloop = work%n_dynamic_angles
++      else
++        nloop = topo%nangl
++      end if
+       !$omp parallel do default(none) reduction (+:eangl, g) &
+-      !$omp shared(n, at, xyz, topo, param) &
+-      !$omp private(m, j, i, k, etmp, g3tmp)
+-      do m = 1,topo%nangl
++      !$omp shared(n, at, xyz, topo, param, work, nloop) &
++      !$omp private(m, i, j, k, l, etmp, g3tmp)
++      do l = 1,nloop
++        if (work%static_cache_valid) then
++          m = work%dynamic_angle_idx(l)
++        else
++          m = l
++        end if
+         j = topo%alist(1,m)
+         i = topo%alist(2,m)
+         k = topo%alist(3,m)
+@@ -593,10 +1107,21 @@ contains  !> MODULE PROCEDURES START HERE
+ !!!!!!!!!!!!!!!!!!
+ 
+     if (topo%ntors .gt. 0) then
+-      !$omp parallel do default(none) reduction(+:etors, g) &
+-      !$omp shared(param, topo, n, at, xyz) &
+-      !$omp private(m, i, j, k, l, etmp, g4tmp)
+-      do m = 1,topo%ntors
++      if (work%static_cache_valid) then
++        etors = etors+work%cached_torsion_total
++        nloop = work%n_dynamic_torsions
++      else
++        nloop = topo%ntors
++      end if
++      !$omp parallel do default(none) reduction (+:etors, g) &
++      !$omp shared(param, topo, n, at, xyz, work, nloop) &
++      !$omp private(m, i, j, k, l, nd3pos, etmp, g4tmp)
++      do nd3pos = 1,nloop
++        if (work%static_cache_valid) then
++          m = work%dynamic_torsion_idx(nd3pos)
++        else
++          m = nd3pos
++        end if
+         i = topo%tlist(1,m)
+         j = topo%tlist(2,m)
+         k = topo%tlist(3,m)
+diff --git a/subprojects/gfnff/src/gfnff_interface.f90 b/subprojects/gfnff/src/gfnff_interface.f90
+index 475bec2..dbfe833 100644
+--- a/subprojects/gfnff/src/gfnff_interface.f90
++++ b/subprojects/gfnff/src/gfnff_interface.f90
+@@ -59,6 +59,7 @@ module gfnff_interface
+     type(TGFFNeighbourList),allocatable :: nlist
+     type(TBorn),allocatable             :: solvation
+     type(gfnff_results),allocatable     :: res
++    type(gfnff_workspace)                 :: work
+   contains
+     procedure :: deallocate => gfnff_data_deallocate
+     procedure :: type_reset => gfnff_data_reset_types
+@@ -110,11 +111,11 @@ contains  !> MODULE PROCEDURES START HERE
+     if (allocated(dat%frozen_mask)) then
+       call gfnff_eg(pr,nat,dat%ichrg,at,xyz,dat%make_chrg,gradient,energy, &
+       &             dat%res,dat%param,dat%topo,dat%nlist,dat%solvation, &
+-      &             dat%update,dat%version,dat%accuracy,io,dat%frozen_mask)
++      &             dat%update,dat%version,dat%accuracy,io,dat%work,dat%frozen_mask)
+     else
+       call gfnff_eg(pr,nat,dat%ichrg,at,xyz,dat%make_chrg,gradient,energy, &
+       &             dat%res,dat%param,dat%topo,dat%nlist,dat%solvation, &
+-      &             dat%update,dat%version,dat%accuracy,io)
++      &             dat%update,dat%version,dat%accuracy,io,dat%work)
+     end if
+ 
+     if (present(iostat)) then
+@@ -367,6 +368,7 @@ contains  !> MODULE PROCEDURES START HERE
+     if (allocated(self%nlist)) deallocate (self%nlist)
+     if (allocated(self%solvation)) deallocate (self%solvation)
+     if (allocated(self%res)) deallocate (self%res)
++    call self%work%release()
+   end subroutine gfnff_data_deallocate
+   subroutine gfnff_data_reset_types(self)
+     implicit none
+@@ -377,6 +379,7 @@ contains  !> MODULE PROCEDURES START HERE
+     if (allocated(self%nlist)) deallocate (self%nlist)
+     if (allocated(self%solvation)) deallocate (self%solvation)
+     if (allocated(self%res)) deallocate (self%res)
++    call self%work%release()
+   end subroutine gfnff_data_reset_types
+   subroutine gfnff_data_make_types(self)
+     implicit none
+diff --git a/test/test_gfnff.F90 b/test/test_gfnff.F90
+index a4a3ff3..b5c3db0 100644
+--- a/test/test_gfnff.F90
++++ b/test/test_gfnff.F90
+@@ -123,6 +123,8 @@ contains  !> Unit tests for using gfnff in crest
+     real(wp) :: eref,efrozen
+     real(wp),allocatable :: gref(:,:),gfrozen(:,:)
+     integer :: io,nfrozen
++    real(wp),parameter :: energy_thr = 1.0e-12_wp
++    real(wp),parameter :: gradient_thr = 1.0e-13_wp
+ 
+     call sett%create('gfnff')
+     call reference%add(sett)
+@@ -135,35 +137,96 @@ contains  !> Unit tests for using gfnff in crest
+     allocate(frozen%freezelist(mol%nat),source=.false.)
+     frozen%freezelist(1:nfrozen) = .true.
+ 
++    ! First call builds the frozen-host caches.
+     call engrad(mol,reference,eref,gref,io)
+     call check(error,io,0)
+     if (allocated(error)) return
++    call engrad(mol,frozen,efrozen,gfrozen,io)
++    call check(error,io,0)
++    if (allocated(error)) return
++    call check_frozen_result('initial cache construction')
++    if (allocated(error)) return
+ 
++    ! Moving an active atom must reuse the caches without changing the result.
++    mol%xyz(1,mol%nat) = mol%xyz(1,mol%nat)+1.0e-3_wp
++    call engrad(mol,reference,eref,gref,io)
++    call check(error,io,0)
++    if (allocated(error)) return
+     call engrad(mol,frozen,efrozen,gfrozen,io)
+     call check(error,io,0)
+     if (allocated(error)) return
++    call check_frozen_result('cache reuse after active displacement')
++    if (allocated(error)) return
+ 
+-    if (eref /= efrozen) then
+-      call test_failed(error,"Frozen-gradient optimization changed GFN-FF energy")
+-      return
+-    end if
++    ! Moving a frozen atom must invalidate and rebuild all geometry caches.
++    mol%xyz(2,1) = mol%xyz(2,1)-2.0e-4_wp
++    call engrad(mol,reference,eref,gref,io)
++    call check(error,io,0)
++    if (allocated(error)) return
++    call engrad(mol,frozen,efrozen,gfrozen,io)
++    call check(error,io,0)
++    if (allocated(error)) return
++    call check_frozen_result('cache invalidation after frozen displacement')
++    if (allocated(error)) return
+ 
+-    if (any(gfrozen(:,nfrozen+1:mol%nat) /= gref(:,nfrozen+1:mol%nat))) then
+-      call test_failed(error,"Frozen-gradient optimization changed an active gradient")
+-      return
+-    end if
++    ! A changed, non-prefix mask exercises the general exact fallback path.
++    frozen%freezelist(nfrozen) = .false.
++    frozen%freezelist(mol%nat) = .true.
++    call engrad(mol,reference,eref,gref,io)
++    call check(error,io,0)
++    if (allocated(error)) return
++    call engrad(mol,frozen,efrozen,gfrozen,io)
++    call check(error,io,0)
++    if (allocated(error)) return
++    call check_frozen_result('cache invalidation after mask change')
++    if (allocated(error)) return
+ 
+-    if (any(gfrozen(:,1:nfrozen) /= 0.0_wp)) then
+-      call test_failed(error,"Frozen gradients were not zeroed")
++    ! Removing the mask must restore the ordinary full-gradient calculation.
++    frozen%nfreeze = 0
++    deallocate(frozen%freezelist)
++    call engrad(mol,reference,eref,gref,io)
++    call check(error,io,0)
++    if (allocated(error)) return
++    call engrad(mol,frozen,efrozen,gfrozen,io)
++    call check(error,io,0)
++    if (allocated(error)) return
++    if (abs(eref-efrozen) > energy_thr) then
++      call test_failed(error,'Removing the freeze mask changed GFN-FF energy')
+       return
+     end if
+-
+-    gref(:,1:nfrozen) = 0.0_wp
+-    if (any(gfrozen /= gref)) then
+-      call test_failed(error,"Post-freeze gradients are not bitwise identical")
++    if (maxval(abs(gfrozen-gref)) > gradient_thr) then
++      call test_failed(error,'Removing the freeze mask changed the full gradient')
++      return
+     end if
+ 
+     deallocate
