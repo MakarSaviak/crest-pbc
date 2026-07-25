@@ -1,0 +1,237 @@
+From 7ce65309f76fe11297b72e6de461540b4d490a68 Mon Sep 17 00:00:00 2001
+From: OpenAI <local@openai.invalid>
+Date: Sat, 25 Jul 2026 18:48:12 +0000
+Subject: [PATCH] Cache exact frozen-host GFN-FF work
+
+---
+ subprojects/gfnff/src/gfnff_cn.f90        | 192 ++++--
+ subprojects/gfnff/src/gfnff_engrad.F90    | 735 ++++++++++++++++++----
+ subprojects/gfnff/src/gfnff_interface.f90 |   7 +-
+ test/test_gfnff.F90                       |  91 ++-
+ 4 files changed, 845 insertions(+), 180 deletions(-)
+
+diff --git a/subprojects/gfnff/src/gfnff_cn.f90 b/subprojects/gfnff/src/gfnff_cn.f90
+index d73f21c..afce931 100644
+--- a/subprojects/gfnff/src/gfnff_cn.f90
++++ b/subprojects/gfnff/src/gfnff_cn.f90
+@@ -37,7 +37,8 @@ contains  !> MODULE PROCEDURES START HERE
+ ! CN routines
+ !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+ !> logCN derivative saved in dlogCN array
+-  subroutine gfnff_dlogcoord(n,at,xyz,rab,logCN,dlogCN,thr2,param)
++  subroutine gfnff_dlogcoord(n,at,xyz,rab,logCN,dlogCN,thr2,param, &
++  & frozen_mask,static_cn,static_valid,frozen_prefix,prefix_frozen)
+     implicit none
+     type(TGFFData),intent(in) :: param
+     integer,intent(in)  :: n
+@@ -47,75 +48,148 @@ contains  !> MODULE PROCEDURES START HERE
+     real(wp),intent(out) :: logCN(n)
+     real(wp),intent(out) :: dlogCN(3,n,n)
+     real(wp),intent(in)  :: thr2
+-    real(wp)             :: cn(n)
+-    !> counter
+-    integer  :: i,j,ij,ii
+-    !> distances
+-    real(wp) :: r
+-    real(wp) :: r0
+-    real(wp) :: dr
++    logical,intent(in),optional :: frozen_mask(n),prefix_frozen
++    real(wp),intent(inout),optional :: static_cn(n)
++    logical,intent(inout),optional :: static_valid
++    integer,intent(in),optional :: frozen_prefix
++    real(wp) :: cn(n)
++    integer  :: i,j,ij,ii,istart
++    real(wp) :: r,r0,dr
+     real(wp),dimension(3) :: rij
+-    !> treshold
+-    real(wp) :: thr
+-    !> cn parameter
+-    real(wp) :: erfCN
+-    real(wp) :: dlogdcni
+-    real(wp) :: dlogdcnj
+-    real(wp) :: derivative
+-    !> local parameter
++    real(wp) :: thr,erfCN,dlogdcni,dlogdcnj,derivative
+     real(wp),parameter :: kn = -7.5_wp
+-    !> initialize vaiiables
++    logical :: use_cache,use_prefix
++
+     cn = 0.0_wp
+     logCN = 0.0_wp
+     dlogCN = 0.0_wp
+-    dlogdcni = 0.0_wp
+-    dlogdcnj = 0.0_wp
+-    derivative = 0.0_wp
+-    r = 0.0_wp
+-    r0 = 0.0_wp
+-    rij = 0.0_wp
+     thr = sqrt(thr2)
+-    !> create error function CN
+-    do i = 2,n
+-      ii = i*(i-1)/2
+-      do j = 1,i-1
+-        ij = ii+j
+-        r = rab(ij)
+-        if (r .gt. thr) cycle
+-        r0 = (param%rcov(at(i))+param%rcov(at(j)))
+-        dr = (r-r0)/r0
+-        !> hier kommt die CN funktion hin
+-!           erfCN = create_expCN(16.0d0,r,r0)
+-        erfCN = 0.5_wp*(1.0_wp+erf(kn*dr))
+-        cn(i) = cn(i)+erfCN
+-        cn(j) = cn(j)+erfCN
++    use_cache = present(frozen_mask).and.present(static_cn).and.present(static_valid)
++    use_prefix = .false.
++    if (present(frozen_prefix).and.present(prefix_frozen)) then
++      use_prefix = prefix_frozen
++    end if
++
++    if (use_cache) then
++!> The raw frozen--frozen CN contribution is geometry invariant while the host
++!> is fixed. It is cached exactly; every active--frozen and active--active term
++!> is recomputed below at each call.
++      if (.not.static_valid) then
++        static_cn = 0.0_wp
++        do i = 2,n
++          ii = i*(i-1)/2
++          do j = 1,i-1
++            if (.not.(frozen_mask(i).and.frozen_mask(j))) cycle
++            ij = ii+j
++            r = rab(ij)
++            if (r .gt. thr) cycle
++            r0 = param%rcov(at(i))+param%rcov(at(j))
++            dr = (r-r0)/r0
++            erfCN = 0.5_wp*(1.0_wp+erf(kn*dr))
++            static_cn(i) = static_cn(i)+erfCN
++            static_cn(j) = static_cn(j)+erfCN
++          end do
++        end do
++        static_valid = .true.
++      end if
++      cn = static_cn
++
++      if (use_prefix) then
++        istart = frozen_prefix+1
++        do i = istart,n
++          ii = i*(i-1)/2
++          do j = 1,i-1
++            ij = ii+j
++            r = rab(ij)
++            if (r .gt. thr) cycle
++            r0 = param%rcov(at(i))+param%rcov(at(j))
++            dr = (r-r0)/r0
++            erfCN = 0.5_wp*(1.0_wp+erf(kn*dr))
++            cn(i) = cn(i)+erfCN
++            cn(j) = cn(j)+erfCN
++          end do
++        end do
++      else
++        do i = 2,n
++          ii = i*(i-1)/2
++          do j = 1,i-1
++            if (frozen_mask(i).and.frozen_mask(j)) cycle
++            ij = ii+j
++            r = rab(ij)
++            if (r .gt. thr) cycle
++            r0 = param%rcov(at(i))+param%rcov(at(j))
++            dr = (r-r0)/r0
++            erfCN = 0.5_wp*(1.0_wp+erf(kn*dr))
++            cn(i) = cn(i)+erfCN
++            cn(j) = cn(j)+erfCN
++          end do
++        end do
++      end if
++    else
++      do i = 2,n
++        ii = i*(i-1)/2
++        do j = 1,i-1
++          ij = ii+j
++          r = rab(ij)
++          if (r .gt. thr) cycle
++          r0 = param%rcov(at(i))+param%rcov(at(j))
++          dr = (r-r0)/r0
++          erfCN = 0.5_wp*(1.0_wp+erf(kn*dr))
++          cn(i) = cn(i)+erfCN
++          cn(j) = cn(j)+erfCN
++        end do
+       end do
+-    end do
+-    !> create cutted logarithm CN + derivatives
++    end if
++
+     do i = 1,n
+-      ii = i*(i-1)/2
+       logCN(i) = create_logCN(cn(i),param)
+-      !> get dlogCN/dCNi
+-      dlogdcni = create_dlogCN(cn(i),param)
+-      do j = 1,i-1
+-        ij = ii+j
+-        !> get dlogCN/dCNj
+-        dlogdcnj = create_dlogCN(cn(j),param)
+-        r = rab(ij)
+-        if (r .gt. thr) cycle
+-        r0 = (param%rcov(at(i))+param%rcov(at(j)))
+-        !> get derfCN/dRij
+-        derivative = create_derfCN(kn,r,r0)
+-!           derivative = create_dexpCN(16.0d0,r,r0)
+-        rij = derivative*(xyz(:,j)-xyz(:,i))/r
+-        !> project rij gradient onto cartesians
+-        dlogCN(:,j,j) = dlogdcnj*rij+dlogCN(:,j,j)
+-        dlogCN(:,i,j) = -dlogdcnj*rij
+-        dlogCN(:,j,i) = dlogdcni*rij
+-        dlogCN(:,i,i) = -dlogdcni*rij+dlogCN(:,i,i)
+-      end do
+     end do
+ 
++!> Only derivatives with respect to an active coordinate can contribute to the
++!> propagated active gradient. Frozen--frozen derivative blocks are therefore
++!> omitted exactly, while the current total CN is retained in every prefactor.
++    if (use_cache.and.use_prefix) then
++      istart = frozen_prefix+1
++      do i = istart,n
++        ii = i*(i-1)/2
++        dlogdcni = create_dlogCN(cn(i),param)
++        do j = 1,i-1
++          ij = ii+j
++          dlogdcnj = create_dlogCN(cn(j),param)
++          r = rab(ij)
++          if (r .gt. thr) cycle
++          r0 = param%rcov(at(i))+param%rcov(at(j))
++          derivative = create_derfCN(kn,r,r0)
++          rij = derivative*(xyz(:,j)-xyz(:,i))/r
++          dlogCN(:,j,j) = dlogdcnj*rij+dlogCN(:,j,j)
++          dlogCN(:,i,j) = -dlogdcnj*rij
++          dlogCN(:,j,i) = dlogdcni*rij
++          dlogCN(:,i,i) = -dlogdcni*rij+dlogCN(:,i,i)
++        end do
++      end do
++    else
++      do i = 1,n
++        ii = i*(i-1)/2
++        dlogdcni = create_dlogCN(cn(i),param)
++        do j = 1,i-1
++          if (use_cache) then
++            if (frozen_mask(i).and.frozen_mask(j)) cycle
++          end if
++          ij = ii+j
++          dlogdcnj = create_dlogCN(cn(j),param)
++          r = rab(ij)
++          if (r .gt. thr) cycle
++          r0 = param%rcov(at(i))+param%rcov(at(j))
++          derivative = create_derfCN(kn,r,r0)
++          rij = derivative*(xyz(:,j)-xyz(:,i))/r
++          dlogCN(:,j,j) = dlogdcnj*rij+dlogCN(:,j,j)
++          dlogCN(:,i,j) = -dlogdcnj*rij
++          dlogCN(:,j,i) = dlogdcni*rij
++          dlogCN(:,i,i) = -dlogdcni*rij+dlogCN(:,i,i)
++        end do
++      end do
++    end if
++
+   contains
+ 
+     pure elemental function create_logCN(cn,param) result(count)
+diff --git a/subprojects/gfnff/src/gfnff_engrad.F90 b/subprojects/gfnff/src/gfnff_engrad.F90
+index e1b43da..5ad07e3 100644
+--- a/subprojects/gfnff/src/gfnff_engrad.F90
++++ b/subprojects/gfnff/src/gfnff_engra

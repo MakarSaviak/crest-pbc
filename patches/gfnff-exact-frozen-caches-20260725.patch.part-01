@@ -1,0 +1,204 @@
+d.F90
+@@ -31,7 +31,7 @@ module gfnff_engrad_module
+   use gfnff_math_wrapper
+   implicit none
+   private
+-  public :: gfnff_eg,gfnff_results
++  public :: gfnff_eg,gfnff_results,gfnff_workspace
+ 
+   type :: gfnff_results
+     real(wp) :: e_total = 0.0_wp
+@@ -54,6 +54,46 @@ module gfnff_engrad_module
+     real(wp) :: e_ext = 0.0_wp
+   end type gfnff_results
+ 
++  !> Persistent storage and exact caches for repeated frozen-host calls.
++  !> No charge, CN, D3 coefficient, cutoff, or force-field approximation is used.
++  type :: gfnff_workspace
++    integer :: nat = 0
++    integer :: nbond = 0
++    integer :: nangl = 0
++    integer :: ntors = 0
++    real(wp),allocatable :: grab0(:,:,:),rab0(:),eeqtmp(:,:)
++    real(wp),allocatable :: cn(:),dcn(:,:,:),qtmp(:)
++    real(wp),allocatable :: hb_cn(:),hb_dcn(:,:,:)
++    real(wp),allocatable :: sqrab(:),srab(:),g5tmp(:,:)
++    integer,allocatable :: d3list(:,:),d3count(:),d3offset(:),active_atoms(:)
++    logical,allocatable :: frozen_pair(:),frozen_mask_ref(:)
++    real(wp),allocatable :: frozen_sqrab(:),frozen_srab(:),frozen_reference(:,:)
++    real(wp),allocatable :: raw_cn_static(:)
++    integer,allocatable :: active_pair_i(:),active_pair_j(:),active_pair_idx(:)
++    integer,allocatable :: dynamic_bond_idx(:),dynamic_angle_idx(:),dynamic_torsion_idx(:)
++    integer :: n_active_pairs = 0
++    integer :: frozen_prefix = 0
++    logical :: prefix_frozen = .false.
++    integer :: n_dynamic_bonds = 0
++    integer :: n_dynamic_angles = 0
++    integer :: n_dynamic_torsions = 0
++    logical :: frozen_cache_valid = .false.
++    logical :: static_cache_valid = .false.
++    logical :: cn_cache_valid = .false.
++    real(wp) :: static_repthr = -1.0_wp
++    real(wp) :: static_dispthr = -1.0_wp
++    real(wp) :: cn_cache_thr = -1.0_wp
++    real(wp) :: cached_nb_rep_total = 0.0_wp
++    real(wp) :: cached_bond_rep_total = 0.0_wp
++    real(wp) :: cached_angle_total = 0.0_wp
++    real(wp) :: cached_torsion_total = 0.0_wp
++  contains
++    procedure :: ensure => gfnff_workspace_ensure
++    procedure :: prepare_frozen => gfnff_workspace_prepare_frozen
++    procedure :: prepare_static => gfnff_workspace_prepare_static
++    procedure :: release => gfnff_workspace_release
++  end type gfnff_workspace
++
+   real(wp),private,parameter :: pi = 3.1415926535897932385_wp
+   real(wp),private,parameter :: sqrtpi = 1.77245385091_wp
+ 
+@@ -63,6 +103,281 @@ contains  !> MODULE PROCEDURES START HERE
+ !========================================================================================!
+ !========================================================================================!
+ 
++  subroutine gfnff_workspace_ensure(self,n,nbond,nangl,ntors)
++    class(gfnff_workspace),intent(inout) :: self
++    integer,intent(in) :: n,nbond,nangl,ntors
++    integer :: npair
++
++    if (self%nat == n .and. self%nbond == nbond .and. self%nangl == nangl .and. &
++   &    self%ntors == ntors .and. allocated(self%sqrab)) return
++
++    call self%release()
++    npair = n*(n+1)/2
++    allocate(self%sqrab(npair),self%srab(npair),self%qtmp(n),self%g5tmp(3,n), &
++   &         self%eeqtmp(2,npair),self%d3list(2,npair),self%dcn(3,n,n), &
++   &         self%cn(n),self%hb_dcn(3,n,n),self%hb_cn(n), &
++   &         self%d3count(n),self%d3offset(n),self%active_atoms(n), &
++   &         self%grab0(3,n,nbond),self%rab0(nbond), &
++   &         self%frozen_pair(npair),self%frozen_mask_ref(n), &
++   &         self%frozen_sqrab(npair),self%frozen_srab(npair), &
++   &         self%frozen_reference(3,n),self%raw_cn_static(n), &
++   &         self%active_pair_i(npair), &
++   &         self%active_pair_j(npair),self%active_pair_idx(npair), &
++   &         self%dynamic_bond_idx(max(1,nbond)), &
++   &         self%dynamic_angle_idx(max(1,nangl)), &
++   &         self%dynamic_torsion_idx(max(1,ntors)))
++    self%frozen_pair = .false.
++    self%frozen_mask_ref = .false.
++    self%frozen_cache_valid = .false.
++    self%static_cache_valid = .false.
++    self%cn_cache_valid = .false.
++    self%n_active_pairs = 0
++    self%frozen_prefix = 0
++    self%prefix_frozen = .false.
++    self%n_dynamic_bonds = 0
++    self%n_dynamic_angles = 0
++    self%n_dynamic_torsions = 0
++    self%cached_nb_rep_total = 0.0_wp
++    self%cached_bond_rep_total = 0.0_wp
++    self%cached_angle_total = 0.0_wp
++    self%cached_torsion_total = 0.0_wp
++    self%nat = n
++    self%nbond = nbond
++    self%nangl = nangl
++    self%ntors = ntors
++  end subroutine gfnff_workspace_ensure
++
++  subroutine gfnff_workspace_prepare_frozen(self,n,xyz,frozen_mask)
++    class(gfnff_workspace),intent(inout) :: self
++    integer,intent(in) :: n
++    real(wp),intent(in) :: xyz(3,n)
++    logical,intent(in) :: frozen_mask(n)
++    integer :: i,j,ij,k,m
++
++    if (count(frozen_mask) < 2) then
++      self%frozen_pair = .false.
++      self%frozen_cache_valid = .false.
++      self%static_cache_valid = .false.
++      self%cn_cache_valid = .false.
++      self%n_active_pairs = 0
++      self%frozen_prefix = 0
++      self%prefix_frozen = .false.
++      self%n_dynamic_bonds = 0
++      self%n_dynamic_angles = 0
++      self%n_dynamic_torsions = 0
++      return
++    end if
++
++    if (self%frozen_cache_valid) then
++      if (any(self%frozen_mask_ref .neqv. frozen_mask)) then
++        self%frozen_cache_valid = .false.
++        self%static_cache_valid = .false.
++        self%cn_cache_valid = .false.
++      else
++        do i = 1,n
++          if (frozen_mask(i)) then
++            if (any(xyz(:,i) /= self%frozen_reference(:,i))) then
++              self%frozen_cache_valid = .false.
++              self%static_cache_valid = .false.
++              self%cn_cache_valid = .false.
++              exit
++            end if
++          end if
++        end do
++      end if
++    end if
++    if (self%frozen_cache_valid) return
++
++    self%frozen_pair = .false.
++    self%frozen_mask_ref = frozen_mask
++    self%n_active_pairs = 0
++    self%frozen_prefix = 0
++    do i = 1,n
++      if (.not.frozen_mask(i)) exit
++      self%frozen_prefix = i
++    end do
++    if (self%frozen_prefix == n) then
++      self%prefix_frozen = .true.
++    else
++      self%prefix_frozen = self%frozen_prefix >= 2 .and. &
++     &                     all(.not.frozen_mask(self%frozen_prefix+1:n))
++    end if
++    do i = 1,n
++      if (frozen_mask(i)) self%frozen_reference(:,i) = xyz(:,i)
++      ij = i*(i-1)/2
++      self%frozen_sqrab(ij+i) = 0.0_wp
++      self%frozen_srab(ij+i) = 0.0_wp
++      self%sqrab(ij+i) = 0.0_wp
++      self%srab(ij+i) = 0.0_wp
++      do j = 1,i-1
++        k = ij+j
++        if (frozen_mask(i).and.frozen_mask(j)) then
++          self%frozen_pair(k) = .true.
++          self%frozen_sqrab(k) = (xyz(1,i)-xyz(1,j))**2 + &
++         &                       (xyz(2,i)-xyz(2,j))**2 + &
++         &                       (xyz(3,i)-xyz(3,j))**2
++          self%frozen_srab(k) = sqrt(self%frozen_sqrab(k))
++          self%sqrab(k) = self%frozen_sqrab(k)
++          self%srab(k) = self%frozen_srab(k)
++        else
++          self%n_active_pairs = self%n_active_pairs+1
++          m = self%n_active_pairs
++          self%active_pair_i(m) = i
++          self%active_pair_j(m) = j
++          self%active_pair_idx(m) = k
++        end if
++      end do
++    end do
++    self%frozen_cache_valid = .true.
++    self%static_cache_valid = .false.
++    self%cn_cache_valid = .false.
++  end subroutine gfnff_workspace_prepare_frozen
++
++  subroutine gfnff_workspace_prepare_static(self,n,at,xyz,frozen_mask,repthr,dispthr,param,topo,sqrab,srab)
++    class(gfnff_workspace),intent(inout) :: self
++    integer,intent(in) :: n,at(n)
++    real(wp),intent(in) :: xyz(3,n),repthr,dispthr,sqrab(:),srab(:)
++    logical,intent(in) :: frozen_mask(n)
++    type(TGFFData),intent(in) :: param
++    type(TGFFTopology),intent(in) :: topo
++    integer :: i,j,k,l,m,ij,iat,jat,ati,atj
++    real(wp) :: r2,rab,t16,t19,t8,t26,alpha,repab,etmp
++    real(wp) :: g3tmp(3,3),g4tmp(3,4)
++
++    if (.not.self%frozen_cache_valid) then
++      self%static_cache_valid = .fals

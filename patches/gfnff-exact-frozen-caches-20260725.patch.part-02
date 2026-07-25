@@ -1,0 +1,193 @@
+e.
++      return
++    end if
++    if (self%static_cache_valid.and.self%static_repthr == repthr .and. &
++   &    self%static_dispthr == dispthr) return
++
++    self%cached_nb_rep_total = 0.0_wp
++    self%cached_bond_rep_total = 0.0_wp
++    self%cached_angle_total = 0.0_wp
++    self%cached_torsion_total = 0.0_wp
++    self%n_dynamic_bonds = 0
++    self%n_dynamic_angles = 0
++    self%n_dynamic_torsions = 0
++
++    do iat = 1,n
++      m = iat*(iat-1)/2
++      do jat = 1,iat-1
++        if (.not.(frozen_mask(iat).and.frozen_mask(jat))) cycle
++        ij = m+jat
++        r2 = sqrab(ij)
++        if (r2 .gt. repthr) cycle
++        if (topo%bpair(ij) .eq. 1) cycle
++        ati = at(iat)
++        atj = at(jat)
++        rab = srab(ij)
++        t16 = r2**0.75_wp
++        t19 = t16*t16
++        t8 = t16*topo%alphanb(ij)
++        t26 = exp(-t8)*param%repz(ati)*param%repz(atj)*param%repscaln
++        self%cached_nb_rep_total = self%cached_nb_rep_total+t26/rab
++      end do
++    end do
++
++    do i = 1,topo%nbond
++      iat = topo%blist(1,i)
++      jat = topo%blist(2,i)
++      if (.not.(frozen_mask(iat).and.frozen_mask(jat))) then
++        self%n_dynamic_bonds = self%n_dynamic_bonds+1
++        self%dynamic_bond_idx(self%n_dynamic_bonds) = i
++        cycle
++      end if
++      ij = iat*(iat-1)/2+jat
++      r2 = sqrab(ij)
++      rab = srab(ij)
++      ati = at(iat)
++      atj = at(jat)
++      alpha = sqrt(param%repa(ati)*param%repa(atj))
++      repab = param%repz(ati)*param%repz(atj)*param%repscalb
++      t16 = r2**0.75_wp
++      t19 = t16*t16
++      t26 = exp(-alpha*t16)*repab
++      self%cached_bond_rep_total = self%cached_bond_rep_total+t26/rab
++    end do
++
++    do m = 1,topo%nangl
++      j = topo%alist(1,m)
++      i = topo%alist(2,m)
++      k = topo%alist(3,m)
++      if (.not.(frozen_mask(i).and.frozen_mask(j).and.frozen_mask(k))) then
++        self%n_dynamic_angles = self%n_dynamic_angles+1
++        self%dynamic_angle_idx(self%n_dynamic_angles) = m
++        cycle
++      end if
++      call egbend(m,j,i,k,n,at,xyz,etmp,g3tmp,param,topo)
++      self%cached_angle_total = self%cached_angle_total+etmp
++    end do
++
++    do m = 1,topo%ntors
++      i = topo%tlist(1,m)
++      j = topo%tlist(2,m)
++      k = topo%tlist(3,m)
++      l = topo%tlist(4,m)
++      if (.not.(frozen_mask(i).and.frozen_mask(j).and.frozen_mask(k).and.frozen_mask(l))) then
++        self%n_dynamic_torsions = self%n_dynamic_torsions+1
++        self%dynamic_torsion_idx(self%n_dynamic_torsions) = m
++        cycle
++      end if
++      call egtors(m,i,j,k,l,n,at,xyz,etmp,g4tmp,param,topo)
++      self%cached_torsion_total = self%cached_torsion_total+etmp
++    end do
++
++    self%static_repthr = repthr
++    self%static_dispthr = dispthr
++    self%static_cache_valid = .true.
++  end subroutine gfnff_workspace_prepare_static
++
++  subroutine gfnff_workspace_release(self)
++    class(gfnff_workspace),intent(inout) :: self
++    if (allocated(self%grab0)) deallocate(self%grab0)
++    if (allocated(self%rab0)) deallocate(self%rab0)
++    if (allocated(self%eeqtmp)) deallocate(self%eeqtmp)
++    if (allocated(self%cn)) deallocate(self%cn)
++    if (allocated(self%dcn)) deallocate(self%dcn)
++    if (allocated(self%qtmp)) deallocate(self%qtmp)
++    if (allocated(self%hb_cn)) deallocate(self%hb_cn)
++    if (allocated(self%hb_dcn)) deallocate(self%hb_dcn)
++    if (allocated(self%sqrab)) deallocate(self%sqrab)
++    if (allocated(self%srab)) deallocate(self%srab)
++    if (allocated(self%g5tmp)) deallocate(self%g5tmp)
++    if (allocated(self%d3list)) deallocate(self%d3list)
++    if (allocated(self%d3count)) deallocate(self%d3count)
++    if (allocated(self%d3offset)) deallocate(self%d3offset)
++    if (allocated(self%active_atoms)) deallocate(self%active_atoms)
++    if (allocated(self%frozen_pair)) deallocate(self%frozen_pair)
++    if (allocated(self%frozen_mask_ref)) deallocate(self%frozen_mask_ref)
++    if (allocated(self%frozen_sqrab)) deallocate(self%frozen_sqrab)
++    if (allocated(self%frozen_srab)) deallocate(self%frozen_srab)
++    if (allocated(self%frozen_reference)) deallocate(self%frozen_reference)
++    if (allocated(self%raw_cn_static)) deallocate(self%raw_cn_static)
++    if (allocated(self%active_pair_i)) deallocate(self%active_pair_i)
++    if (allocated(self%active_pair_j)) deallocate(self%active_pair_j)
++    if (allocated(self%active_pair_idx)) deallocate(self%active_pair_idx)
++    if (allocated(self%dynamic_bond_idx)) deallocate(self%dynamic_bond_idx)
++    if (allocated(self%dynamic_angle_idx)) deallocate(self%dynamic_angle_idx)
++    if (allocated(self%dynamic_torsion_idx)) deallocate(self%dynamic_torsion_idx)
++    self%nat = 0
++    self%nbond = 0
++    self%nangl = 0
++    self%ntors = 0
++    self%frozen_cache_valid = .false.
++    self%static_cache_valid = .false.
++    self%cn_cache_valid = .false.
++    self%static_repthr = -1.0_wp
++    self%static_dispthr = -1.0_wp
++    self%cn_cache_thr = -1.0_wp
++    self%n_active_pairs = 0
++    self%frozen_prefix = 0
++    self%prefix_frozen = .false.
++    self%n_dynamic_bonds = 0
++    self%n_dynamic_angles = 0
++    self%n_dynamic_torsions = 0
++  end subroutine gfnff_workspace_release
++
+ !---------------------------------------------------
+ !> GFN-FF
+ !> energy and analytical gradient for given xyz and
+@@ -91,7 +406,7 @@ contains  !> MODULE PROCEDURES START HERE
+ !> 
+ !---------------------------------------------------
+   subroutine gfnff_eg(pr,n,ichrg,at,xyz,makeq,g,etot,res_gff, &
+-  &          param,topo,nlist,solvation,update,version,accuracy,io,frozen_mask)
++  &          param,topo,nlist,solvation,update,version,accuracy,io,work,frozen_mask)
+ 
+     use gfnff_param,only:efield,gffVersion,gfnff_thresholds
+     use gfnff_gdisp0
+@@ -104,6 +419,7 @@ contains  !> MODULE PROCEDURES START HERE
+     type(TGFFData),intent(in) :: param
+     type(TGFFTopology),intent(in) :: topo
+     type(TGFFNeighbourList),intent(inout) :: nlist
++    type(gfnff_workspace),intent(inout),target :: work
+     logical,intent(in),optional :: frozen_mask(n)
+ 
+     type(TBorn),allocatable,intent(inout) :: solvation
+@@ -123,7 +439,7 @@ contains  !> MODULE PROCEDURES START HERE
+     real(wp) :: edisp,ees,ebond,eangl,etors,erep,ehb,exb,ebatm,eext
+     real(wp) :: gsolv,gborn,ghb,gsasa,gshift
+ 
+-    integer  :: i,j,k,l,m,ij,nd3,nd3pos,nlocal,nthreads,tid,nactive,iact
++    integer  :: i,j,k,l,m,ij,nd3,nd3pos,nlocal,nthreads,tid,nactive,iact,nloop
+     integer  :: ati,atj,iat,jat
+     integer  :: hbA,hbB
+     integer  :: lin
+@@ -136,12 +452,12 @@ contains  !> MODULE PROCEDURES START HERE
+     real(wp) ::  rn,dr,g3tmp(3,3),g4tmp(3,4)
+     real(wp) :: rij,drij(3,n),gactive(3)
+ 
+-    real(wp),allocatable :: grab0(:,:,:),rab0(:),eeqtmp(:,:)
+-    real(wp),allocatable :: cn(:),dcn(:,:,:),qtmp(:)
+-    real(wp),allocatable :: hb_cn(:),hb_dcn(:,:,:)
+-    real(wp),allocatable :: sqrab(:),srab(:)
+-    real(wp),allocatable :: g5tmp(:,:),ghb_thread(:,:,:),ehb_thread(:)
+-    integer,allocatable :: d3list(:,:),d3count(:),d3offset(:),active_atoms(:)
++    real(wp),pointer :: grab0(:,:,:),rab0(:),eeqtmp(:,:)
++    real(wp),pointer :: cn(:),dcn(:,:,:),qtmp(:)
++    real(wp),pointer :: hb_cn(:),hb_dcn(:,:,:)
++    real(wp),pointer :: sqrab(:),srab(:),g5tmp(:,:)
++    real(wp),allocatable :: ghb_thread(:,:,:),ehb_thread(:)
++    integer,pointer :: d3list(:,:),d3count(:),d3offset(:),active_atoms(:)
+     !type(tb_timer) :: timer
+     real(wp) :: dispthr,cnthr,repthr,hbthr1,hbthr2
+ 
+@@ -167,36 +483,135 @@ contains  !> MODULE PROCEDURES START HERE
+     ghb = 0.0d0
+     gshift = 0.0d0
+ 
+-    allocate (sqrab(n*(n+1)/2),srab(n*(n+1)/2),qtmp(n),g5tmp(3,n), &
+-   &         eeqtmp(2,n*(n+1)/2),d3list(2,n*(n+1)/2),dcn(3,n,n),cn(n), &
+-   &         hb_dcn(3,n,n),hb_cn(n),d3count(n),d3offset(n))
++    call work%ensure(n,topo%nbond,topo%nangl,topo%ntors)
++    if (present(frozen_mask)) then
++      call work%prepare_frozen(n,xyz,frozen_mask)
++      if (work%static_cache_valid) then
++        if (work%static_repthr /= repthr .or. work%static_dispthr /= dispthr) the
