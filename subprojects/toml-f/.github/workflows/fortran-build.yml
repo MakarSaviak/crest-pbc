@@ -1,0 +1,125 @@
+name: CI
+on: [push, pull_request]
+
+jobs:
+  gcc-build:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        toolchain: [{compiler: gcc, version: 10}]
+        build-type: [default]
+
+        include:
+          - os: ubuntu-latest
+            toolchain: {compiler: gcc, version: 9}
+            build-type: coverage
+          - os: ubuntu-latest
+            toolchain: {compiler: gcc, version: 10}
+            build-type: coverage
+          - os: ubuntu-latest
+            toolchain: {compiler: gcc, version: 11}
+            build-type: coverage
+          - os: ubuntu-latest
+            toolchain: {compiler: gcc, version: 12}
+            build-type: coverage
+          - os: ubuntu-latest
+            toolchain: {compiler: intel-classic, version: '2021.9'}
+            build-type: default
+          # os: ubuntu-latest
+          # toolchain: {compiler: intel, version: '2023.1'}
+          # build-type: default
+
+    defaults:
+      run:
+        shell: ${{ contains(matrix.os, 'windows') && 'msys2 {0}' || 'bash -l {0}' }}
+
+    env:
+      OMP_NUM_THREADS: 2,1
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v3
+
+    - uses: actions/setup-python@v4
+      with:
+        python-version: '3.x'
+
+    - uses: actions/setup-go@v3
+      with:
+        go-version: '>=1.17.0'
+
+    - name: Checkout toml-test
+      uses: actions/checkout@v2
+      with:
+        repository: BurntSushi/toml-test
+        ref: v1.1.0
+        path: _validator
+
+    - run: go install ./cmd/toml-test
+      working-directory: _validator
+      shell: bash
+
+    - name: Setup compiler
+      if: ${{ ! contains(matrix.os, 'windows') }}
+      uses: awvwgk/setup-fortran@v1
+      with:
+        compiler: ${{ matrix.toolchain.compiler }}
+        version: ${{ matrix.toolchain.version }}
+
+    - name: Install GCC (Windows)
+      if: ${{ contains(matrix.os, 'windows') }}
+      uses: msys2/setup-msys2@v2
+      with:
+        msystem: ucrt64
+        update: false
+        path-type: inherit
+        pacboy: >-
+          gcc-fortran:p
+          cmake:p
+          meson:p
+          ninja:p
+
+    - name: Install meson/cmake
+      if: ${{ ! contains(matrix.os, 'windows') }}
+      run: >-
+        pip3 install
+        meson cmake ninja
+        ${{ matrix.build-type == 'coverage' && 'gcovr' || '' }}
+
+    - name: Configure meson build
+      run: meson setup build ${{ env.meson_args }}
+      env:
+        meson_args: >-
+          ${{ matrix.toolchain.version == '9' && '-Dwerror=true' || '' }}
+          ${{ matrix.build-type == 'coverage' && '-Db_coverage=true' || '' }}
+
+    - name: Build library (meson)
+      run: meson compile -C build
+
+    - name: Run unit tests (meson)
+      run: meson test -C build --print-errorlogs --no-rebuild
+
+    - name: Create coverage report
+      if: ${{ matrix.build-type == 'coverage' }}
+      run:
+         ninja -C build coverage
+
+    - name: Configure cmake build
+      run: cmake -B _build -G Ninja
+
+    - name: Build library (CMake)
+      run: cmake --build _build
+
+    - name: Run unit tests (CTest)
+      run: |
+        pushd _build
+        ctest
+        popd
+
+    - name: Upload coverage report
+      if: ${{ matrix.build-type == 'coverage' }}
+      uses: codecov/codecov-action@v2
+      with:
+        token: ${{ secrets.CODECOV_TOKEN }}
