@@ -54,6 +54,10 @@ module gfnff_math_wrapper
     module procedure ssytrf_wrap
     module procedure dsytrf_wrap
   end interface sytrf_wrap
+  interface sytrf_cached_wrap
+    module procedure ssytrf_cached_wrap
+    module procedure dsytrf_cached_wrap
+  end interface sytrf_cached_wrap
   interface lapack_sytrf
     pure subroutine ssytrf(uplo,n,a,lda,ipiv,work,lwork,info)
       import :: sp
@@ -415,6 +419,87 @@ contains
       write (stderr,'("Factorisation of matrix failed ",a)') source
     end if
   end subroutine dsytrf_wrap
+
+  !> Variant of SYTRF that retains the optimal LAPACK work array between calls.
+  !> The factorization and pivoting are identical to sytrf_wrap; only the
+  !> workspace query/allocation is avoided after the first call.
+  subroutine ssytrf_cached_wrap(amat,ipiv,work,info,uplo)
+    character(len=*),parameter :: source = 'lapack_sytrf'
+    real(sp),intent(inout) :: amat(:,:)
+    integer,intent(out) :: ipiv(:)
+    real(sp),allocatable,intent(inout) :: work(:)
+    integer,intent(out) :: info
+    character(len=1),intent(in),optional :: uplo
+    character(len=1) :: ula
+    integer :: n,lda,lwork,stat_alloc
+    real(sp) :: test(1)
+
+    if (present(uplo)) then
+      ula = uplo
+    else
+      ula = 'u'
+    end if
+    lda = max(1,size(amat,1))
+    n = size(amat,2)
+    if (.not.allocated(work)) then
+      lwork = -1
+      call lapack_sytrf(ula,n,amat,lda,ipiv,test,lwork,info)
+      if (info /= 0) then
+        write (stderr,'("Factorisation workspace query failed ",a)') source
+        return
+      end if
+      lwork = max(1,nint(test(1)))
+      allocate(work(lwork),stat=stat_alloc)
+      if (stat_alloc /= 0) then
+        info = -1000
+        write (stderr,'("Factorisation workspace allocation failed ",a)') source
+        return
+      end if
+    end if
+    call lapack_sytrf(ula,n,amat,lda,ipiv,work,size(work),info)
+    if (info /= 0) then
+      write (stderr,'("Factorisation of matrix failed ",a)') source
+    end if
+  end subroutine ssytrf_cached_wrap
+
+  subroutine dsytrf_cached_wrap(amat,ipiv,work,info,uplo)
+    character(len=*),parameter :: source = 'lapack_sytrf'
+    real(wp),intent(inout) :: amat(:,:)
+    integer,intent(out) :: ipiv(:)
+    real(wp),allocatable,intent(inout) :: work(:)
+    integer,intent(out) :: info
+    character(len=1),intent(in),optional :: uplo
+    character(len=1) :: ula
+    integer :: n,lda,lwork,stat_alloc
+    real(wp) :: test(1)
+
+    if (present(uplo)) then
+      ula = uplo
+    else
+      ula = 'u'
+    end if
+    lda = max(1,size(amat,1))
+    n = size(amat,2)
+    if (.not.allocated(work)) then
+      lwork = -1
+      call lapack_sytrf(ula,n,amat,lda,ipiv,test,lwork,info)
+      if (info /= 0) then
+        write (stderr,'("Factorisation workspace query failed ",a)') source
+        return
+      end if
+      lwork = max(1,nint(test(1)))
+      allocate(work(lwork),stat=stat_alloc)
+      if (stat_alloc /= 0) then
+        info = -1000
+        write (stderr,'("Factorisation workspace allocation failed ",a)') source
+        return
+      end if
+    end if
+    call lapack_sytrf(ula,n,amat,lda,ipiv,work,size(work),info)
+    if (info /= 0) then
+      write (stderr,'("Factorisation of matrix failed ",a)') source
+    end if
+  end subroutine dsytrf_cached_wrap
 
 !=======================================================================================!
 !> SYTRI computes the inverse of a real symmetric indefinite matrix
