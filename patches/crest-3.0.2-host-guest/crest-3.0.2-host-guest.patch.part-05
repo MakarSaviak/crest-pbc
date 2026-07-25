@@ -1,0 +1,250 @@
+(fragments)
++      call get_atlist(nat,selected,trim(fragments(f)),at)
++      where(selected) frag_ids=f
++      deallocate(selected)
++    end do
++    nf=maxval(frag_ids)
++    equal=.false.
++    do f=0,nf
++      nsub=count(frag_ids==f)
++      if(nsub<=1) cycle
++      allocate(subat(nsub),sub_a(3,nsub),sub_b(3,nsub))
++      k=0
++      do i=1,nat
++        if(frag_ids(i)/=f) cycle
++        k=k+1
++        subat(k)=at(i)
++        sub_a(:,k)=xyz_a(:,i)
++        sub_b(:,k)=xyz_b(:,i)
++      end do
++      ntopo=nsub*(nsub+1)/2
++      allocate(topo_a(ntopo),topo_b(ntopo))
++      call quicktopo(nsub,subat,sub_a,ntopo,topo_a)
++      call quicktopo(nsub,subat,sub_b,ntopo,topo_b)
++      if(any(topo_a/=topo_b)) then
++        deallocate(topo_b,topo_a,sub_b,sub_a,subat,frag_ids)
++        return
++      end if
++      deallocate(topo_b,topo_a,sub_b,sub_a,subat)
++    end do
++    equal=.true.
++    deallocate(frag_ids)
++  end function fragment_topology_equal
++
++  subroutine get_consistent_gff_fragments(env,fragments,found)
++    type(systemdata),intent(in) :: env
++    character(len=:),allocatable,intent(out) :: fragments(:)
++    logical,intent(out) :: found
++    integer :: i,j,first
++    found=.false.; first=0
++    do i=1,env%calc%ncalculations
++      if(.not.allocated(env%calc%calcs(i)%gff_fragments)) cycle
++      if(first==0) then
++        fragments=env%calc%calcs(i)%gff_fragments
++        first=i; found=.true.
++      else
++        if(size(fragments)/=size(env%calc%calcs(i)%gff_fragments)) then
++          error stop '**ERROR** inconsistent GFN-FF fragments across calculation levels'
++        end if
++        do j=1,size(fragments)
++          if(trim(fragments(j))/=trim(env%calc%calcs(i)%gff_fragments(j))) then
++            error stop '**ERROR** inconsistent GFN-FF fragments across calculation levels'
++          end if
++        end do
++      end if
++    end do
++  end subroutine get_consistent_gff_fragments
++
++  subroutine remove_external_rerank_checkpoint()
++    integer :: ich,io
++    logical :: ex
++    inquire(file=checkpoint_file,exist=ex)
++    if(.not.ex) return
++    open(newunit=ich,file=checkpoint_file,status='old',iostat=io)
++    if(io==0) close(ich,status='delete')
++  end subroutine remove_external_rerank_checkpoint
++end module external_rerank_restart
+diff --git a/src/legacy_algos/confscript2_misc.f90 b/src/legacy_algos/confscript2_misc.f90
+index 11be311..c72eaf2 100644
+--- a/src/legacy_algos/confscript2_misc.f90
++++ b/src/legacy_algos/confscript2_misc.f90
+@@ -303,14 +303,17 @@ subroutine MetaMD_para_OMP(env)
+ 
+   type(systemdata) :: env
+ 
+-  integer :: i,vz,T,Tn
++  integer :: i,vz,T,Tn,Trestore,Tnrestore,thread_save
+   real(wp) :: time
+   character(len=512) :: thispath,tmppath
+   character(len=512) :: jobcall
+   character(len=80)  :: fname,pipe,atmp,btmp
+   integer :: dum,io
+-  logical :: ex
++  logical :: ex,use_tmd_threads
+ 
++  use_tmd_threads = env%threadsmdsetmanual.and.env%ThreadsMD > 0
++  thread_save = env%Threads
++  if (use_tmd_threads) env%Threads = env%ThreadsMD
+   call new_ompautoset(env,'auto',env%nmetadyn,T,Tn)
+ 
+   time = env%mdtime !for some reason this is necessary
+@@ -383,6 +386,11 @@ subroutine MetaMD_para_OMP(env)
+     call cleanMTD
+   end if
+ 
++  if (use_tmd_threads) then
++    env%Threads = thread_save
++    call new_ompautoset(env,'max',0,Trestore,Tnrestore)
++  end if
++
+ end subroutine MetaMD_para_OMP
+ 
+ !---------------------------------------------------------------------
+diff --git a/src/meson.build b/src/meson.build
+index 1fd7359..39ddeb8 100644
+--- a/src/meson.build
++++ b/src/meson.build
+@@ -60,6 +60,8 @@ srcs += files(
+   'minitools.f90',
+   'miscdata.f90',
+   'ncigeo.f90',
++  'nci_input_ensemble.f90',
++  'external_rerank_restart.f90',
+   'ompmklset.F90',
+   'printouts.f90',
+   'prmat.f90',
+diff --git a/src/nci_input_ensemble.f90 b/src/nci_input_ensemble.f90
+new file mode 100644
+index 0000000..17b9c1e
+--- /dev/null
++++ b/src/nci_input_ensemble.f90
+@@ -0,0 +1,229 @@
++!================================================================================!
++! Multi-input NCI placements for the first iMTD-GC iteration.
++!================================================================================!
++module nci_input_ensemble
++  use crest_parameters,only:wp,stdout,bohr
++  use crest_data,only:systemdata
++  use crest_calculator,only:calcdata
++  use optimize_module,only:optimize_geometry
++  use strucrd,only:coord,rdensembleparam,rdensemble,checkcoordtype,wrensemble
++  use dynamics_module,only:mddata
++  use axis_module,only:axis,cma
++  implicit none
++  private
++
++  public :: load_nci_input_ensemble
++  public :: write_nci_input_starts
++  public :: write_nci_mtd_jobs
++
++  real(wp),parameter :: transform_tolerance = 1.0e-7_wp
++  real(wp),parameter :: fixed_atom_tolerance = 1.0e-8_wp
++
++contains
++
++  subroutine load_nci_input_ensemble(env,prepared_ref,mols,ninputs)
++    type(systemdata),intent(inout) :: env
++    type(coord),intent(in) :: prepared_ref
++    type(coord),allocatable,intent(out) :: mols(:)
++    integer,intent(out) :: ninputs
++
++    integer :: filetype,nat,natmax,iframe,iatom,iaxis
++    integer :: ntopo,nfixed,nelec
++    integer,allocatable :: nats(:),ats(:,:),topo0(:),topoi(:)
++    character(len=512),allocatable :: comments(:)
++    real(wp),allocatable :: xyz_ang(:,:,:),xyz_bohr(:,:,:),aligned_first(:,:)
++    real(wp) :: rot(3),avmom,evec(3,3),center(3),det
++    real(wp) :: shifted(3),max_fixed_delta,max_transform_delta,max_prepared_delta
++    logical :: is_xyz
++
++    ninputs = 1
++    if (.not.env%NCI) return
++    if (.not.allocated(env%inputcoords)) return
++
++    call checkcoordtype(trim(env%inputcoords),filetype)
++    is_xyz = filetype == 2
++    if (.not.is_xyz) return
++
++    call rdensembleparam(trim(env%inputcoords),natmax,ninputs)
++    if (ninputs <= 1) then
++      ninputs = 1
++      return
++    end if
++
++    write(stdout,'(/,1x,a,i0,a)') 'Detected ',ninputs, &
++      ' positional XYZ frames for the first NCI MTD stage.'
++
++    allocate(nats(ninputs),ats(natmax,ninputs),comments(ninputs))
++    allocate(xyz_ang(3,natmax,ninputs),source=0.0_wp)
++    nats=0; ats=0
++    call rdensemble(trim(env%inputcoords),natmax,ninputs,nats,ats,xyz_ang,comments)
++
++    nat=nats(1)
++    if (nat /= prepared_ref%nat .or. nat /= env%ref%nat) then
++      error stop 'Multi-input NCI: frame 1 atom count differs from parsed input.'
++    end if
++    do iframe=1,ninputs
++      if (nats(iframe) /= nat) error stop 'Multi-input NCI: atom counts differ.'
++      if (any(ats(1:nat,iframe) /= ats(1:nat,1))) then
++        error stop 'Multi-input NCI: elements or atom ordering differ.'
++      end if
++    end do
++    if (any(ats(1:nat,1) /= prepared_ref%at)) then
++      error stop 'Multi-input NCI: elements/order differ from parsed reference.'
++    end if
++
++    call validate_global_selections(env,nat)
++    nelec=sum(ats(1:nat,1))-env%chrg
++    if (nelec < 0 .or. mod(nelec-env%uhf,2) /= 0) then
++      error stop 'Multi-input NCI: incompatible charge and unpaired-electron count.'
++    end if
++
++    max_fixed_delta=0.0_wp
++    nfixed=0
++    if (allocated(env%calc%freezelist)) then
++      nfixed=count(env%calc%freezelist)
++      do iframe=2,ninputs
++        do iatom=1,nat
++          if (env%calc%freezelist(iatom)) then
++            max_fixed_delta=max(max_fixed_delta, &
++              maxval(abs(xyz_ang(:,iatom,iframe)-xyz_ang(:,iatom,1))))
++          end if
++        end do
++      end do
++      if (max_fixed_delta > fixed_atom_tolerance) then
++        error stop 'Multi-input NCI: frozen-atom coordinates differ between frames.'
++      end if
++    end if
++
++    ntopo=nat*(nat+1)/2
++    allocate(topo0(ntopo),topoi(ntopo))
++    call quicktopo(nat,ats(1:nat,1),xyz_ang(:,1:nat,1)/bohr,ntopo,topo0)
++    do iframe=2,ninputs
++      call quicktopo(nat,ats(1:nat,iframe),xyz_ang(:,1:nat,iframe)/bohr,ntopo,topoi)
++      if (any(topoi /= topo0)) then
++        error stop 'Multi-input NCI: supplied frames have incompatible topology.'
++      end if
++    end do
++
++    call axis(nat,ats(1:nat,1),xyz_ang(:,1:nat,1),rot,avmom,evec)
++    call cma(nat,ats(1:nat,1),xyz_ang(:,1:nat,1),center)
++    allocate(aligned_first(3,nat))
++    call axis(nat,ats(1:nat,1),xyz_ang(:,1:nat,1),aligned_first,rot)
++    det=evec(1,1)*(evec(2,2)*evec(3,3)-evec(2,3)*evec(3,2)) &
++       -evec(1,2)*(evec(2,1)*evec(3,3)-evec(2,3)*evec(3,1)) &
++       +evec(1,3)*(evec(2,1)*evec(3,2)-evec(2,2)*evec(3,1))
++    if (det < 0.0_wp) evec(:,1)=-evec(:,1)
++
++    allocate(xyz_bohr(3,nat,ninputs))
++    do iframe=1,ninputs
++      do iatom=1,nat
++        shifted=xyz_ang(:,iatom,iframe)-center
++        xyz_bohr(:,iatom,iframe)=matmul(transpose(evec),shifted)/bohr
++      end do
++    end do
++    max_transform_delta=maxval(abs(xyz_bohr(:,:,1)-aligned_first/bohr))
++    if (max_transform_delta > transform_tolerance) then
++      error stop 'Multi-input NCI: failed to reconstruct common axis transform.'
++    end if
++    max_prepared_delta=maxval(abs(xyz_bohr(:,:,1)-prepared_ref%xyz))
++    if (max_prepared_delta > transform_toler

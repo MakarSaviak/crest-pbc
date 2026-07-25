@@ -1,0 +1,224 @@
+es=',T,', cores per trajectory=',1
++  end if
+ 
+   allocate (calculations(T),source=env%calc)
+   allocate (moltmps(T),source=mols(1))
+@@ -918,6 +990,7 @@ subroutine crest_search_multimd2(env,mols,mddats,nsim)
+     !>--- the acutal MD call with timing
+     call profiler%start(vz)
+     call dynamics(moltmps(job),mddats(vz),calculations(job),pr,io)
++    mddats(vz)%termination_status = io
+     call profiler%stop(vz)
+ 
+     !>--- finish printout (thread safe)
+@@ -934,6 +1007,10 @@ subroutine crest_search_multimd2(env,mols,mddats,nsim)
+   call profiler%clear()
+   deallocate (calculations)
+   if (allocated(moltmps)) deallocate (moltmps)
++  if (use_tmd_threads.or.gfnff_thread_cap) then
++    env%Threads = thread_save
++    call new_ompautoset(env,'max',0,Trestore,Tnrestore)
++  end if
+   return
+ contains
+   subroutine collect(n,mddats)
+diff --git a/src/algos/search_conformers.f90 b/src/algos/search_conformers.f90
+index abf606d..abeaca0 100644
+--- a/src/algos/search_conformers.f90
++++ b/src/algos/search_conformers.f90
+@@ -34,10 +34,16 @@ subroutine crest_search_imtdgc(env,tim)
+   use iomod
+   use utilities
+   use cregen_interface
++  use nci_input_ensemble,only:load_nci_input_ensemble,write_nci_input_starts,write_nci_mtd_jobs
++  use external_rerank_restart,only:external_rerank_state,external_rerank_checkpoint_exists, &
++  & read_external_rerank_checkpoint,restore_external_rerank_state, &
++  & write_external_rerank_checkpoint,validate_external_rerank_seed, &
++  & remove_external_rerank_checkpoint
+   implicit none
+   type(systemdata),intent(inout) :: env
+   type(timer),intent(inout)      :: tim
+   type(coord) :: mol,molnew
++  type(coord),allocatable :: nci_input_mols(:),mtd_mols(:)
+   integer :: i,j,k,l,io,ich,m
+   logical :: pr,wr
+ !===========================================================!
+@@ -46,7 +52,9 @@ subroutine crest_search_imtdgc(env,tim)
+   type(shakedata) :: shk
+ 
+   type(mddata),allocatable :: mddats(:)
+-  integer :: nsim,nallout
++  integer,allocatable :: bias_indices(:),input_indices(:)
++  integer :: nsim,nallout,ninputs,nbias,nbias_check
++  integer :: iinput,ibias,ijob
+ 
+   real(wp) :: energy,gnorm
+   real(wp),allocatable :: grad(:,:)
+@@ -59,6 +67,8 @@ subroutine crest_search_imtdgc(env,tim)
+   character(len=80) :: atmp,btmp,str
+   logical :: multilevel(6)
+   logical :: start,lower
++  type(external_rerank_state) :: erstate
++  logical :: special_external_restart
+ !===========================================================!
+ !>--- printout header
+   write (stdout,*)
+@@ -80,12 +90,35 @@ subroutine crest_search_imtdgc(env,tim)
+     return
+   endif
+ 
++!>--- Interpret a positional multi-frame XYZ only for the first NCI MTD stage.
++  ninputs=1
++  if (env%NCI) then
++    call load_nci_input_ensemble(env,mol,nci_input_mols,ninputs)
++    if (ninputs>1) call write_nci_input_starts(nci_input_mols)
++  end if
++
+ !>--- sets the MD length according to a flexibility measure
+   call md_length_setup(env) 
+ !>--- create the MD calculator saved to env
+   call env_to_mddat(env)
+ 
+-  if (env%performMTD) then
++!>--- staged external-rerank continuation or initial checkpoint validation
++  special_external_restart=env%external_rerank_restart
++  if(special_external_restart) then
++    call read_external_rerank_checkpoint(erstate)
++    call restore_external_rerank_state(env,erstate)
++    call validate_external_rerank_seed(env,erstate)
++  else if(env%external_rerank) then
++    if(.not.allocated(env%input_settings_file)) then
++      error stop '**ERROR** external reranking requires a TOML input file'
++    end if
++    if(env%Maxrestart<2) error stop '**ERROR** external reranking requires at least two MTD iterations'
++    if(external_rerank_checkpoint_exists()) then
++      error stop '**ERROR** crest.external_rerank already exists; use --restart or remove it'
++    end if
++  end if
++
++  if (env%performMTD.and..not.special_external_restart) then
+ !>--- (optional) calculate a short 1ps test MTD to check settings
+    call tim%start(1,'Trial metadynamics (MTD)')
+    call trialmd(env)  
+@@ -97,12 +130,16 @@ subroutine crest_search_imtdgc(env,tim)
+ !>--- Start mainloop 
+   env%nreset = 0
+   start = .true.
++  if(special_external_restart) then
++    start=.false.
++    env%nreset=0
++  end if
+   MAINLOOP : do
+     call printiter
+     if (.not. start) then
+-!>--- clean Dir for new iterations, but leave iteration backup files
+-      call clean_V2i 
+-      env%nreset = env%nreset + 1
++!>--- clean working files but preserve .cre_*.xyz iteration archives
++      call clean_V2i
++      if(.not.special_external_restart) env%nreset=env%nreset+1
+     else 
+ !>--- at the beginning, wipe directory clean
+       call V2cleanup(.false.)
+@@ -111,19 +148,56 @@ subroutine crest_search_imtdgc(env,tim)
+ !>--- Meta-dynamics loop
+   mtdloop: do i = 1,env%Maxrestart
+ 
++    if(special_external_restart.and.i<=erstate%completed_mtd) cycle mtdloop
++
+     write(stdout,*)
+     write(stdout,'(1x,a)') '------------------------------'
+     write(stdout,'(1x,a,i0)') 'Meta-Dynamics Iteration ',i
+     write(stdout,'(1x,a)') '------------------------------'
+ 
+-    nsim = -1 !>--- enambles automatic MTD setup in init routines
+-    call crest_search_multimd_init(env,mol,mddat,nsim)
+-    allocate (mddats(nsim), source=mddat)
+-    call crest_search_multimd_init2(env,mddats,nsim)
+-
+-    call tim%start(2,'Metadynamics (MTD)')
+-    call crest_search_multimd(env,mol,mddats,nsim)
+-    call tim%stop(2)
++    !> Always seed this MTD iteration from the currently selected reference.
++    call env%ref%to(mol)
++    if (start .and. i==1 .and. ninputs>1) then
++      nbias=-1
++      call crest_search_multimd_init(env,nci_input_mols(1),mddat,nbias)
++      nsim=ninputs*nbias
++      allocate(mddats(nsim),mtd_mols(nsim))
++      allocate(bias_indices(nsim),input_indices(nsim))
++      ijob=0
++      do iinput=1,ninputs
++        if (iinput>1) then
++          nbias_check=nbias
++          call crest_search_multimd_init(env,nci_input_mols(iinput),mddat,nbias_check)
++          if (nbias_check/=nbias) error stop 'NCI multi-input bias count changed.'
++          mddat%simtype=type_mtd
++        end if
++        do ibias=1,nbias
++          ijob=ijob+1
++          mtd_mols(ijob)=nci_input_mols(iinput)
++          mddats(ijob)=mddat
++          input_indices(ijob)=iinput
++          bias_indices(ijob)=ibias
++        end do
++      end do
++      if (ijob/=nsim) error stop 'NCI multi-input job construction failed.'
++      call crest_search_multimd_init2_mapped(env,mddats,nsim,bias_indices,input_indices)
++      call write_nci_mtd_jobs(mddats)
++      write(stdout,'(1x,a,i0,a,i0,a,i0,a)') 'NCI first MTD batch: ',ninputs, &
++        ' inputs x ',nbias,' biases = ',nsim,' trajectories'
++      call tim%start(2,'Metadynamics (MTD)')
++      call crest_search_multimd2(env,mtd_mols,mddats,nsim)
++      call tim%stop(2)
++      call write_nci_mtd_jobs(mddats)
++      deallocate(mtd_mols,bias_indices,input_indices)
++    else
++      nsim=-1
++      call crest_search_multimd_init(env,mol,mddat,nsim)
++      allocate(mddats(nsim),source=mddat)
++      call crest_search_multimd_init2(env,mddats,nsim)
++      call tim%start(2,'Metadynamics (MTD)')
++      call crest_search_multimd(env,mol,mddats,nsim)
++      call tim%stop(2)
++    end if
+ !>--- a file called crest_dynamics.trj should have been written
+     ensnam = 'crest_dynamics.trj'
+ !>--- deallocate for next iteration
+@@ -157,7 +231,17 @@ subroutine crest_search_imtdgc(env,tim)
+         env%nmetadyn = env%nmetadyn - 2
+       end if
+ !>-- the cleanup 
+-      call clean_V2i   
++      call clean_V2i
++      if(env%external_rerank) then
++        call write_external_rerank_checkpoint(env,trim(str),i)
++        env%keepModef = .true. ! preserve iteration archives until explicit restart
++        write(stdout,'(/,1x,a)') 'External-rerank checkpoint reached after iteration 1.'
++        write(stdout,'(1x,a)') 'Rank the source conformers externally, copy the selected original finite geometry to'
++        write(stdout,'(3x,a)') 'crest-best-external.xyz'
++        write(stdout,'(1x,a)') 'and continue with:'
++        write(stdout,'(3x,a)') 'crest crest-best-external.xyz --restart'
++        return
++      end if
+ !>-- and always do two cycles of MTDs
+       cycle mtdloop 
+     endif
+@@ -255,6 +339,7 @@ subroutine crest_search_imtdgc(env,tim)
+     write (stdout,'(/)')
+     call smallhead('Final Ensemble Information')
+     call V2terminating()
++    if(special_external_restart) call remove_external_rerank_checkpoint()
+ 
+ !==========================================================!
+   return
+diff --git a/src/algos/search_entropy.f90 b/src/algos/search_entropy.f90
+index 9c1b8c7..8dd370e 100644
+--- a/src/algos/search_entropy.f90
++++ b/src/algos/search_entropy.f90
+@@ -122,6 +122,8 @@ subroutine crest_search_entropy(env,tim)
+       write (stdout,'(1x,a,i0)') 'Meta-Dynamics Iteration ',i
+       write (stdout,'(1x,a)') '------------------------------'
+ 
++      !> Always seed this MTD iteration from the currently selected reference.
++      call env%ref%to

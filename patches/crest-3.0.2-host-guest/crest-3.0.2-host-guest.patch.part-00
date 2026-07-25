@@ -1,0 +1,246 @@
+diff --git a/src/CMakeLists.txt b/src/CMakeLists.txt
+index 49c591a..516f413 100644
+--- a/src/CMakeLists.txt
++++ b/src/CMakeLists.txt
+@@ -63,6 +63,8 @@ list(APPEND srcs
+   "${dir}/minitools.f90"
+   "${dir}/miscdata.f90"
+   "${dir}/ncigeo.f90"
++  "${dir}/nci_input_ensemble.f90"
++  "${dir}/external_rerank_restart.f90"
+   "${dir}/ompmklset.F90"
+   "${dir}/printouts.f90"
+   "${dir}/prmat.f90"
+diff --git a/src/algos/parallel.f90 b/src/algos/parallel.f90
+index 27fa9f0..03f7f17 100644
+--- a/src/algos/parallel.f90
++++ b/src/algos/parallel.f90
+@@ -528,8 +528,9 @@ subroutine crest_search_multimd(env,mol,mddats,nsim)
+   type(coord) :: mol
+   type(coord),allocatable :: moltmps(:)
+   integer :: i,j,io,ich
+-  logical :: pr,ex,nested
+-  integer :: T,Tn
++  logical :: pr,ex,nested,use_tmd_threads
++  logical :: all_gfnff,has_active_calc,gfnff_thread_cap
++  integer :: T,Tn,Trestore,Tnrestore,thread_save
+   real(wp) :: percent
+   character(len=80) :: atmp
+   character(len=*),parameter :: mdir = 'MDFILES'
+@@ -556,12 +557,33 @@ subroutine crest_search_multimd(env,mol,mddats,nsim)
+   end if
+ 
+ !>--- prepare calculation containers for parallelization (one per thread)
++  use_tmd_threads = env%threadsmdsetmanual.and.env%ThreadsMD > 0
++  thread_save = env%Threads
++  if (use_tmd_threads) env%Threads = env%ThreadsMD
++
++  all_gfnff = .true.
++  has_active_calc = .false.
++  do j = 1,env%calc%ncalculations
++    if (env%calc%calcs(j)%active) then
++      has_active_calc = .true.
++      if (env%calc%calcs(j)%id /= jobtype%gfnff) all_gfnff = .false.
++    end if
++  end do
++  all_gfnff = all_gfnff.and.has_active_calc
++  gfnff_thread_cap = all_gfnff.and.nsim > 0.and.env%Threads > nsim
++  if (gfnff_thread_cap) env%Threads = nsim
+   call new_ompautoset(env,'auto_nested',nsim,T,Tn)
+   nested = env%omp_allow_nested
++  if (all_gfnff) then
++    Tn = 1
++    write (stdout,'(1x,a,i0,a,i0)') &
++    & 'GFN-FF MTD scheduling: parallel trajectories=',T,', cores per trajectory=',1
++  end if
+ 
+   allocate (calculations(T),source=env%calc)
+   allocate (moltmps(T),source=mol)
+   allocate (grdtmp(3,mol%nat),source=0.0_wp)
++  if (all_gfnff) call ompmklset(1)
+   do i = 1,T
+     moltmps(i)%nat = mol%nat
+     moltmps(i)%at = mol%at
+@@ -583,6 +605,7 @@ subroutine crest_search_multimd(env,mol,mddats,nsim)
+     !>--- initialize the calculations
+     call engrad(moltmps(i),calculations(i),etmp,grdtmp,io)
+   end do
++  if (all_gfnff) call ompmklset(T)
+ 
+   !>--- other settings
+   pr = .false.
+@@ -618,6 +641,7 @@ subroutine crest_search_multimd(env,mol,mddats,nsim)
+     !>--- the acutal MD call with timing
+     call profiler%start(vz)
+     call dynamics(moltmps(job),mddats(vz),calculations(job),pr,io)
++    mddats(vz)%termination_status = io
+     call profiler%stop(vz)
+ 
+     !>--- finish printout (thread safe)
+@@ -633,6 +657,10 @@ subroutine crest_search_multimd(env,mol,mddats,nsim)
+   call profiler%clear()
+   deallocate (calculations)
+   if (allocated(moltmps)) deallocate (moltmps)
++  if (use_tmd_threads.or.gfnff_thread_cap) then
++    env%Threads = thread_save
++    call new_ompautoset(env,'max',0,Trestore,Tnrestore)
++  end if
+   return
+ contains
+   subroutine collect(n,mddats)
+@@ -756,6 +784,25 @@ end subroutine crest_search_multimd_init
+ 
+ !========================================================================================!
+ subroutine crest_search_multimd_init2(env,mddats,nsim)
++  use crest_data
++  use dynamics_module
++  implicit none
++  type(systemdata),intent(inout) :: env
++  type(mddata) :: mddats(nsim)
++  integer :: nsim
++  integer,allocatable :: bias_indices(:),input_indices(:)
++  integer :: i
++  allocate(bias_indices(nsim),input_indices(nsim))
++  do i=1,nsim
++    bias_indices(i)=i
++  end do
++  input_indices=1
++  call crest_search_multimd_init2_mapped(env,mddats,nsim,bias_indices,input_indices)
++  deallocate(bias_indices,input_indices)
++end subroutine crest_search_multimd_init2
++
++!========================================================================================!
++subroutine crest_search_multimd_init2_mapped(env,mddats,nsim,bias_indices,input_indices)
+   use crest_parameters,only:wp,stdout,sep
+   use crest_data
+   use crest_calculator
+@@ -767,53 +814,57 @@ subroutine crest_search_multimd_init2(env,mddats,nsim)
+   type(systemdata),intent(inout) :: env
+   type(mddata) :: mddats(nsim)
+   integer :: nsim
+-  integer :: i,io,j
++  integer,intent(in) :: bias_indices(nsim),input_indices(nsim)
++  integer :: i,io,j,bias_id
+   logical :: ex
+-!========================================================!
+   type(mtdpot),allocatable :: mtds(:)
+-
+   character(len=80) :: atmp
+-  character(len=*),parameter :: mdir = 'MDFILES'
+-
+-  !>--- parallel MD setup
+-  ex = directory_exist(mdir)
+-  if (ex) then
+-    call rmrf(mdir)
+-  end if
+-  io = makedir(mdir)
+-  do i = 1,nsim
+-    mddats(i)%md_index = i
+-    write (atmp,'(a,i0,a)') 'crest_',i,'.trj'
+-    mddats(i)%trajectoryfile = mdir//sep//trim(atmp)
+-    write (atmp,'(a,i0,a)') 'crest_',i,'.mdrestart'
+-    mddats(i)%restartfile = mdir//sep//trim(atmp)
++  character(len=*),parameter :: mdir='MDFILES'
++
++  ex=directory_exist(mdir)
++  if (ex) call rmrf(mdir)
++  io=makedir(mdir)
++  do i=1,nsim
++    if (input_indices(i)<1) error stop '**ERROR** invalid input structure index for MD job'
++    mddats(i)%md_index=i
++    mddats(i)%input_structure_id=input_indices(i)
++    mddats(i)%bias_configuration_id=bias_indices(i)
++    mddats(i)%termination_status=-1
++    write(atmp,'(a,i0,a)') 'crest_',i,'.trj'
++    mddats(i)%trajectoryfile=mdir//sep//trim(atmp)
++    write(atmp,'(a,i0,a)') 'crest_',i,'.mdrestart'
++    mddats(i)%restartfile=mdir//sep//trim(atmp)
+   end do
+ 
+-  allocate (mtds(nsim))
+-  do i = 1,nsim
++  allocate(mtds(nsim))
++  do i=1,nsim
+     if (mddats(i)%simtype == type_mtd) then
+-      mtds(i)%kpush = env%metadfac(i)
+-      mtds(i)%alpha = env%metadexp(i)
+-      mtds(i)%cvdump_fs = float(env%mddump)
+-      mtds(i)%mtdtype = cv_rmsd
+-
+-      mddats(i)%npot = 1
+-      allocate (mddats(i)%mtd(1),source=mtds(i))
+-      allocate (mddats(i)%cvtype(1),source=cv_rmsd)
+-      !> if necessary exclude atoms from RMSD bias
++      bias_id=mddats(i)%bias_configuration_id
++      if (bias_id<1 .or. bias_id>env%nmetadyn) then
++        error stop '**ERROR** invalid metadynamics bias index for MD job'
++      end if
++      mtds(i)%kpush=env%metadfac(bias_id)
++      mtds(i)%alpha=env%metadexp(bias_id)
++      mtds(i)%cvdump_fs=float(env%mddump)
++      mtds(i)%mtdtype=cv_rmsd
++      mtds(i)%com_bias=env%mtd_com_bias
++      mtds(i)%com_factor=env%mtd_com_factor
++      mtds(i)%com_width=env%mtd_com_width
++      mtds(i)%com_mass_weighted=env%mtd_com_mass_weighted
++      mddats(i)%npot=1
++      allocate(mddats(i)%mtd(1),source=mtds(i))
++      allocate(mddats(i)%cvtype(1),source=cv_rmsd)
+       if (sum(env%includeRMSD) /= env%ref%nat) then
+         if (.not.allocated(mddats(i)%mtd(1)%atinclude)) &
+-        & allocate (mddats(i)%mtd(1)%atinclude(env%ref%nat),source=.true.)
+-        do j = 1,env%ref%nat
+-          if (env%includeRMSD(j) .ne. 1) mddats(i)%mtd(1)%atinclude(j) = .false.
++          allocate(mddats(i)%mtd(1)%atinclude(env%ref%nat),source=.true.)
++        do j=1,env%ref%nat
++          if (env%includeRMSD(j)/=1) mddats(i)%mtd(1)%atinclude(j)=.false.
+         end do
+       end if
+     end if
+   end do
+-  if (allocated(mtds)) deallocate (mtds)
+-
+-  return
+-end subroutine crest_search_multimd_init2
++  deallocate(mtds)
++end subroutine crest_search_multimd_init2_mapped
+ 
+ !========================================================================================!
+ subroutine crest_search_multimd2(env,mols,mddats,nsim)
+@@ -838,8 +889,9 @@ subroutine crest_search_multimd2(env,mols,mddats,nsim)
+   type(coord) :: mols(nsim)
+   type(coord),allocatable :: moltmps(:)
+   integer :: i,j,io,ich
+-  logical :: pr,ex,nested
+-  integer :: T,Tn
++  logical :: pr,ex,nested,use_tmd_threads
++  logical :: all_gfnff,has_active_calc,gfnff_thread_cap
++  integer :: T,Tn,Trestore,Tnrestore,thread_save
+   real(wp) :: percent
+   character(len=80) :: atmp
+   character(len=*),parameter :: mdir = 'MDFILES'
+@@ -864,8 +916,28 @@ subroutine crest_search_multimd2(env,mols,mddats,nsim)
+   end if
+ 
+ !>--- prepare calculation objects for parallelization (one per thread)
++  use_tmd_threads = env%threadsmdsetmanual.and.env%ThreadsMD > 0
++  thread_save = env%Threads
++  if (use_tmd_threads) env%Threads = env%ThreadsMD
++
++  all_gfnff = .true.
++  has_active_calc = .false.
++  do j = 1,env%calc%ncalculations
++    if (env%calc%calcs(j)%active) then
++      has_active_calc = .true.
++      if (env%calc%calcs(j)%id /= jobtype%gfnff) all_gfnff = .false.
++    end if
++  end do
++  all_gfnff = all_gfnff.and.has_active_calc
++  gfnff_thread_cap = all_gfnff.and.nsim > 0.and.env%Threads > nsim
++  if (gfnff_thread_cap) env%Threads = nsim
+   call new_ompautoset(env,'auto_nested',nsim,T,Tn)
+   nested = env%omp_allow_nested
++  if (all_gfnff) then
++    Tn = 1
++    write (stdout,'(1x,a,i0,a,i0)') &
++    & 'GFN-FF MTD scheduling: parallel trajectori

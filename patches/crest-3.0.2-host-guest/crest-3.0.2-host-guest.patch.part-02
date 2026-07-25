@@ -1,0 +1,193 @@
+(mol)
+       nsim = -1 !>--- enambles automatic MTD setup in init routines
+       call crest_search_multimd_init(env,mol,mddat,nsim)
+       allocate (mddats(nsim),source=mddat)
+diff --git a/src/calculator/api_engrad.f90 b/src/calculator/api_engrad.f90
+index 2db8196..8b5e2a5 100644
+--- a/src/calculator/api_engrad.f90
++++ b/src/calculator/api_engrad.f90
+@@ -251,7 +251,7 @@ contains    !> MODULE PROCEDURES START HERE
+     pr = .false.
+ !>--- setup system call information
+     !$omp critical
+-    call gfnff_init(calc,loadnew)
++    call gfnff_init(calc,mol,loadnew)
+ !>--- printout handling
+     call api_handle_output(calc,'gfnff.out',mol,pr)
+ 
+diff --git a/src/calculator/api_helpers.F90 b/src/calculator/api_helpers.F90
+index 81ee45e..e7a529e 100644
+--- a/src/calculator/api_helpers.F90
++++ b/src/calculator/api_helpers.F90
+@@ -310,11 +310,14 @@ contains    !> MODULE PROCEDURES START HERE
+ !========================================================================================!
+ 
+ !>--- GFN-FF setup/helper routines
+-  subroutine gfnff_init(calc,loadnew)
++  subroutine gfnff_init(calc,mol,loadnew)
+     implicit none
+     type(calculation_settings),intent(inout) :: calc
++    type(coord),intent(in) :: mol
+     logical,intent(out) :: loadnew
+-    integer :: nel,nao,nlev
++    integer :: nel,nao,nlev,f
++    integer,allocatable :: frag_ids(:)
++    logical,allocatable :: selected(:)
+     loadnew = .false.
+ #ifdef WITH_GFNFF
+     if (.not.allocated(calc%ff_dat)) then
+@@ -343,6 +346,18 @@ contains    !> MODULE PROCEDURES START HERE
+         calc%ff_dat%solvent = calc%solvent
+       end if
+     end if
++    if (allocated(calc%gff_fragments)) then
++      allocate(frag_ids(mol%nat),source=0)
++      do f = 1,size(calc%gff_fragments)
++        call get_atlist(mol%nat,selected,trim(calc%gff_fragments(f)),mol%at)
++        where(selected) frag_ids = f
++        deallocate(selected)
++      end do
++      if (any(frag_ids == 0)) frag_ids = frag_ids+1
++      if (allocated(calc%ff_dat%user_fraglist)) deallocate(calc%ff_dat%user_fraglist)
++      calc%ff_dat%user_fraglist = frag_ids
++      deallocate(frag_ids)
++    end if
+     if (calc%apiclean) loadnew = .true.
+ #endif
+   end subroutine gfnff_init
+diff --git a/src/calculator/calc_type.f90 b/src/calculator/calc_type.f90
+index 3b61bc4..c72e4c3 100644
+--- a/src/calculator/calc_type.f90
++++ b/src/calculator/calc_type.f90
+@@ -159,6 +159,7 @@ module calc_type
+ 
+ !>--- GFN-FF data
+     type(gfnff_data),allocatable :: ff_dat
++    character(len=:),allocatable :: gff_fragments(:)
+ 
+ !>--- libpvol data
+     integer  :: pvmodel = 1            !> libpvol model type (0=XHCFF, 1=PV)
+@@ -917,6 +918,7 @@ contains  !>--- Module routines start here
+     if (allocated(self%tblite)) deallocate (self%tblite)
+     if (allocated(self%g0calc)) deallocate (self%g0calc)
+     if (allocated(self%ff_dat)) deallocate (self%ff_dat)
++    if (allocated(self%gff_fragments)) deallocate (self%gff_fragments)
+     if (allocated(self%libpvol)) deallocate (self%libpvol)
+ 
+     self%id = 0
+diff --git a/src/classes.f90 b/src/classes.f90
+index f24dbd9..83a117d 100644
+--- a/src/classes.f90
++++ b/src/classes.f90
+@@ -375,6 +375,7 @@ module crest_data
+     integer :: MAXRUN = 1      !> number of cores per job
+     integer :: omp = 1         !> OMP/MKL_NUM_THREADS
+     integer :: Threads = 1     !> Total number of threads (=omp*MAXRUN)
++    integer :: ThreadsMD = 0   !> Optional total thread budget for MD/MTD only
+     logical :: omp_allow_nested = .true.  !> allow nested OpenMP threadding
+ 
+     !>--- various names and flags
+@@ -393,6 +394,7 @@ module crest_data
+     character(len=512) :: scratchdir     !> path to the scratch directory
+     character(len=:),allocatable :: cmd
+     character(len=:),allocatable :: inputcoords
++    character(len=:),allocatable :: input_settings_file
+     character(len=:),allocatable :: wbofile
+     character(len=:),allocatable :: atlist
+     character(len=:),allocatable :: chargesfilename
+@@ -419,6 +421,10 @@ module crest_data
+     real(wp),allocatable :: metadexp(:)
+     integer,allocatable  :: metadlist(:)
+     real(wp) :: mtd_kscal = 1.0_wp !> globally scale kpush for all metadynamics
++    logical  :: mtd_com_bias = .false. !> add translation-sensitive COM hills
++    real(wp) :: mtd_com_factor = 0.0_wp !> COM Gaussian amplitude / Eh
++    real(wp) :: mtd_com_width = 0.05_wp !> COM Gaussian width / Bohr^-2
++    logical  :: mtd_com_mass_weighted = .true. !> false selects centroid
+ 
+     character(len=:),allocatable :: mtdstaticfile
+     integer :: nstatic
+@@ -591,6 +597,9 @@ module crest_data
+     logical :: reftopo = .true.      !> use a reference topology from the given input structure
+     logical :: relax = .false.       !> was the --relax function used for protonation site search?
+     logical :: restartopt            !> restart in the second step of the multilevel opt (V2) ?
++    logical :: restart_requested = .false. !> explicit --restart request
++    logical :: external_rerank = .false. !> stop after iteration 1 for external ranking
++    logical :: external_rerank_restart = .false. !> continue from staged checkpoint
+     logical :: reweight = .false.    !> reweight structures on the fly after optimizations (i.e. do SPs)?
+     logical :: riso = .false.        !> take only isomers in reactor mode
+     logical :: rotamermds            !> do additional MDs after second  multilevel OPT step in V2 ?
+@@ -607,6 +616,7 @@ module crest_data
+     logical :: subRMSD               !> include only the selected substructure into the CREGEN RMSD
+     logical :: superquick            !> very crude quick-run option
+     logical :: threadssetmanual      !> are #CPUs set with the '-T' flag ?
++    logical :: threadsmdsetmanual = .false. !> are MD/MTD CPUs set with -TMD?
+     logical :: trackorigin           !> track the origin of a conformation?
+     logical :: testnumgrad = .false. !> test numerical gradient in singlepoint
+     logical :: use_xtbiff = .false.  !> use xtbiff for QCG?
+diff --git a/src/confparse.f90 b/src/confparse.f90
+index 203eec7..70f978b 100644
+--- a/src/confparse.f90
++++ b/src/confparse.f90
+@@ -46,6 +46,8 @@ subroutine parseflags(env,arg,nra)
+   use optimize_module
+   use parse_inputfile
+   use crest_restartlog
++  use external_rerank_restart,only:external_rerank_state,external_rerank_checkpoint_exists, &
++  & read_external_rerank_checkpoint
+   use lwoniom_module
+   implicit none
+   type(systemdata),intent(inout) :: env
+@@ -61,6 +63,8 @@ subroutine parseflags(env,arg,nra)
+   integer :: ctype
+   logical :: ex,bondconst
+   character(len=:),allocatable :: argument
++  type(external_rerank_state) :: erstate
++  logical :: special_external_restart
+ 
+   allocate (xx(10),floats(3),strings(3))
+   ctmp = ''
+@@ -124,14 +128,20 @@ subroutine parseflags(env,arg,nra)
+ !&<
+ !>--- parallelization stuff
+   env%Threads = 1                !> total number of threads
++  env%ThreadsMD = 0              !> optional total threads for MD/MTD only
+   env%MAXRUN = 1                 !> number of parallel xtb jobs
+   env%omp = 1                    !> # of OMP_NUM_THREADS and MKL_NUMTHREADS to be used
+   env%autothreads = .true.       !> automatically determine optimal parameters omp and MAXRUN
+   env%threadssetmanual = .false. !> did the user set the #threads manually?
++  env%threadsmdsetmanual = .false. !> did the user set the MD/MTD budget?
++  env%restart_requested = .false.
++  env%external_rerank = .false.
++  env%external_rerank_restart = .false.
+ 
+   env%scratch = .false.          !> use scratch directory?
+   call getcwd(env%homedir)       !> original directory
+   env%scratchdir = ''            !> directory that shall be used for scratch
++  env%constraints = ''           !> no external xTB constraint file by default
+ 
+ !>--- xtb settings
+   env%ProgName = 'xtb'           !> the name of the xtb executable used per default
+@@ -330,11 +340,35 @@ subroutine parseflags(env,arg,nra)
+   env%properties2 = p_none  !> backup for env%properties
+   env%iterativeV2 = .true.  !> iterative crest V2 version
+   env%preopt = .true.
+-!>--- check for (TOML) input file
+-  call find_input_file(arg,nra,idum)
+-  if(idum.ne.0)then
+-    call parseinputfile(env,trim(arg(idum)))
+-  endif
++!>--- resolve an explicit staged external-rerank restart before ordinary TOML discovery
++  do i=1,nra
++    if(trim(arg(i))=='--restart'.or.trim(arg(i))=='-restart') env%restart_requested=.true.
++  end do
++  special_external_restart=env%restart_requested.and.external_rerank_checkpoint_exists()
++  if(env%restart_requested.and..not.special_external_restart) then
++    error stop '**ERROR** --restart requested but crest.external_rerank is absent'
++  end if
++  if(special_external_restart) then
++    call read_external_rerank_checkpoint(erstate)
++    inquire(file=trim(erstate%settings_file),exist=ex)
++    if(.not.ex) error stop '**ERROR** original external-rerank TOML file not found'
++    call parseinputfile(env,trim(erstate%settings_file))
++    env%external_rerank=.true.
++    env%external_rerank_rest
