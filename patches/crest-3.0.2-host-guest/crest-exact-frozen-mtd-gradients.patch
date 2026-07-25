@@ -1,0 +1,172 @@
+diff --git a/src/calculator/api_engrad.f90 b/src/calculator/api_engrad.f90
+index 8b5e2a5..cad1ef3 100644
+--- a/src/calculator/api_engrad.f90
++++ b/src/calculator/api_engrad.f90
+@@ -231,7 +231,7 @@ contains    !> MODULE PROCEDURES START HERE
+ 
+ !========================================================================================!
+ 
+-  subroutine gfnff_engrad(mol,calc,energy,grad,iostatus)
++  subroutine gfnff_engrad(mol,calc,energy,grad,iostatus,frozen_mask)
+ !******************************************************************
+ !* Interface singlepoint call between CREST and GFN-FF force field
+ !******************************************************************
+@@ -242,6 +242,7 @@ contains    !> MODULE PROCEDURES START HERE
+     real(wp),intent(inout) :: energy
+     real(wp),intent(inout) :: grad(3,mol%nat)
+     integer,intent(out) :: iostatus
++    logical,intent(in),optional :: frozen_mask(mol%nat)
+ 
+     character(len=:),allocatable :: cpath
+     logical :: loadnew,pr
+@@ -252,6 +253,17 @@ contains    !> MODULE PROCEDURES START HERE
+ !>--- setup system call information
+     !$omp critical
+     call gfnff_init(calc,mol,loadnew)
++    if (present(frozen_mask)) then
++      if (.not.allocated(calc%ff_dat%frozen_mask)) then
++        allocate(calc%ff_dat%frozen_mask(mol%nat))
++      else if (size(calc%ff_dat%frozen_mask) /= mol%nat) then
++        deallocate(calc%ff_dat%frozen_mask)
++        allocate(calc%ff_dat%frozen_mask(mol%nat))
++      end if
++      calc%ff_dat%frozen_mask = frozen_mask
++    else if (allocated(calc%ff_dat%frozen_mask)) then
++      deallocate(calc%ff_dat%frozen_mask)
++    end if
+ !>--- printout handling
+     call api_handle_output(calc,'gfnff.out',mol,pr)
+ 
+diff --git a/src/calculator/calculator.F90 b/src/calculator/calculator.F90
+index 85e0216..62e556f 100644
+--- a/src/calculator/calculator.F90
++++ b/src/calculator/calculator.F90
+@@ -351,8 +351,15 @@ contains  !> MODULE PROCEDURES START HERE
+       &                   calc%grdtmp(:,1:pnat,id),iostatus)
+ 
+     case (jobtype%gfnff)
+-      !> GFN-FF api
+-      call gfnff_engrad(molptr,calc%calcs(id),calc%etmp(id),calc%grdtmp(:,1:pnat,id),iostatus)
++      !> GFN-FF api. Pass the freeze mask so the backend may omit only
++      !> direct reaction-force work that calculation_freezegrad discards.
++      if (calc%nfreeze > 0 .and. allocated(calc%freezelist)) then
++        call gfnff_engrad(molptr,calc%calcs(id),calc%etmp(id), &
++        & calc%grdtmp(:,1:pnat,id),iostatus,calc%freezelist)
++      else
++        call gfnff_engrad(molptr,calc%calcs(id),calc%etmp(id), &
++        & calc%grdtmp(:,1:pnat,id),iostatus)
++      end if
+ 
+     case (jobtype%libpvol)
+       !> libpvol
+diff --git a/test/test_gfn0.F90 b/test/test_gfn0.F90
+index 1080199..a0fd063 100644
+--- a/test/test_gfn0.F90
++++ b/test/test_gfn0.F90
+@@ -42,7 +42,7 @@ contains  !> Unit tests for using gfn0 in crest
+   subroutine test_compiled_gfn0(error)
+     type(error_type),allocatable,intent(out) :: error
+ #ifndef WITH_GFN0
+-    write (*,'("       ...")') 'gfn0 not compiled, expecting fail.'
++    write (*,'(7x,a)') 'gfn0 not compiled, expecting fail.'
+     allocate (error)
+ #endif
+   end subroutine test_compiled_gfn0
+diff --git a/test/test_gfn0occ.F90 b/test/test_gfn0occ.F90
+index 29f11dd..75364f8 100644
+--- a/test/test_gfn0occ.F90
++++ b/test/test_gfn0occ.F90
+@@ -40,7 +40,7 @@ contains  !> Unit tests for using gfn0 in crest
+   subroutine test_compiled_gfn0(error)
+     type(error_type),allocatable,intent(out) :: error
+ #ifndef WITH_GFN0
+-    write (*,'("       ...")') 'gfn0 not compiled, expecting fail.'
++    write (*,'(7x,a)') 'gfn0 not compiled, expecting fail.'
+     allocate (error)
+ #endif
+   end subroutine test_compiled_gfn0
+diff --git a/test/test_gfnff.F90 b/test/test_gfnff.F90
+index 6e5c9d4..a4a3ff3 100644
+--- a/test/test_gfnff.F90
++++ b/test/test_gfnff.F90
+@@ -28,6 +28,7 @@ contains  !> Unit tests for using gfnff in crest
+ #ifdef WITH_GFNFF
+     new_unittest("Compiled gfnff subproject     ",test_compiled_gfnff), &
+     new_unittest("GFN-FF singlepoint            ",test_gfnff_sp), &
++    new_unittest("GFN-FF exact frozen gradient   ",test_gfnff_frozen_exact), &
+     new_unittest("GFN-FF singlepoint (cation)   ",test_gfnff_sp_cation), &
+     new_unittest("GFN-FF singlepoint (anion)    ",test_gfnff_sp_anion), &
+     new_unittest("GFN-FF singlepoint (ALPB)     ",test_gfnff_sp_alpb) &
+@@ -112,6 +113,59 @@ contains  !> Unit tests for using gfnff in crest
+     deallocate (grad)
+   end subroutine test_gfnff_sp
+ 
++!=======================================================================================!
++
++  subroutine test_gfnff_frozen_exact(error)
++    type(error_type),allocatable,intent(out) :: error
++    type(calcdata) :: reference,frozen
++    type(calculation_settings) :: sett
++    type(coord) :: mol
++    real(wp) :: eref,efrozen
++    real(wp),allocatable :: gref(:,:),gfrozen(:,:)
++    integer :: io,nfrozen
++
++    call sett%create('gfnff')
++    call reference%add(sett)
++    call frozen%add(sett)
++    call get_testmol('caffeine',mol)
++    allocate(gref(3,mol%nat),gfrozen(3,mol%nat))
++
++    nfrozen = mol%nat/2
++    frozen%nfreeze = nfrozen
++    allocate(frozen%freezelist(mol%nat),source=.false.)
++    frozen%freezelist(1:nfrozen) = .true.
++
++    call engrad(mol,reference,eref,gref,io)
++    call check(error,io,0)
++    if (allocated(error)) return
++
++    call engrad(mol,frozen,efrozen,gfrozen,io)
++    call check(error,io,0)
++    if (allocated(error)) return
++
++    if (eref /= efrozen) then
++      call test_failed(error,"Frozen-gradient optimization changed GFN-FF energy")
++      return
++    end if
++
++    if (any(gfrozen(:,nfrozen+1:mol%nat) /= gref(:,nfrozen+1:mol%nat))) then
++      call test_failed(error,"Frozen-gradient optimization changed an active gradient")
++      return
++    end if
++
++    if (any(gfrozen(:,1:nfrozen) /= 0.0_wp)) then
++      call test_failed(error,"Frozen gradients were not zeroed")
++      return
++    end if
++
++    gref(:,1:nfrozen) = 0.0_wp
++    if (any(gfrozen /= gref)) then
++      call test_failed(error,"Post-freeze gradients are not bitwise identical")
++    end if
++
++    deallocate(gref,gfrozen)
++  end subroutine test_gfnff_frozen_exact
++
+ !=======================================================================================!
+ 
+   subroutine test_gfnff_sp_cation(error)
+diff --git a/test/test_tblite.F90 b/test/test_tblite.F90
+index fecefd7..2073770 100644
+--- a/test/test_tblite.F90
++++ b/test/test_tblite.F90
+@@ -44,7 +44,7 @@ contains  !> Unit tests for using tblite in crest
+   subroutine test_compiled_tblite(error)
+     type(error_type),allocatable,intent(out) :: error
+ #ifndef WITH_TBLITE
+-    write(*,'("       ...")') 'tblite not compiled, expecting fail.'
++    write(*,'(7x,a)') 'tblite not compiled, expecting fail.'
+     allocate (error)
+ #endif
+   end subroutine test_compiled_tblite
