@@ -1,0 +1,174 @@
+# GFN-FF active-force-loop optimization (incremental)
+#
+# Apply after patches/gfnff-openmp-force-loops-20260725.patch.
+#
+# Benchmark system: 938-atom host-guest structure; atoms 1-808 frozen,
+# atoms 809-938 mobile. No structures, trajectories, chemical identities,
+# or project-specific names are included.
+#
+# Scope:
+# - dynamically schedule the triangular nonbonded-repulsion loop;
+# - dynamically schedule the frozen-host D3 pair-force loop;
+# - for large systems with a minority active region, evaluate direct EEQ pair
+#   gradients atom-centrically so each thread owns complete force vectors;
+# - retain the original half-pair implementation for small or mostly active
+#   systems to preserve bitwise behavior and avoid unnecessary duplicate work;
+# - no changes to coordination-number definitions, topology construction,
+#   energies, charges, or force-field equations.
+#
+# Validation:
+# - full 12-test CREST/GFN-FF test suite passes;
+# - five separated 938-atom structures tested with 1, 2, 4, and 5 threads;
+# - worst energy deviation: 5.7e-14 Eh;
+# - worst mobile-gradient deviation: 3.5e-17 Eh/bohr;
+# - representative 200-step frozen-host MTD means from two runs:
+#     1 thread: 25.97 s
+#     2 threads: 24.77 s
+#     4 threads: 23.94 s
+#     5 threads: 23.29 s
+#
+diff --git a/subprojects/gfnff/src/gfnff_engrad.F90 b/subprojects/gfnff/src/gfnff_engrad.F90
+index 7306aa6..e1b43da 100644
+--- a/subprojects/gfnff/src/gfnff_engrad.F90
++++ b/subprojects/gfnff/src/gfnff_engrad.F90
+@@ -123,7 +123,7 @@ contains  !> MODULE PROCEDURES START HERE
+     real(wp) :: edisp,ees,ebond,eangl,etors,erep,ehb,exb,ebatm,eext
+     real(wp) :: gsolv,gborn,ghb,gsasa,gshift
+ 
+-    integer  :: i,j,k,l,m,ij,nd3,nd3pos,nlocal,nthreads,tid
++    integer  :: i,j,k,l,m,ij,nd3,nd3pos,nlocal,nthreads,tid,nactive,iact
+     integer  :: ati,atj,iat,jat
+     integer  :: hbA,hbB
+     integer  :: lin
+@@ -134,14 +134,14 @@ contains  !> MODULE PROCEDURES START HERE
+     real(wp) ::  repab,t16,t19,t26,t27,xa,ya,za,cosa,de,t28
+     real(wp) ::  gammij,eesinf,etmp,phi
+     real(wp) ::  rn,dr,g3tmp(3,3),g4tmp(3,4)
+-    real(wp) :: rij,drij(3,n)
++    real(wp) :: rij,drij(3,n),gactive(3)
+ 
+     real(wp),allocatable :: grab0(:,:,:),rab0(:),eeqtmp(:,:)
+     real(wp),allocatable :: cn(:),dcn(:,:,:),qtmp(:)
+     real(wp),allocatable :: hb_cn(:),hb_dcn(:,:,:)
+     real(wp),allocatable :: sqrab(:),srab(:)
+     real(wp),allocatable :: g5tmp(:,:),ghb_thread(:,:,:),ehb_thread(:)
+-    integer,allocatable :: d3list(:,:),d3count(:),d3offset(:)
++    integer,allocatable :: d3list(:,:),d3count(:),d3offset(:),active_atoms(:)
+     !type(tb_timer) :: timer
+     real(wp) :: dispthr,cnthr,repthr,hbthr1,hbthr2
+ 
+@@ -265,7 +265,7 @@ contains  !> MODULE PROCEDURES START HERE
+ !!!!!!!!!!!!!
+ 
+ !      if (pr) call timer%measure(2,'non bonded repulsion')
+-    !$omp parallel do default(none) reduction(+:erep, g) &
++    !$omp parallel do default(none) schedule(dynamic,8) reduction(+:erep, g) &
+     !$omp shared(n, at, xyz, srab, sqrab, repthr, topo, param, frozen_mask) &
+     !$omp private(iat, jat, m, ij, ati, atj, rab, r2, r3, t8, t16, t19, t26, t27)
+     do iat = 1,n
+@@ -368,29 +368,70 @@ contains  !> MODULE PROCEDURES START HERE
+ !!!!!!!!
+ !      if (pr) call timer%measure(6,'EEQ gradient')
+     if (present(frozen_mask)) then
+-      !$omp parallel do default(none) reduction (+:g) &
+-      !$omp shared(nlist,n,sqrab,srab,eeqtmp,xyz,frozen_mask) &
+-      !$omp private(i,j,k,ij,r3,r2,rab,gammij,erff,dd)
+-      do i = 1,n
+-        k = i*(i-1)/2
+-        do j = 1,i-1
+-          ! The pair energy and EEQ solution were already evaluated above.
+-          ! For two frozen atoms this direct pair gradient has no active
+-          ! endpoint, so calculating it cannot affect CREST's equations of motion.
+-          if (frozen_mask(i).and.frozen_mask(j)) cycle
+-          ij = k+j
+-          r2 = sqrab(ij)
+-          rab = srab(ij)
+-          gammij = eeqtmp(1,ij)
+-          erff = eeqtmp(2,ij)
+-          dd = (2.0d0*gammij*exp(-gammij**2*r2) &
+-             & /(sqrtpi*r2)-erff/(rab*r2))*nlist%q(i)*nlist%q(j)
+-          r3 = (xyz(:,i)-xyz(:,j))*dd
+-          if (.not.frozen_mask(i)) g(:,i) = g(:,i)+r3
+-          if (.not.frozen_mask(j)) g(:,j) = g(:,j)-r3
++      nactive = count(.not.frozen_mask)
++!> The atom-centred path is intended for large systems with a minority active
++!> region.  Retain the original half-pair loop for small or mostly active cases.
++      if (n < 256.or.nactive > n/2) then
++        !$omp parallel do default(none) reduction (+:g) &
++        !$omp shared(nlist,n,sqrab,srab,eeqtmp,xyz,frozen_mask) &
++        !$omp private(i,j,k,ij,r3,r2,rab,gammij,erff,dd)
++        do i = 1,n
++          k = i*(i-1)/2
++          do j = 1,i-1
++            if (frozen_mask(i).and.frozen_mask(j)) cycle
++            ij = k+j
++            r2 = sqrab(ij)
++            rab = srab(ij)
++            gammij = eeqtmp(1,ij)
++            erff = eeqtmp(2,ij)
++            dd = (2.0d0*gammij*exp(-gammij**2*r2) &
++               & /(sqrtpi*r2)-erff/(rab*r2))*nlist%q(i)*nlist%q(j)
++            r3 = (xyz(:,i)-xyz(:,j))*dd
++            if (.not.frozen_mask(i)) g(:,i) = g(:,i)+r3
++            if (.not.frozen_mask(j)) g(:,j) = g(:,j)-r3
++          end do
+         end do
+-      end do
+-      !$omp end parallel do
++        !$omp end parallel do
++      else
++  !> Evaluate the direct EEQ pair gradient atom-centrically for active atoms.
++  !> Each iteration owns one gradient vector, eliminating the full-array OpenMP
++  !> reduction. Active-active pairs are visited once from each endpoint; their
++  !> two endpoint forces are therefore accumulated without races.
++        allocate(active_atoms(nactive))
++        iact = 0
++        do i = 1,n
++          if (.not.frozen_mask(i)) then
++            iact = iact+1
++            active_atoms(iact) = i
++          end if
++        end do
++        !$omp parallel do default(none) schedule(dynamic,4) &
++        !$omp shared(nlist,n,sqrab,srab,eeqtmp,xyz,active_atoms,nactive,g) &
++        !$omp private(iact,i,j,k,ij,r3,gactive,r2,rab,gammij,erff,dd)
++        do iact = 1,nactive
++          i = active_atoms(iact)
++          gactive = g(:,i)
++          do j = 1,n
++            if (j == i) cycle
++            if (i > j) then
++              ij = i*(i-1)/2+j
++            else
++              ij = j*(j-1)/2+i
++            end if
++            r2 = sqrab(ij)
++            rab = srab(ij)
++            gammij = eeqtmp(1,ij)
++            erff = eeqtmp(2,ij)
++            dd = (2.0d0*gammij*exp(-gammij**2*r2) &
++               & /(sqrtpi*r2)-erff/(rab*r2))*nlist%q(i)*nlist%q(j)
++            r3 = (xyz(:,i)-xyz(:,j))*dd
++            gactive = gactive+r3
++          end do
++          g(:,i) = gactive
++        end do
++        !$omp end parallel do
++        deallocate(active_atoms)
++      end if
+     else
+       !$omp parallel do default(none) reduction (+:g) &
+       !$omp shared(topo,nlist,n,sqrab,srab,eeqtmp,xyz,at) &
+diff --git a/subprojects/gfnff/src/gfnff_gdisp0.f90 b/subprojects/gfnff/src/gfnff_gdisp0.f90
+index f9202bb..161dfa7 100644
+--- a/subprojects/gfnff/src/gfnff_gdisp0.f90
++++ b/subprojects/gfnff/src/gfnff_gdisp0.f90
+@@ -357,7 +357,7 @@ subroutine d3_gradient(dispm, nat, at, xyz, npair, pairlist, zeta_scale, radii,
+    call get_atomic_c6_d4(dispm, nat, at, gw, dgwdcn, c6, dc6dcn)
+ 
+    if (present(frozen_mask)) then
+-      !$omp parallel do default(none) schedule(runtime) &
++      !$omp parallel do default(none) schedule(dynamic,64) &
+       !$omp reduction(+:energies, gradient, sigma, dEdcn) &
+       !$omp shared(at, xyz, npair, pairlist, zeta_scale, dispscale, radii, r4r2, c6, &
+       !$omp&       dc6dcn, frozen_mask) &
