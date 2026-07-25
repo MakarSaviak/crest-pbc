@@ -1,0 +1,308 @@
+diff --git a/src/gfnff_engrad.F90 b/src/gfnff_engrad.F90
+index 0184711..f56a1c4 100644
+--- a/src/gfnff_engrad.F90
++++ b/src/gfnff_engrad.F90
+@@ -90,7 +90,7 @@ contains  !> MODULE PROCEDURES START HERE
+ !> 
+ !---------------------------------------------------
+   subroutine gfnff_eg(pr,n,ichrg,at,xyz,makeq,g,etot,res_gff, &
+-  &          param,topo,nlist,solvation,update,version,accuracy,io)
++  &          param,topo,nlist,solvation,update,version,accuracy,io,frozen_mask)
+ 
+     use gfnff_param,only:efield,gffVersion,gfnff_thresholds
+     use gfnff_gdisp0
+@@ -103,6 +103,7 @@ contains  !> MODULE PROCEDURES START HERE
+     type(TGFFData),intent(in) :: param
+     type(TGFFTopology),intent(in) :: topo
+     type(TGFFNeighbourList),intent(inout) :: nlist
++    logical,intent(in),optional :: frozen_mask(n)
+ 
+     type(TBorn),allocatable,intent(inout) :: solvation
+     logical,intent(in) :: update
+@@ -238,7 +239,7 @@ contains  !> MODULE PROCEDURES START HERE
+ 
+ !      if (pr) call timer%measure(2,'non bonded repulsion')
+     !$omp parallel do default(none) reduction(+:erep, g) &
+-    !$omp shared(n, at, xyz, srab, sqrab, repthr, topo, param) &
++    !$omp shared(n, at, xyz, srab, sqrab, repthr, topo, param, frozen_mask) &
+     !$omp private(iat, jat, m, ij, ati, atj, rab, r2, r3, t8, t16, t19, t26, t27)
+     do iat = 1,n
+       m = iat*(iat-1)/2
+@@ -255,10 +256,20 @@ contains  !> MODULE PROCEDURES START HERE
+         t8 = t16*topo%alphanb(ij)
+         t26 = exp(-t8)*param%repz(ati)*param%repz(atj)*param%repscaln
+         erep = erep+t26/rab !energy
++        if (present(frozen_mask)) then
++          ! A frozen--frozen pair has no direct derivative with respect to any
++          ! active coordinate. CREST discards both endpoint gradients anyway.
++          if (frozen_mask(iat).and.frozen_mask(jat)) cycle
++        end if
+         t27 = t26*(1.5d0*t8+1.0d0)/t19
+         r3 = (xyz(:,iat)-xyz(:,jat))*t27
+-        g(:,iat) = g(:,iat)-r3
+-        g(:,jat) = g(:,jat)+r3
++        if (present(frozen_mask)) then
++          if (.not.frozen_mask(iat)) g(:,iat) = g(:,iat)-r3
++          if (.not.frozen_mask(jat)) g(:,jat) = g(:,jat)+r3
++        else
++          g(:,iat) = g(:,iat)-r3
++          g(:,jat) = g(:,jat)+r3
++        end if
+       end do
+     end do
+     !$omp end parallel do
+@@ -314,8 +325,13 @@ contains  !> MODULE PROCEDURES START HERE
+ 
+ !      if (pr) call timer%measure(5,'D3')
+     if (nd3 .gt. 0) then
+-      call d3_gradient(topo%dispm,n,at,xyz,nd3,d3list,topo%zetac6, &
+-         & param%d3r0,sqrtZr4r2,4.0d0,param%dispscale,cn,dcn,edisp,g)
++      if (present(frozen_mask)) then
++        call d3_gradient(topo%dispm,n,at,xyz,nd3,d3list,topo%zetac6, &
++           & param%d3r0,sqrtZr4r2,4.0d0,param%dispscale,cn,dcn,edisp,g,frozen_mask)
++      else
++        call d3_gradient(topo%dispm,n,at,xyz,nd3,d3list,topo%zetac6, &
++           & param%d3r0,sqrtZr4r2,4.0d0,param%dispscale,cn,dcn,edisp,g)
++      end if
+     end if
+     deallocate (d3list)
+ !      if (pr) call timer%measure(5)
+@@ -324,25 +340,51 @@ contains  !> MODULE PROCEDURES START HERE
+ ! ES part
+ !!!!!!!!
+ !      if (pr) call timer%measure(6,'EEQ gradient')
+-    !$omp parallel do default(none) reduction (+:g) &
+-    !$omp shared(topo,nlist,n,sqrab,srab,eeqtmp,xyz,at) &
+-    !$omp private(i,j,k,ij,r3,r2,rab,gammij,erff,dd)
+-    do i = 1,n
+-      k = i*(i-1)/2
+-      do j = 1,i-1
+-        ij = k+j
+-        r2 = sqrab(ij)
+-        rab = srab(ij)
+-        gammij = eeqtmp(1,ij)
+-        erff = eeqtmp(2,ij)
+-        dd = (2.0d0*gammij*exp(-gammij**2*r2) &
+-           & /(sqrtpi*r2)-erff/(rab*r2))*nlist%q(i)*nlist%q(j)
+-        r3 = (xyz(:,i)-xyz(:,j))*dd
+-        g(:,i) = g(:,i)+r3
+-        g(:,j) = g(:,j)-r3
++    if (present(frozen_mask)) then
++      !$omp parallel do default(none) reduction (+:g) &
++      !$omp shared(nlist,n,sqrab,srab,eeqtmp,xyz,frozen_mask) &
++      !$omp private(i,j,k,ij,r3,r2,rab,gammij,erff,dd)
++      do i = 1,n
++        k = i*(i-1)/2
++        do j = 1,i-1
++          ! The pair energy and EEQ solution were already evaluated above.
++          ! For two frozen atoms this direct pair gradient has no active
++          ! endpoint, so calculating it cannot affect CREST's equations of motion.
++          if (frozen_mask(i).and.frozen_mask(j)) cycle
++          ij = k+j
++          r2 = sqrab(ij)
++          rab = srab(ij)
++          gammij = eeqtmp(1,ij)
++          erff = eeqtmp(2,ij)
++          dd = (2.0d0*gammij*exp(-gammij**2*r2) &
++             & /(sqrtpi*r2)-erff/(rab*r2))*nlist%q(i)*nlist%q(j)
++          r3 = (xyz(:,i)-xyz(:,j))*dd
++          if (.not.frozen_mask(i)) g(:,i) = g(:,i)+r3
++          if (.not.frozen_mask(j)) g(:,j) = g(:,j)-r3
++        end do
+       end do
+-    end do
+-    !$omp end parallel do
++      !$omp end parallel do
++    else
++      !$omp parallel do default(none) reduction (+:g) &
++      !$omp shared(topo,nlist,n,sqrab,srab,eeqtmp,xyz,at) &
++      !$omp private(i,j,k,ij,r3,r2,rab,gammij,erff,dd)
++      do i = 1,n
++        k = i*(i-1)/2
++        do j = 1,i-1
++          ij = k+j
++          r2 = sqrab(ij)
++          rab = srab(ij)
++          gammij = eeqtmp(1,ij)
++          erff = eeqtmp(2,ij)
++          dd = (2.0d0*gammij*exp(-gammij**2*r2) &
++             & /(sqrtpi*r2)-erff/(rab*r2))*nlist%q(i)*nlist%q(j)
++          r3 = (xyz(:,i)-xyz(:,j))*dd
++          g(:,i) = g(:,i)+r3
++          g(:,j) = g(:,j)-r3
++        end do
++      end do
++      !$omp end parallel do
++    end if
+     if (.not.pr) deallocate (eeqtmp)
+ 
+ #ifdef WITH_GBSA
+@@ -405,7 +447,7 @@ contains  !> MODULE PROCEDURES START HERE
+ !!!!!!!!!!!!!!!!!!
+ 
+       !$omp parallel do default(none) reduction(+:erep, g) &
+-      !$omp shared(topo, param, at, sqrab, srab, xyz) &
++      !$omp shared(topo, param, at, sqrab, srab, xyz, frozen_mask) &
+       !$omp private(i, iat, jat, ij, xa, ya, za, dx, dy, dz, r2, rab, ati, atj, &
+       !$omp& alpha, repab, t16, t19, t26, t27)
+       do i = 1,topo%nbond
+@@ -428,13 +470,29 @@ contains  !> MODULE PROCEDURES START HERE
+         t19 = t16*t16
+         t26 = exp(-alpha*t16)*repab
+         erep = erep+t26/rab !energy
++        if (present(frozen_mask)) then
++          if (frozen_mask(iat).and.frozen_mask(jat)) cycle
++        end if
+         t27 = t26*(1.5d0*alpha*t16+1.0d0)/t19
+-        g(1,iat) = g(1,iat)-dx*t27
+-        g(2,iat) = g(2,iat)-dy*t27
+-        g(3,iat) = g(3,iat)-dz*t27
+-        g(1,jat) = g(1,jat)+dx*t27
+-        g(2,jat) = g(2,jat)+dy*t27
+-        g(3,jat) = g(3,jat)+dz*t27
++        if (present(frozen_mask)) then
++          if (.not.frozen_mask(iat)) then
++            g(1,iat) = g(1,iat)-dx*t27
++            g(2,iat) = g(2,iat)-dy*t27
++            g(3,iat) = g(3,iat)-dz*t27
++          end if
++          if (.not.frozen_mask(jat)) then
++            g(1,jat) = g(1,jat)+dx*t27
++            g(2,jat) = g(2,jat)+dy*t27
++            g(3,jat) = g(3,jat)+dz*t27
++          end if
++        else
++          g(1,iat) = g(1,iat)-dx*t27
++          g(2,iat) = g(2,iat)-dy*t27
++          g(3,iat) = g(3,iat)-dz*t27
++          g(1,jat) = g(1,jat)+dx*t27
++          g(2,jat) = g(2,jat)+dy*t27
++          g(3,jat) = g(3,jat)+dz*t27
++        end if
+       end do
+       !$omp end parallel do
+     end if
+diff --git a/src/gfnff_gdisp0.f90 b/src/gfnff_gdisp0.f90
+index 3ef0a7a..874bb81 100644
+--- a/src/gfnff_gdisp0.f90
++++ b/src/gfnff_gdisp0.f90
+@@ -306,7 +306,7 @@ end subroutine get_atomic_c6_d4
+ !========================================================================================!
+ 
+ subroutine d3_gradient(dispm, nat, at, xyz, npair, pairlist, zeta_scale, radii, &
+-      & r4r2, weighting_factor, dispscale, cn, dcndr, energy, gradient)
++      & r4r2, weighting_factor, dispscale, cn, dcndr, energy, gradient, frozen_mask)
+    use disp_dftd3param
+    type(TDispersionData), intent(in) :: dispm
+    integer, intent(in) :: nat
+@@ -325,6 +325,7 @@ subroutine d3_gradient(dispm, nat, at, xyz, npair, pairlist, zeta_scale, radii,
+ 
+    real(wp), intent(inout) :: energy
+    real(wp), intent(inout) :: gradient(:, :)
++   logical, intent(in), optional :: frozen_mask(nat)
+    real(wp) :: sigma(3, 3)
+ 
+    integer :: max_ref
+@@ -347,6 +348,52 @@ subroutine d3_gradient(dispm, nat, at, xyz, npair, pairlist, zeta_scale, radii,
+    !dgwdcn = dgwdcn*zeta_scale
+    call get_atomic_c6_d4(dispm, nat, at, gw, dgwdcn, c6, dc6dcn)
+ 
++   if (present(frozen_mask)) then
++      !$omp parallel do default(none) schedule(runtime) &
++      !$omp reduction(+:energies, gradient, sigma, dEdcn) &
++      !$omp shared(at, xyz, npair, pairlist, zeta_scale, dispscale, radii, r4r2, c6, &
++      !$omp&       dc6dcn, frozen_mask) &
++      !$omp private(ij, img, iat, jat, ati, atj, r2, rij, r4r2ij, r0, t6, t8, t10, &
++      !$omp&        d6, d8, d10, disp, ddisp, dE, dG, dS)
++      do img = 1, npair
++         iat = pairlist(1, img)
++         jat = pairlist(2, img)
++         ij = jat + iat*(iat-1)/2
++         ati = at(iat)
++         atj = at(jat)
++         rij = xyz(:, iat) - xyz(:, jat)
++         r2 = sum(rij**2)
++
++         r4r2ij = 3*r4r2(ati)*r4r2(atj)
++         r0 = radii(lin(ati, atj))
++
++         t6 = 1._wp/(r2**3+r0**3)
++         t8 = 1._wp/(r2**4+r0**4)
++
++         disp = (t6 + 2*r4r2ij*t8) * zeta_scale(ij)*dispscale
++         dE = -c6(iat, jat)*disp * 0.5_wp
++
++         energies(iat) = energies(iat) + dE
++         dEdcn(iat) = dEdcn(iat) - dc6dcn(iat, jat) * disp
++         if (iat /= jat) then
++            energies(jat) = energies(jat) + dE
++            dEdcn(jat) = dEdcn(jat) - dc6dcn(jat, iat) * disp
++
++            ! CN-dependent D3 forces are retained below through dEdcn and dcndr.
++            ! Only the direct pair force has no active endpoint for a
++            ! frozen--frozen pair.
++            if (.not.(frozen_mask(iat).and.frozen_mask(jat))) then
++               d6 = -6*r2**2*t6**2
++               d8 = -8*r2**3*t8**2
++               ddisp = (d6 + 2*r4r2ij*d8) * zeta_scale(ij)*dispscale
++               dG = -c6(iat, jat)*ddisp*rij
++               if (.not.frozen_mask(iat)) gradient(:, iat) = gradient(:, iat) + dG
++               if (.not.frozen_mask(jat)) gradient(:, jat) = gradient(:, jat) - dG
++            end if
++         endif
++      enddo
++      !$omp end parallel do
++   else
+    !$omp parallel do default(none) schedule(runtime) &
+    !$omp reduction(+:energies, gradient, sigma, dEdcn) &
+    !$omp shared(at, xyz, npair, pairlist, zeta_scale, dispscale, radii, r4r2, c6, &
+@@ -391,6 +438,7 @@ subroutine d3_gradient(dispm, nat, at, xyz, npair, pairlist, zeta_scale, radii,
+ 
+    enddo
+    !$omp end parallel do
++   end if
+ 
+    call dgemv('n', 3*nat, nat, 1.0_wp, dcndr, 3*nat, dEdcn, 1, 1.0_wp, gradient, 1)
+    !call dgemv('n', 9, nat, 1.0_wp, dcndL, 9, dEdcn, 1, 1.0_wp, sigma, 1)
+diff --git a/src/gfnff_interface.f90 b/src/gfnff_interface.f90
+index 7595562..475bec2 100644
+--- a/src/gfnff_interface.f90
++++ b/src/gfnff_interface.f90
+@@ -48,6 +48,10 @@ module gfnff_interface
+     character(len=:),allocatable :: refgeo
+     character(len=:),allocatable :: refcharges
+     integer,allocatable :: user_fraglist(:) !> host-defined per-atom fragment IDs
++    !> Optional host-supplied mask. When present, GFN-FF may omit only direct
++    !> gradient work on atoms whose coordinates CREST will hold fixed. Energies,
++    !> charges, CNs, D3, and all active-atom gradients remain fully evaluated.
++    logical,allocatable :: frozen_mask(:)
+ 
+     type(TGFFGenerator),allocatable     :: gen
+     type(TGFFData),allocatable          :: param
+@@ -103,9 +107,15 @@ contains  !> MODULE PROCEDURES START HERE
+     gradient(:,:) = 0.0_wp
+     io = 0
+ 
+-    call gfnff_eg(pr,nat,dat%ichrg,at,xyz,dat%make_chrg,gradient,energy,   &
+-    &             dat%res,dat%param,dat%topo,dat%nlist,dat%solvation, &
+-    &             dat%update,dat%version,dat%accuracy,io)
++    if (allocated(dat%frozen_mask)) then
++      call gfnff_eg(pr,nat,dat%ichrg,at,xyz,dat%make_chrg,gradient,energy, &
++      &             dat%res,dat%param,dat%topo,dat%nlist,dat%solvation, &
++      &             dat%update,dat%version,dat%accuracy,io,dat%frozen_mask)
++    else
++      call gfnff_eg(pr,nat,dat%ichrg,at,xyz,dat%make_chrg,gradient,energy, &
++      &             dat%res,dat%param,dat%topo,dat%nlist,dat%solvation, &
++      &             dat%update,dat%version,dat%accuracy,io)
++    end if
+ 
+     if (present(iostat)) then
+       iostat = io
+@@ -350,6 +360,7 @@ contains  !> MODULE PROCEDURES START HERE
+     self%write_topo = .true.
+     if (allocated(self%solvent)) deallocate (self%solvent)
+     if (allocated(self%user_fraglist)) deallocate (self%user_fraglist)
++    if (allocated(self%frozen_mask)) deallocate (self%frozen_mask)
+     if (allocated(self%gen)) deallocate (self%gen)
+     if (allocated(self%param)) deallocate (self%param)
+     if (allocated(self%topo)) deallocate (self%topo)
