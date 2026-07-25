@@ -1,0 +1,235 @@
+n
++          work%static_cache_valid = .false.
++        end if
++      end if
++      if (work%cn_cache_valid.and.work%cn_cache_thr /= cnthr) then
++        work%cn_cache_valid = .false.
++      end if
++    else
++      work%frozen_cache_valid = .false.
++      work%static_cache_valid = .false.
++      work%cn_cache_valid = .false.
++      work%frozen_pair = .false.
++    end if
++    sqrab => work%sqrab
++    srab => work%srab
++    qtmp => work%qtmp
++    g5tmp => work%g5tmp
++    eeqtmp => work%eeqtmp
++    d3list => work%d3list
++    dcn => work%dcn
++    cn => work%cn
++    hb_dcn => work%hb_dcn
++    hb_cn => work%hb_cn
++    d3count => work%d3count
++    d3offset => work%d3offset
++    active_atoms => work%active_atoms
++    grab0 => work%grab0
++    rab0 => work%rab0
+ 
+ !      if (pr) call timer%new(10 + count([allocated(solvation)]),.false.)
+ 
+ !      if (pr) call timer%measure(1,'distance/D3 list')
+-    d3count = 0
+-    !$omp parallel do default(none) schedule(static) &
+-    !$omp shared(n, xyz, sqrab, srab, dispthr, d3count) &
+-    !$omp private(i, j, k, ij, nlocal)
+-    do i = 1,n
+-      ij = i*(i-1)/2
+-      nlocal = 0
+-      do j = 1,i-1
+-        k = ij+j
+-        sqrab(k) = (xyz(1,i)-xyz(1,j))**2+&
+- &               (xyz(2,i)-xyz(2,j))**2+&
+- &               (xyz(3,i)-xyz(3,j))**2
+-        if (sqrab(k) .lt. dispthr) nlocal = nlocal+1
+-        srab(k) = sqrt(sqrab(k))
++    if (work%frozen_cache_valid) then
++      if (work%prefix_frozen) then
++!> Fast path for the CREST host--guest layout: all frozen atoms form a
++!> contiguous prefix. Frozen rows are already present in the persistent packed
++!> distance arrays; only rows belonging to active atoms are recomputed.
++        if (.not.work%static_cache_valid) then
++          d3count(1:work%frozen_prefix) = 0
++          !$omp parallel do default(none) schedule(static) &
++          !$omp shared(sqrab, dispthr, d3count, work) &
++          !$omp private(i, j, k, ij, nlocal)
++          do i = 1,work%frozen_prefix
++            ij = i*(i-1)/2
++            nlocal = 0
++            do j = 1,i-1
++              k = ij+j
++              if (sqrab(k) .lt. dispthr) nlocal = nlocal+1
++            end do
++            d3count(i) = nlocal
++          end do
++          !$omp end parallel do
++        end if
++
++        !$omp parallel do default(none) schedule(static) &
++        !$omp shared(n, xyz, sqrab, srab, dispthr, d3count, work) &
++        !$omp private(i, j, k, ij, nlocal)
++        do i = work%frozen_prefix+1,n
++          ij = i*(i-1)/2
++          nlocal = 0
++          do j = 1,i-1
++            k = ij+j
++            sqrab(k) = (xyz(1,i)-xyz(1,j))**2 + &
++           &           (xyz(2,i)-xyz(2,j))**2 + &
++           &           (xyz(3,i)-xyz(3,j))**2
++            srab(k) = sqrt(sqrab(k))
++            if (sqrab(k) .lt. dispthr) nlocal = nlocal+1
++          end do
++          d3count(i) = nlocal
++        end do
++        !$omp end parallel do
++      else
++!> General-mask fallback: update the packed list of every pair containing at
++!> least one active atom, then rebuild threshold counts in original row order.
++        d3count = 0
++        !$omp parallel do default(none) schedule(static) &
++        !$omp shared(xyz, sqrab, srab, work) &
++        !$omp private(m, i, j, k)
++        do m = 1,work%n_active_pairs
++          i = work%active_pair_i(m)
++          j = work%active_pair_j(m)
++          k = work%active_pair_idx(m)
++          sqrab(k) = (xyz(1,i)-xyz(1,j))**2 + &
++         &           (xyz(2,i)-xyz(2,j))**2 + &
++         &           (xyz(3,i)-xyz(3,j))**2
++          srab(k) = sqrt(sqrab(k))
++        end do
++        !$omp end parallel do
++
++        !$omp parallel do default(none) schedule(static) &
++        !$omp shared(n, sqrab, dispthr, d3count) &
++        !$omp private(i, j, k, ij, nlocal)
++        do i = 1,n
++          ij = i*(i-1)/2
++          nlocal = 0
++          do j = 1,i-1
++            k = ij+j
++            if (sqrab(k) .lt. dispthr) nlocal = nlocal+1
++          end do
++          d3count(i) = nlocal
++        end do
++        !$omp end parallel do
++      end if
++    else
++      d3count = 0
++      !$omp parallel do default(none) schedule(static) &
++      !$omp shared(n, xyz, sqrab, srab, dispthr, d3count) &
++      !$omp private(i, j, k, ij, nlocal)
++      do i = 1,n
++        ij = i*(i-1)/2
++        nlocal = 0
++        do j = 1,i-1
++          k = ij+j
++          sqrab(k) = (xyz(1,i)-xyz(1,j))**2 + &
++         &           (xyz(2,i)-xyz(2,j))**2 + &
++         &           (xyz(3,i)-xyz(3,j))**2
++          srab(k) = sqrt(sqrab(k))
++          if (sqrab(k) .lt. dispthr) nlocal = nlocal+1
++        end do
++        d3count(i) = nlocal
++        sqrab(ij+i) = 0.0_wp
++        srab(ij+i) = 0.0_wp
+       end do
+-      d3count(i) = nlocal
+-!> The loop above only runs over the off diagonal elements
+-!> This initializes the unitialized diagonal to zero but does not
+-!> add it to the dispersion list.
+-      sqrab(ij+i) = 0.0d0
+-      srab(ij+i) = 0.0d0
+-    end do
+-    !$omp end parallel do
++      !$omp end parallel do
++    end if
+ 
+ !> Prefix offsets preserve the original deterministic (i,j) pair order.
+     d3offset(1) = 0
+@@ -205,22 +620,46 @@ contains  !> MODULE PROCEDURES START HERE
+     end do
+     nd3 = d3offset(n)+d3count(n)
+ 
+-    !$omp parallel do default(none) schedule(static) &
+-    !$omp shared(n, sqrab, dispthr, d3offset, d3list) &
+-    !$omp private(i, j, k, ij, nd3pos)
+-    do i = 1,n
+-      ij = i*(i-1)/2
+-      nd3pos = d3offset(i)
+-      do j = 1,i-1
+-        k = ij+j
+-        if (sqrab(k) .lt. dispthr) then
+-          nd3pos = nd3pos+1
+-          d3list(1,nd3pos) = i
+-          d3list(2,nd3pos) = j
+-        end if
++    if (work%prefix_frozen.and.work%static_cache_valid) then
++!> Frozen-prefix D3-list entries remain valid and already occupy the beginning
++!> of d3list. Rebuild only rows containing an active atom.
++      !$omp parallel do default(none) schedule(static) &
++      !$omp shared(n, sqrab, dispthr, d3offset, d3list, work) &
++      !$omp private(i, j, k, ij, nd3pos)
++      do i = work%frozen_prefix+1,n
++        ij = i*(i-1)/2
++        nd3pos = d3offset(i)
++        do j = 1,i-1
++          k = ij+j
++          if (sqrab(k) .lt. dispthr) then
++            nd3pos = nd3pos+1
++            d3list(1,nd3pos) = i
++            d3list(2,nd3pos) = j
++          end if
++        end do
+       end do
+-    end do
+-    !$omp end parallel do
++      !$omp end parallel do
++    else
++      !$omp parallel do default(none) schedule(static) &
++      !$omp shared(n, sqrab, dispthr, d3offset, d3list) &
++      !$omp private(i, j, k, ij, nd3pos)
++      do i = 1,n
++        ij = i*(i-1)/2
++        nd3pos = d3offset(i)
++        do j = 1,i-1
++          k = ij+j
++          if (sqrab(k) .lt. dispthr) then
++            nd3pos = nd3pos+1
++            d3list(1,nd3pos) = i
++            d3list(2,nd3pos) = j
++          end if
++        end do
++      end do
++      !$omp end parallel do
++    end if
++    if (present(frozen_mask)) then
++      call work%prepare_static(n,at,xyz,frozen_mask,repthr,dispthr,param,topo,sqrab,srab)
++    end if
+ !      if (pr) call timer%measure(1)
+ 
+ !!!!!!!!!!!!
+@@ -265,41 +704,97 @@ contains  !> MODULE PROCEDURES START HERE
+ !!!!!!!!!!!!!
+ 
+ !      if (pr) call timer%measure(2,'non bonded repulsion')
+-    !$omp parallel do default(none) schedule(dynamic,8) reduction(+:erep, g) &
+-    !$omp shared(n, at, xyz, srab, sqrab, repthr, topo, param, frozen_mask) &
+-    !$omp private(iat, jat, m, ij, ati, atj, rab, r2, r3, t8, t16, t19, t26, t27)
+-    do iat = 1,n
+-      m = iat*(iat-1)/2
+-      do jat = 1,iat-1
+-        ij = m+jat
+-        r2 = sqrab(ij)
+-        if (r2 .gt. repthr) cycle ! cut-off
+-        if (topo%bpair(ij) .eq. 1) cycle ! list avoided because of memory
+-        ati = at(iat)
+-        atj = at(jat)
+-        rab = srab(ij)
+-        t16 = r2**0.75
+-        t19 = t16*t16
+-        t8 = t16*topo%alphanb(ij)
+-        t26 = exp(-t8)*param%repz(ati)*param%repz(atj)*param%repscaln
+-        erep = erep+t26/rab !energy
+-        if (pre
