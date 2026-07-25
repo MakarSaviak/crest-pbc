@@ -1,0 +1,157 @@
+diff --git a/subprojects/gfnff/src/gfnff_ini2.f90 b/subprojects/gfnff/src/gfnff_ini2.f90
+index dbd4fa3..9eabf58 100644
+--- a/subprojects/gfnff/src/gfnff_ini2.f90
++++ b/subprojects/gfnff/src/gfnff_ini2.f90
+@@ -129,6 +129,13 @@ contains  !> MODULE PROCEDURES START HERE
+       call getnb(natoms,at,rtmp,rab,mchar,2,f_in,f2_in,nbf,topo%nb,param) ! no highly coordinates atoms
+       call getnb(natoms,at,rtmp,rab,mchar,3,f_in,f2_in,nbf,nbm,param) ! no metals and unusually coordinated stuff
+ 
++      if (topo%nfrag > 1.and.allocated(topo%fraglist)) then
++        call prune_cross_fragment_neighbors(natoms,topo%fraglist,nbdum)
++        call prune_cross_fragment_neighbors(natoms,topo%fraglist,nbf)
++        call prune_cross_fragment_neighbors(natoms,topo%fraglist,topo%nb)
++        call prune_cross_fragment_neighbors(natoms,topo%fraglist,nbm)
++      end if
++
+ ! take the input
+     else
+ 
+@@ -1510,5 +1517,31 @@ contains  !> MODULE PROCEDURES START HERE
+ 
+   end function amideH
+ 
++!========================================================================================!
++!========================================================================================!
++  subroutine prune_cross_fragment_neighbors(natoms,fraglist,nb)
++    integer,intent(in) :: natoms
++    integer,intent(in) :: fraglist(natoms)
++    integer,intent(inout) :: nb(20,natoms)
++    integer :: i,k,j,nold,nnew
++    integer :: kept(18)
++
++    do i = 1,natoms
++      kept = 0
++      nnew = 0
++      nold = min(max(nb(20,i),0),18)
++      do k = 1,nold
++        j = nb(k,i)
++        if (j < 1.or.j > natoms) cycle
++        if (fraglist(j) /= fraglist(i)) cycle
++        nnew = nnew+1
++        kept(nnew) = j
++      end do
++      nb(1:18,i) = 0
++      if (nnew > 0) nb(1:nnew,i) = kept(1:nnew)
++      nb(20,i) = nnew
++    end do
++  end subroutine prune_cross_fragment_neighbors
++
+ !========================================================================================!
+ end module gfnff_ini2
+diff --git a/subprojects/gfnff/src/gfnff_interface.f90 b/subprojects/gfnff/src/gfnff_interface.f90
+index 412db6f..7595562 100644
+--- a/subprojects/gfnff/src/gfnff_interface.f90
++++ b/subprojects/gfnff/src/gfnff_interface.f90
+@@ -47,6 +47,7 @@ module gfnff_interface
+     character(len=:),allocatable :: restartfile
+     character(len=:),allocatable :: refgeo
+     character(len=:),allocatable :: refcharges
++    integer,allocatable :: user_fraglist(:) !> host-defined per-atom fragment IDs
+ 
+     type(TGFFGenerator),allocatable     :: gen
+     type(TGFFData),allocatable          :: param
+@@ -279,9 +280,16 @@ contains  !> MODULE PROCEDURES START HERE
+ 
+     call newD3Model(dat%topo%dispm,nat,at)
+ 
+-    call gfnff_setup(nat,at,xyz,dat%ichrg,pr,restart,dat%write_topo, &
+-    &        dat%gen,dat%param,dat%topo,dat%accuracy,dat%version,io, &
+-    &        verbose=verbose, iunit=myunit)
++    if (allocated(dat%user_fraglist)) then
++      if (size(dat%user_fraglist) /= nat) error stop 'GFN-FF user fragment list has wrong atom count'
++      call gfnff_setup(nat,at,xyz,dat%ichrg,pr,restart,dat%write_topo, &
++      &        dat%gen,dat%param,dat%topo,dat%accuracy,dat%version,io, &
++      &        verbose=verbose,iunit=myunit,fraglist=dat%user_fraglist)
++    else
++      call gfnff_setup(nat,at,xyz,dat%ichrg,pr,restart,dat%write_topo, &
++      &        dat%gen,dat%param,dat%topo,dat%accuracy,dat%version,io, &
++      &        verbose=verbose,iunit=myunit)
++    end if
+ 
+     !> Optional, ALPB solvation
+     if (allocated(dat%solvent)) then
+@@ -341,6 +349,7 @@ contains  !> MODULE PROCEDURES START HERE
+     self%update = .true.
+     self%write_topo = .true.
+     if (allocated(self%solvent)) deallocate (self%solvent)
++    if (allocated(self%user_fraglist)) deallocate (self%user_fraglist)
+     if (allocated(self%gen)) deallocate (self%gen)
+     if (allocated(self%param)) deallocate (self%param)
+     if (allocated(self%topo)) deallocate (self%topo)
+diff --git a/subprojects/gfnff/src/gfnff_setup.f90 b/subprojects/gfnff/src/gfnff_setup.f90
+index 5098b31..590a097 100644
+--- a/subprojects/gfnff/src/gfnff_setup.f90
++++ b/subprojects/gfnff/src/gfnff_setup.f90
+@@ -35,7 +35,7 @@ contains   !> MODULE PROCEDURES START HERE
+ !========================================================================================!
+ 
+   subroutine gfnff_setup(nat,at,xyz,ichrg,pr,restart,write_topo, &
+-  &                      gen,param,topo,accuracy,version,io,verbose,iunit)
++  &                      gen,param,topo,accuracy,version,io,verbose,iunit,fraglist)
+     use gfnff_restart
+     use gfnff_param,only:ini,gfnff_set_param
+     implicit none
+@@ -57,6 +57,7 @@ contains   !> MODULE PROCEDURES START HERE
+     integer,intent(out) :: io
+     logical,intent(in),optional :: verbose !> extended prinout
+     integer,intent(in),optional :: iunit
++    integer,intent(in),optional :: fraglist(nat)
+ 
+ !> Stack
+     integer :: newichrg,myunit
+@@ -71,7 +72,11 @@ contains   !> MODULE PROCEDURES START HERE
+     endif
+ 
+     newichrg = ichrg
+-    call gfnff_input(nat,at,xyz,newichrg,topo)
++    if (present(fraglist)) then
++      call gfnff_input(nat,at,xyz,newichrg,topo,fraglist)
++    else
++      call gfnff_input(nat,at,xyz,newichrg,topo)
++    end if
+ 
+     call gfnff_set_param(nat,gen,param)
+     param%dispscale = 1.0_wp
+@@ -107,7 +112,7 @@ contains   !> MODULE PROCEDURES START HERE
+   end subroutine gfnff_setup
+ !========================================================================================!
+ 
+-  subroutine gfnff_input(nat,at,xyz,ichrg,topo)
++  subroutine gfnff_input(nat,at,xyz,ichrg,topo,fraglist)
+     use gfnff_param
+     implicit none
+     ! Dummy
+@@ -116,6 +121,7 @@ contains   !> MODULE PROCEDURES START HERE
+     real(wp),intent(in) :: xyz(3,nat)
+     integer,intent(inout)  :: ichrg
+     type(TGFFTopology),intent(inout) :: topo
++    integer,intent(in),optional :: fraglist(nat)
+     ! Stack
+     integer           :: i,j,k
+     integer           :: ni
+@@ -161,8 +167,14 @@ contains   !> MODULE PROCEDURES START HERE
+ !      ichrg = int(sum(topo%qfrag(1:nf)))
+ !      topo%qfrag(nf+1:nat) = 9999
+ !    else
++      topo%qfrag = 0.0_wp
+       topo%qfrag(1) = ichrg
+-      topo%qfrag(2:nat) = 0
++      if (present(fraglist)) then
++        if (any(fraglist < 1)) error stop 'GFN-FF fragment IDs must be positive'
++        topo%fraglist = fraglist
++        topo%nfrag = maxval(fraglist)
++        if (topo%nfrag > nat) error stop 'GFN-FF fragment ID exceeds atom count'
++      end if
+ !    end if
+ 
+   end subroutine gfnff_input
