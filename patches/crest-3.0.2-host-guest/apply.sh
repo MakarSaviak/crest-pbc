@@ -14,6 +14,12 @@ printf '%s  %s\n' \
 git apply --check "$combined"
 git apply "$combined"
 
+printf '%s  %s\n' \
+  '02aefedb780a969523dd6c08a8c34999cfef2c4cab33e1d35ec93c52544ec3ce' \
+  "$patch_dir/crest-exact-frozen-mtd-gradients.patch" | sha256sum -c -
+git apply --check "$patch_dir/crest-exact-frozen-mtd-gradients.patch"
+git apply "$patch_dir/crest-exact-frozen-mtd-gradients.patch"
+
 git submodule update --init --recursive subprojects/gfnff
 cd "$root/subprojects/gfnff"
 printf '%s  %s\n' \
@@ -22,4 +28,10 @@ printf '%s  %s\n' \
 git apply --check "$patch_dir/gfnff-host-guest-fragments.patch"
 git apply "$patch_dir/gfnff-host-guest-fragments.patch"
 
-echo "Applied CREST 3.0.2 host–guest workflow and GFN-FF fragment backport."
+printf '%s  %s\n' \
+  '4bb0cef08cc7de2a382c74d17699992089c252d79c5abe7237824c15905e9756' \
+  "$patch_dir/gfnff-exact-frozen-mtd-gradients.patch" | sha256sum -c -
+git apply --check "$patch_dir/gfnff-exact-frozen-mtd-gradients.patch"
+git apply "$patch_dir/gfnff-exact-frozen-mtd-gradients.patch"
+
+echo "Applied CREST 3.0.2 host-guest workflow, fragment backport, and exact frozen-host MTD acceleration."
