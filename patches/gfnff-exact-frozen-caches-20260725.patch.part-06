@@ -1,0 +1,34 @@
+(gref,gfrozen)
++
++  contains
++
++    subroutine check_frozen_result(context)
++      character(len=*),intent(in) :: context
++      integer :: i
++
++      if (abs(eref-efrozen) > energy_thr) then
++        call test_failed(error,trim(context)//': GFN-FF energy changed')
++        return
++      end if
++
++      do i = 1,mol%nat
++        if (frozen%freezelist(i)) then
++          if (any(gfrozen(:,i) /= 0.0_wp)) then
++            call test_failed(error,trim(context)//': frozen gradient was not zeroed')
++            return
++          end if
++        else
++          if (maxval(abs(gfrozen(:,i)-gref(:,i))) > gradient_thr) then
++            call test_failed(error,trim(context)//': active gradient changed')
++            return
++          end if
++        end if
++      end do
++    end subroutine check_frozen_result
++
+   end subroutine test_gfnff_frozen_exact
+ 
+ !=======================================================================================!
+-- 
+2.47.3
+
