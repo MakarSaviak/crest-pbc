@@ -132,7 +132,9 @@ contains  !> Unit tests for using gfnff in crest
     call get_testmol('caffeine',mol)
     allocate(gref(3,mol%nat),gfrozen(3,mol%nat))
 
-    nfrozen = mol%nat/2
+    ! A three-quarter frozen prefix ensures the exact EEQ host-block solver
+    ! is exercised (active atoms + fragment constraints are the small block).
+    nfrozen = 3*mol%nat/4
     frozen%nfreeze = nfrozen
     allocate(frozen%freezelist(mol%nat),source=.false.)
     frozen%freezelist(1:nfrozen) = .true.
