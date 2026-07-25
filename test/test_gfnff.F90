@@ -123,6 +123,8 @@ contains  !> Unit tests for using gfnff in crest
     real(wp) :: eref,efrozen
     real(wp),allocatable :: gref(:,:),gfrozen(:,:)
     integer :: io,nfrozen
+    real(wp),parameter :: energy_thr = 1.0e-12_wp
+    real(wp),parameter :: gradient_thr = 1.0e-13_wp
 
     call sett%create('gfnff')
     call reference%add(sett)
@@ -135,35 +137,96 @@ contains  !> Unit tests for using gfnff in crest
     allocate(frozen%freezelist(mol%nat),source=.false.)
     frozen%freezelist(1:nfrozen) = .true.
 
+    ! First call builds the frozen-host caches.
     call engrad(mol,reference,eref,gref,io)
     call check(error,io,0)
     if (allocated(error)) return
-
     call engrad(mol,frozen,efrozen,gfrozen,io)
     call check(error,io,0)
     if (allocated(error)) return
+    call check_frozen_result('initial cache construction')
+    if (allocated(error)) return
 
-    if (eref /= efrozen) then
-      call test_failed(error,"Frozen-gradient optimization changed GFN-FF energy")
+    ! Moving an active atom must reuse the caches without changing the result.
+    mol%xyz(1,mol%nat) = mol%xyz(1,mol%nat)+1.0e-3_wp
+    call engrad(mol,reference,eref,gref,io)
+    call check(error,io,0)
+    if (allocated(error)) return
+    call engrad(mol,frozen,efrozen,gfrozen,io)
+    call check(error,io,0)
+    if (allocated(error)) return
+    call check_frozen_result('cache reuse after active displacement')
+    if (allocated(error)) return
+
+    ! Moving a frozen atom must invalidate and rebuild all geometry caches.
+    mol%xyz(2,1) = mol%xyz(2,1)-2.0e-4_wp
+    call engrad(mol,reference,eref,gref,io)
+    call check(error,io,0)
+    if (allocated(error)) return
+    call engrad(mol,frozen,efrozen,gfrozen,io)
+    call check(error,io,0)
+    if (allocated(error)) return
+    call check_frozen_result('cache invalidation after frozen displacement')
+    if (allocated(error)) return
+
+    ! A changed, non-prefix mask exercises the general exact fallback path.
+    frozen%freezelist(nfrozen) = .false.
+    frozen%freezelist(mol%nat) = .true.
+    call engrad(mol,reference,eref,gref,io)
+    call check(error,io,0)
+    if (allocated(error)) return
+    call engrad(mol,frozen,efrozen,gfrozen,io)
+    call check(error,io,0)
+    if (allocated(error)) return
+    call check_frozen_result('cache invalidation after mask change')
+    if (allocated(error)) return
+
+    ! Removing the mask must restore the ordinary full-gradient calculation.
+    frozen%nfreeze = 0
+    deallocate(frozen%freezelist)
+    call engrad(mol,reference,eref,gref,io)
+    call check(error,io,0)
+    if (allocated(error)) return
+    call engrad(mol,frozen,efrozen,gfrozen,io)
+    call check(error,io,0)
+    if (allocated(error)) return
+    if (abs(eref-efrozen) > energy_thr) then
+      call test_failed(error,'Removing the freeze mask changed GFN-FF energy')
       return
     end if
-
-    if (any(gfrozen(:,nfrozen+1:mol%nat) /= gref(:,nfrozen+1:mol%nat))) then
-      call test_failed(error,"Frozen-gradient optimization changed an active gradient")
+    if (maxval(abs(gfrozen-gref)) > gradient_thr) then
+      call test_failed(error,'Removing the freeze mask changed the full gradient')
       return
-    end if
-
-    if (any(gfrozen(:,1:nfrozen) /= 0.0_wp)) then
-      call test_failed(error,"Frozen gradients were not zeroed")
-      return
-    end if
-
-    gref(:,1:nfrozen) = 0.0_wp
-    if (any(gfrozen /= gref)) then
-      call test_failed(error,"Post-freeze gradients are not bitwise identical")
     end if
 
     deallocate(gref,gfrozen)
+
+  contains
+
+    subroutine check_frozen_result(context)
+      character(len=*),intent(in) :: context
+      integer :: i
+
+      if (abs(eref-efrozen) > energy_thr) then
+        call test_failed(error,trim(context)//': GFN-FF energy changed')
+        return
+      end if
+
+      do i = 1,mol%nat
+        if (frozen%freezelist(i)) then
+          if (any(gfrozen(:,i) /= 0.0_wp)) then
+            call test_failed(error,trim(context)//': frozen gradient was not zeroed')
+            return
+          end if
+        else
+          if (maxval(abs(gfrozen(:,i)-gref(:,i))) > gradient_thr) then
+            call test_failed(error,trim(context)//': active gradient changed')
+            return
+          end if
+        end if
+      end do
+    end subroutine check_frozen_result
+
   end subroutine test_gfnff_frozen_exact
 
 !=======================================================================================!

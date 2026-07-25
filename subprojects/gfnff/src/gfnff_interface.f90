@@ -59,6 +59,7 @@ module gfnff_interface
     type(TGFFNeighbourList),allocatable :: nlist
     type(TBorn),allocatable             :: solvation
     type(gfnff_results),allocatable     :: res
+    type(gfnff_workspace)                 :: work
   contains
     procedure :: deallocate => gfnff_data_deallocate
     procedure :: type_reset => gfnff_data_reset_types
@@ -110,11 +111,11 @@ contains  !> MODULE PROCEDURES START HERE
     if (allocated(dat%frozen_mask)) then
       call gfnff_eg(pr,nat,dat%ichrg,at,xyz,dat%make_chrg,gradient,energy, &
       &             dat%res,dat%param,dat%topo,dat%nlist,dat%solvation, &
-      &             dat%update,dat%version,dat%accuracy,io,dat%frozen_mask)
+      &             dat%update,dat%version,dat%accuracy,io,dat%work,dat%frozen_mask)
     else
       call gfnff_eg(pr,nat,dat%ichrg,at,xyz,dat%make_chrg,gradient,energy, &
       &             dat%res,dat%param,dat%topo,dat%nlist,dat%solvation, &
-      &             dat%update,dat%version,dat%accuracy,io)
+      &             dat%update,dat%version,dat%accuracy,io,dat%work)
     end if
 
     if (present(iostat)) then
@@ -367,6 +368,7 @@ contains  !> MODULE PROCEDURES START HERE
     if (allocated(self%nlist)) deallocate (self%nlist)
     if (allocated(self%solvation)) deallocate (self%solvation)
     if (allocated(self%res)) deallocate (self%res)
+    call self%work%release()
   end subroutine gfnff_data_deallocate
   subroutine gfnff_data_reset_types(self)
     implicit none
@@ -377,6 +379,7 @@ contains  !> MODULE PROCEDURES START HERE
     if (allocated(self%nlist)) deallocate (self%nlist)
     if (allocated(self%solvation)) deallocate (self%solvation)
     if (allocated(self%res)) deallocate (self%res)
+    call self%work%release()
   end subroutine gfnff_data_reset_types
   subroutine gfnff_data_make_types(self)
     implicit none

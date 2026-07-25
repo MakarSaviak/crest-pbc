@@ -31,7 +31,7 @@ module gfnff_engrad_module
   use gfnff_math_wrapper
   implicit none
   private
-  public :: gfnff_eg,gfnff_results
+  public :: gfnff_eg,gfnff_results,gfnff_workspace
 
   type :: gfnff_results
     real(wp) :: e_total = 0.0_wp
@@ -54,6 +54,46 @@ module gfnff_engrad_module
     real(wp) :: e_ext = 0.0_wp
   end type gfnff_results
 
+  !> Persistent storage and exact caches for repeated frozen-host calls.
+  !> No charge, CN, D3 coefficient, cutoff, or force-field approximation is used.
+  type :: gfnff_workspace
+    integer :: nat = 0
+    integer :: nbond = 0
+    integer :: nangl = 0
+    integer :: ntors = 0
+    real(wp),allocatable :: grab0(:,:,:),rab0(:),eeqtmp(:,:)
+    real(wp),allocatable :: cn(:),dcn(:,:,:),qtmp(:)
+    real(wp),allocatable :: hb_cn(:),hb_dcn(:,:,:)
+    real(wp),allocatable :: sqrab(:),srab(:),g5tmp(:,:)
+    integer,allocatable :: d3list(:,:),d3count(:),d3offset(:),active_atoms(:)
+    logical,allocatable :: frozen_pair(:),frozen_mask_ref(:)
+    real(wp),allocatable :: frozen_sqrab(:),frozen_srab(:),frozen_reference(:,:)
+    real(wp),allocatable :: raw_cn_static(:)
+    integer,allocatable :: active_pair_i(:),active_pair_j(:),active_pair_idx(:)
+    integer,allocatable :: dynamic_bond_idx(:),dynamic_angle_idx(:),dynamic_torsion_idx(:)
+    integer :: n_active_pairs = 0
+    integer :: frozen_prefix = 0
+    logical :: prefix_frozen = .false.
+    integer :: n_dynamic_bonds = 0
+    integer :: n_dynamic_angles = 0
+    integer :: n_dynamic_torsions = 0
+    logical :: frozen_cache_valid = .false.
+    logical :: static_cache_valid = .false.
+    logical :: cn_cache_valid = .false.
+    real(wp) :: static_repthr = -1.0_wp
+    real(wp) :: static_dispthr = -1.0_wp
+    real(wp) :: cn_cache_thr = -1.0_wp
+    real(wp) :: cached_nb_rep_total = 0.0_wp
+    real(wp) :: cached_bond_rep_total = 0.0_wp
+    real(wp) :: cached_angle_total = 0.0_wp
+    real(wp) :: cached_torsion_total = 0.0_wp
+  contains
+    procedure :: ensure => gfnff_workspace_ensure
+    procedure :: prepare_frozen => gfnff_workspace_prepare_frozen
+    procedure :: prepare_static => gfnff_workspace_prepare_static
+    procedure :: release => gfnff_workspace_release
+  end type gfnff_workspace
+
   real(wp),private,parameter :: pi = 3.1415926535897932385_wp
   real(wp),private,parameter :: sqrtpi = 1.77245385091_wp
 
@@ -62,6 +102,281 @@ module gfnff_engrad_module
 contains  !> MODULE PROCEDURES START HERE
 !========================================================================================!
 !========================================================================================!
+
+  subroutine gfnff_workspace_ensure(self,n,nbond,nangl,ntors)
+    class(gfnff_workspace),intent(inout) :: self
+    integer,intent(in) :: n,nbond,nangl,ntors
+    integer :: npair
+
+    if (self%nat == n .and. self%nbond == nbond .and. self%nangl == nangl .and. &
+   &    self%ntors == ntors .and. allocated(self%sqrab)) return
+
+    call self%release()
+    npair = n*(n+1)/2
+    allocate(self%sqrab(npair),self%srab(npair),self%qtmp(n),self%g5tmp(3,n), &
+   &         self%eeqtmp(2,npair),self%d3list(2,npair),self%dcn(3,n,n), &
+   &         self%cn(n),self%hb_dcn(3,n,n),self%hb_cn(n), &
+   &         self%d3count(n),self%d3offset(n),self%active_atoms(n), &
+   &         self%grab0(3,n,nbond),self%rab0(nbond), &
+   &         self%frozen_pair(npair),self%frozen_mask_ref(n), &
+   &         self%frozen_sqrab(npair),self%frozen_srab(npair), &
+   &         self%frozen_reference(3,n),self%raw_cn_static(n), &
+   &         self%active_pair_i(npair), &
+   &         self%active_pair_j(npair),self%active_pair_idx(npair), &
+   &         self%dynamic_bond_idx(max(1,nbond)), &
+   &         self%dynamic_angle_idx(max(1,nangl)), &
+   &         self%dynamic_torsion_idx(max(1,ntors)))
+    self%frozen_pair = .false.
+    self%frozen_mask_ref = .false.
+    self%frozen_cache_valid = .false.
+    self%static_cache_valid = .false.
+    self%cn_cache_valid = .false.
+    self%n_active_pairs = 0
+    self%frozen_prefix = 0
+    self%prefix_frozen = .false.
+    self%n_dynamic_bonds = 0
+    self%n_dynamic_angles = 0
+    self%n_dynamic_torsions = 0
+    self%cached_nb_rep_total = 0.0_wp
+    self%cached_bond_rep_total = 0.0_wp
+    self%cached_angle_total = 0.0_wp
+    self%cached_torsion_total = 0.0_wp
+    self%nat = n
+    self%nbond = nbond
+    self%nangl = nangl
+    self%ntors = ntors
+  end subroutine gfnff_workspace_ensure
+
+  subroutine gfnff_workspace_prepare_frozen(self,n,xyz,frozen_mask)
+    class(gfnff_workspace),intent(inout) :: self
+    integer,intent(in) :: n
+    real(wp),intent(in) :: xyz(3,n)
+    logical,intent(in) :: frozen_mask(n)
+    integer :: i,j,ij,k,m
+
+    if (count(frozen_mask) < 2) then
+      self%frozen_pair = .false.
+      self%frozen_cache_valid = .false.
+      self%static_cache_valid = .false.
+      self%cn_cache_valid = .false.
+      self%n_active_pairs = 0
+      self%frozen_prefix = 0
+      self%prefix_frozen = .false.
+      self%n_dynamic_bonds = 0
+      self%n_dynamic_angles = 0
+      self%n_dynamic_torsions = 0
+      return
+    end if
+
+    if (self%frozen_cache_valid) then
+      if (any(self%frozen_mask_ref .neqv. frozen_mask)) then
+        self%frozen_cache_valid = .false.
+        self%static_cache_valid = .false.
+        self%cn_cache_valid = .false.
+      else
+        do i = 1,n
+          if (frozen_mask(i)) then
+            if (any(xyz(:,i) /= self%frozen_reference(:,i))) then
+              self%frozen_cache_valid = .false.
+              self%static_cache_valid = .false.
+              self%cn_cache_valid = .false.
+              exit
+            end if
+          end if
+        end do
+      end if
+    end if
+    if (self%frozen_cache_valid) return
+
+    self%frozen_pair = .false.
+    self%frozen_mask_ref = frozen_mask
+    self%n_active_pairs = 0
+    self%frozen_prefix = 0
+    do i = 1,n
+      if (.not.frozen_mask(i)) exit
+      self%frozen_prefix = i
+    end do
+    if (self%frozen_prefix == n) then
+      self%prefix_frozen = .true.
+    else
+      self%prefix_frozen = self%frozen_prefix >= 2 .and. &
+     &                     all(.not.frozen_mask(self%frozen_prefix+1:n))
+    end if
+    do i = 1,n
+      if (frozen_mask(i)) self%frozen_reference(:,i) = xyz(:,i)
+      ij = i*(i-1)/2
+      self%frozen_sqrab(ij+i) = 0.0_wp
+      self%frozen_srab(ij+i) = 0.0_wp
+      self%sqrab(ij+i) = 0.0_wp
+      self%srab(ij+i) = 0.0_wp
+      do j = 1,i-1
+        k = ij+j
+        if (frozen_mask(i).and.frozen_mask(j)) then
+          self%frozen_pair(k) = .true.
+          self%frozen_sqrab(k) = (xyz(1,i)-xyz(1,j))**2 + &
+         &                       (xyz(2,i)-xyz(2,j))**2 + &
+         &                       (xyz(3,i)-xyz(3,j))**2
+          self%frozen_srab(k) = sqrt(self%frozen_sqrab(k))
+          self%sqrab(k) = self%frozen_sqrab(k)
+          self%srab(k) = self%frozen_srab(k)
+        else
+          self%n_active_pairs = self%n_active_pairs+1
+          m = self%n_active_pairs
+          self%active_pair_i(m) = i
+          self%active_pair_j(m) = j
+          self%active_pair_idx(m) = k
+        end if
+      end do
+    end do
+    self%frozen_cache_valid = .true.
+    self%static_cache_valid = .false.
+    self%cn_cache_valid = .false.
+  end subroutine gfnff_workspace_prepare_frozen
+
+  subroutine gfnff_workspace_prepare_static(self,n,at,xyz,frozen_mask,repthr,dispthr,param,topo,sqrab,srab)
+    class(gfnff_workspace),intent(inout) :: self
+    integer,intent(in) :: n,at(n)
+    real(wp),intent(in) :: xyz(3,n),repthr,dispthr,sqrab(:),srab(:)
+    logical,intent(in) :: frozen_mask(n)
+    type(TGFFData),intent(in) :: param
+    type(TGFFTopology),intent(in) :: topo
+    integer :: i,j,k,l,m,ij,iat,jat,ati,atj
+    real(wp) :: r2,rab,t16,t19,t8,t26,alpha,repab,etmp
+    real(wp) :: g3tmp(3,3),g4tmp(3,4)
+
+    if (.not.self%frozen_cache_valid) then
+      self%static_cache_valid = .false.
+      return
+    end if
+    if (self%static_cache_valid.and.self%static_repthr == repthr .and. &
+   &    self%static_dispthr == dispthr) return
+
+    self%cached_nb_rep_total = 0.0_wp
+    self%cached_bond_rep_total = 0.0_wp
+    self%cached_angle_total = 0.0_wp
+    self%cached_torsion_total = 0.0_wp
+    self%n_dynamic_bonds = 0
+    self%n_dynamic_angles = 0
+    self%n_dynamic_torsions = 0
+
+    do iat = 1,n
+      m = iat*(iat-1)/2
+      do jat = 1,iat-1
+        if (.not.(frozen_mask(iat).and.frozen_mask(jat))) cycle
+        ij = m+jat
+        r2 = sqrab(ij)
+        if (r2 .gt. repthr) cycle
+        if (topo%bpair(ij) .eq. 1) cycle
+        ati = at(iat)
+        atj = at(jat)
+        rab = srab(ij)
+        t16 = r2**0.75_wp
+        t19 = t16*t16
+        t8 = t16*topo%alphanb(ij)
+        t26 = exp(-t8)*param%repz(ati)*param%repz(atj)*param%repscaln
+        self%cached_nb_rep_total = self%cached_nb_rep_total+t26/rab
+      end do
+    end do
+
+    do i = 1,topo%nbond
+      iat = topo%blist(1,i)
+      jat = topo%blist(2,i)
+      if (.not.(frozen_mask(iat).and.frozen_mask(jat))) then
+        self%n_dynamic_bonds = self%n_dynamic_bonds+1
+        self%dynamic_bond_idx(self%n_dynamic_bonds) = i
+        cycle
+      end if
+      ij = iat*(iat-1)/2+jat
+      r2 = sqrab(ij)
+      rab = srab(ij)
+      ati = at(iat)
+      atj = at(jat)
+      alpha = sqrt(param%repa(ati)*param%repa(atj))
+      repab = param%repz(ati)*param%repz(atj)*param%repscalb
+      t16 = r2**0.75_wp
+      t19 = t16*t16
+      t26 = exp(-alpha*t16)*repab
+      self%cached_bond_rep_total = self%cached_bond_rep_total+t26/rab
+    end do
+
+    do m = 1,topo%nangl
+      j = topo%alist(1,m)
+      i = topo%alist(2,m)
+      k = topo%alist(3,m)
+      if (.not.(frozen_mask(i).and.frozen_mask(j).and.frozen_mask(k))) then
+        self%n_dynamic_angles = self%n_dynamic_angles+1
+        self%dynamic_angle_idx(self%n_dynamic_angles) = m
+        cycle
+      end if
+      call egbend(m,j,i,k,n,at,xyz,etmp,g3tmp,param,topo)
+      self%cached_angle_total = self%cached_angle_total+etmp
+    end do
+
+    do m = 1,topo%ntors
+      i = topo%tlist(1,m)
+      j = topo%tlist(2,m)
+      k = topo%tlist(3,m)
+      l = topo%tlist(4,m)
+      if (.not.(frozen_mask(i).and.frozen_mask(j).and.frozen_mask(k).and.frozen_mask(l))) then
+        self%n_dynamic_torsions = self%n_dynamic_torsions+1
+        self%dynamic_torsion_idx(self%n_dynamic_torsions) = m
+        cycle
+      end if
+      call egtors(m,i,j,k,l,n,at,xyz,etmp,g4tmp,param,topo)
+      self%cached_torsion_total = self%cached_torsion_total+etmp
+    end do
+
+    self%static_repthr = repthr
+    self%static_dispthr = dispthr
+    self%static_cache_valid = .true.
+  end subroutine gfnff_workspace_prepare_static
+
+  subroutine gfnff_workspace_release(self)
+    class(gfnff_workspace),intent(inout) :: self
+    if (allocated(self%grab0)) deallocate(self%grab0)
+    if (allocated(self%rab0)) deallocate(self%rab0)
+    if (allocated(self%eeqtmp)) deallocate(self%eeqtmp)
+    if (allocated(self%cn)) deallocate(self%cn)
+    if (allocated(self%dcn)) deallocate(self%dcn)
+    if (allocated(self%qtmp)) deallocate(self%qtmp)
+    if (allocated(self%hb_cn)) deallocate(self%hb_cn)
+    if (allocated(self%hb_dcn)) deallocate(self%hb_dcn)
+    if (allocated(self%sqrab)) deallocate(self%sqrab)
+    if (allocated(self%srab)) deallocate(self%srab)
+    if (allocated(self%g5tmp)) deallocate(self%g5tmp)
+    if (allocated(self%d3list)) deallocate(self%d3list)
+    if (allocated(self%d3count)) deallocate(self%d3count)
+    if (allocated(self%d3offset)) deallocate(self%d3offset)
+    if (allocated(self%active_atoms)) deallocate(self%active_atoms)
+    if (allocated(self%frozen_pair)) deallocate(self%frozen_pair)
+    if (allocated(self%frozen_mask_ref)) deallocate(self%frozen_mask_ref)
+    if (allocated(self%frozen_sqrab)) deallocate(self%frozen_sqrab)
+    if (allocated(self%frozen_srab)) deallocate(self%frozen_srab)
+    if (allocated(self%frozen_reference)) deallocate(self%frozen_reference)
+    if (allocated(self%raw_cn_static)) deallocate(self%raw_cn_static)
+    if (allocated(self%active_pair_i)) deallocate(self%active_pair_i)
+    if (allocated(self%active_pair_j)) deallocate(self%active_pair_j)
+    if (allocated(self%active_pair_idx)) deallocate(self%active_pair_idx)
+    if (allocated(self%dynamic_bond_idx)) deallocate(self%dynamic_bond_idx)
+    if (allocated(self%dynamic_angle_idx)) deallocate(self%dynamic_angle_idx)
+    if (allocated(self%dynamic_torsion_idx)) deallocate(self%dynamic_torsion_idx)
+    self%nat = 0
+    self%nbond = 0
+    self%nangl = 0
+    self%ntors = 0
+    self%frozen_cache_valid = .false.
+    self%static_cache_valid = .false.
+    self%cn_cache_valid = .false.
+    self%static_repthr = -1.0_wp
+    self%static_dispthr = -1.0_wp
+    self%cn_cache_thr = -1.0_wp
+    self%n_active_pairs = 0
+    self%frozen_prefix = 0
+    self%prefix_frozen = .false.
+    self%n_dynamic_bonds = 0
+    self%n_dynamic_angles = 0
+    self%n_dynamic_torsions = 0
+  end subroutine gfnff_workspace_release
 
 !---------------------------------------------------
 !> GFN-FF
@@ -91,7 +406,7 @@ contains  !> MODULE PROCEDURES START HERE
 !> 
 !---------------------------------------------------
   subroutine gfnff_eg(pr,n,ichrg,at,xyz,makeq,g,etot,res_gff, &
-  &          param,topo,nlist,solvation,update,version,accuracy,io,frozen_mask)
+  &          param,topo,nlist,solvation,update,version,accuracy,io,work,frozen_mask)
 
     use gfnff_param,only:efield,gffVersion,gfnff_thresholds
     use gfnff_gdisp0
@@ -104,6 +419,7 @@ contains  !> MODULE PROCEDURES START HERE
     type(TGFFData),intent(in) :: param
     type(TGFFTopology),intent(in) :: topo
     type(TGFFNeighbourList),intent(inout) :: nlist
+    type(gfnff_workspace),intent(inout),target :: work
     logical,intent(in),optional :: frozen_mask(n)
 
     type(TBorn),allocatable,intent(inout) :: solvation
@@ -123,7 +439,7 @@ contains  !> MODULE PROCEDURES START HERE
     real(wp) :: edisp,ees,ebond,eangl,etors,erep,ehb,exb,ebatm,eext
     real(wp) :: gsolv,gborn,ghb,gsasa,gshift
 
-    integer  :: i,j,k,l,m,ij,nd3,nd3pos,nlocal,nthreads,tid,nactive,iact
+    integer  :: i,j,k,l,m,ij,nd3,nd3pos,nlocal,nthreads,tid,nactive,iact,nloop
     integer  :: ati,atj,iat,jat
     integer  :: hbA,hbB
     integer  :: lin
@@ -136,12 +452,12 @@ contains  !> MODULE PROCEDURES START HERE
     real(wp) ::  rn,dr,g3tmp(3,3),g4tmp(3,4)
     real(wp) :: rij,drij(3,n),gactive(3)
 
-    real(wp),allocatable :: grab0(:,:,:),rab0(:),eeqtmp(:,:)
-    real(wp),allocatable :: cn(:),dcn(:,:,:),qtmp(:)
-    real(wp),allocatable :: hb_cn(:),hb_dcn(:,:,:)
-    real(wp),allocatable :: sqrab(:),srab(:)
-    real(wp),allocatable :: g5tmp(:,:),ghb_thread(:,:,:),ehb_thread(:)
-    integer,allocatable :: d3list(:,:),d3count(:),d3offset(:),active_atoms(:)
+    real(wp),pointer :: grab0(:,:,:),rab0(:),eeqtmp(:,:)
+    real(wp),pointer :: cn(:),dcn(:,:,:),qtmp(:)
+    real(wp),pointer :: hb_cn(:),hb_dcn(:,:,:)
+    real(wp),pointer :: sqrab(:),srab(:),g5tmp(:,:)
+    real(wp),allocatable :: ghb_thread(:,:,:),ehb_thread(:)
+    integer,pointer :: d3list(:,:),d3count(:),d3offset(:),active_atoms(:)
     !type(tb_timer) :: timer
     real(wp) :: dispthr,cnthr,repthr,hbthr1,hbthr2
 
@@ -167,36 +483,135 @@ contains  !> MODULE PROCEDURES START HERE
     ghb = 0.0d0
     gshift = 0.0d0
 
-    allocate (sqrab(n*(n+1)/2),srab(n*(n+1)/2),qtmp(n),g5tmp(3,n), &
-   &         eeqtmp(2,n*(n+1)/2),d3list(2,n*(n+1)/2),dcn(3,n,n),cn(n), &
-   &         hb_dcn(3,n,n),hb_cn(n),d3count(n),d3offset(n))
+    call work%ensure(n,topo%nbond,topo%nangl,topo%ntors)
+    if (present(frozen_mask)) then
+      call work%prepare_frozen(n,xyz,frozen_mask)
+      if (work%static_cache_valid) then
+        if (work%static_repthr /= repthr .or. work%static_dispthr /= dispthr) then
+          work%static_cache_valid = .false.
+        end if
+      end if
+      if (work%cn_cache_valid.and.work%cn_cache_thr /= cnthr) then
+        work%cn_cache_valid = .false.
+      end if
+    else
+      work%frozen_cache_valid = .false.
+      work%static_cache_valid = .false.
+      work%cn_cache_valid = .false.
+      work%frozen_pair = .false.
+    end if
+    sqrab => work%sqrab
+    srab => work%srab
+    qtmp => work%qtmp
+    g5tmp => work%g5tmp
+    eeqtmp => work%eeqtmp
+    d3list => work%d3list
+    dcn => work%dcn
+    cn => work%cn
+    hb_dcn => work%hb_dcn
+    hb_cn => work%hb_cn
+    d3count => work%d3count
+    d3offset => work%d3offset
+    active_atoms => work%active_atoms
+    grab0 => work%grab0
+    rab0 => work%rab0
 
 !      if (pr) call timer%new(10 + count([allocated(solvation)]),.false.)
 
 !      if (pr) call timer%measure(1,'distance/D3 list')
-    d3count = 0
-    !$omp parallel do default(none) schedule(static) &
-    !$omp shared(n, xyz, sqrab, srab, dispthr, d3count) &
-    !$omp private(i, j, k, ij, nlocal)
-    do i = 1,n
-      ij = i*(i-1)/2
-      nlocal = 0
-      do j = 1,i-1
-        k = ij+j
-        sqrab(k) = (xyz(1,i)-xyz(1,j))**2+&
- &               (xyz(2,i)-xyz(2,j))**2+&
- &               (xyz(3,i)-xyz(3,j))**2
-        if (sqrab(k) .lt. dispthr) nlocal = nlocal+1
-        srab(k) = sqrt(sqrab(k))
+    if (work%frozen_cache_valid) then
+      if (work%prefix_frozen) then
+!> Fast path for the CREST host--guest layout: all frozen atoms form a
+!> contiguous prefix. Frozen rows are already present in the persistent packed
+!> distance arrays; only rows belonging to active atoms are recomputed.
+        if (.not.work%static_cache_valid) then
+          d3count(1:work%frozen_prefix) = 0
+          !$omp parallel do default(none) schedule(static) &
+          !$omp shared(sqrab, dispthr, d3count, work) &
+          !$omp private(i, j, k, ij, nlocal)
+          do i = 1,work%frozen_prefix
+            ij = i*(i-1)/2
+            nlocal = 0
+            do j = 1,i-1
+              k = ij+j
+              if (sqrab(k) .lt. dispthr) nlocal = nlocal+1
+            end do
+            d3count(i) = nlocal
+          end do
+          !$omp end parallel do
+        end if
+
+        !$omp parallel do default(none) schedule(static) &
+        !$omp shared(n, xyz, sqrab, srab, dispthr, d3count, work) &
+        !$omp private(i, j, k, ij, nlocal)
+        do i = work%frozen_prefix+1,n
+          ij = i*(i-1)/2
+          nlocal = 0
+          do j = 1,i-1
+            k = ij+j
+            sqrab(k) = (xyz(1,i)-xyz(1,j))**2 + &
+           &           (xyz(2,i)-xyz(2,j))**2 + &
+           &           (xyz(3,i)-xyz(3,j))**2
+            srab(k) = sqrt(sqrab(k))
+            if (sqrab(k) .lt. dispthr) nlocal = nlocal+1
+          end do
+          d3count(i) = nlocal
+        end do
+        !$omp end parallel do
+      else
+!> General-mask fallback: update the packed list of every pair containing at
+!> least one active atom, then rebuild threshold counts in original row order.
+        d3count = 0
+        !$omp parallel do default(none) schedule(static) &
+        !$omp shared(xyz, sqrab, srab, work) &
+        !$omp private(m, i, j, k)
+        do m = 1,work%n_active_pairs
+          i = work%active_pair_i(m)
+          j = work%active_pair_j(m)
+          k = work%active_pair_idx(m)
+          sqrab(k) = (xyz(1,i)-xyz(1,j))**2 + &
+         &           (xyz(2,i)-xyz(2,j))**2 + &
+         &           (xyz(3,i)-xyz(3,j))**2
+          srab(k) = sqrt(sqrab(k))
+        end do
+        !$omp end parallel do
+
+        !$omp parallel do default(none) schedule(static) &
+        !$omp shared(n, sqrab, dispthr, d3count) &
+        !$omp private(i, j, k, ij, nlocal)
+        do i = 1,n
+          ij = i*(i-1)/2
+          nlocal = 0
+          do j = 1,i-1
+            k = ij+j
+            if (sqrab(k) .lt. dispthr) nlocal = nlocal+1
+          end do
+          d3count(i) = nlocal
+        end do
+        !$omp end parallel do
+      end if
+    else
+      d3count = 0
+      !$omp parallel do default(none) schedule(static) &
+      !$omp shared(n, xyz, sqrab, srab, dispthr, d3count) &
+      !$omp private(i, j, k, ij, nlocal)
+      do i = 1,n
+        ij = i*(i-1)/2
+        nlocal = 0
+        do j = 1,i-1
+          k = ij+j
+          sqrab(k) = (xyz(1,i)-xyz(1,j))**2 + &
+         &           (xyz(2,i)-xyz(2,j))**2 + &
+         &           (xyz(3,i)-xyz(3,j))**2
+          srab(k) = sqrt(sqrab(k))
+          if (sqrab(k) .lt. dispthr) nlocal = nlocal+1
+        end do
+        d3count(i) = nlocal
+        sqrab(ij+i) = 0.0_wp
+        srab(ij+i) = 0.0_wp
       end do
-      d3count(i) = nlocal
-!> The loop above only runs over the off diagonal elements
-!> This initializes the unitialized diagonal to zero but does not
-!> add it to the dispersion list.
-      sqrab(ij+i) = 0.0d0
-      srab(ij+i) = 0.0d0
-    end do
-    !$omp end parallel do
+      !$omp end parallel do
+    end if
 
 !> Prefix offsets preserve the original deterministic (i,j) pair order.
     d3offset(1) = 0
@@ -205,22 +620,46 @@ contains  !> MODULE PROCEDURES START HERE
     end do
     nd3 = d3offset(n)+d3count(n)
 
-    !$omp parallel do default(none) schedule(static) &
-    !$omp shared(n, sqrab, dispthr, d3offset, d3list) &
-    !$omp private(i, j, k, ij, nd3pos)
-    do i = 1,n
-      ij = i*(i-1)/2
-      nd3pos = d3offset(i)
-      do j = 1,i-1
-        k = ij+j
-        if (sqrab(k) .lt. dispthr) then
-          nd3pos = nd3pos+1
-          d3list(1,nd3pos) = i
-          d3list(2,nd3pos) = j
-        end if
+    if (work%prefix_frozen.and.work%static_cache_valid) then
+!> Frozen-prefix D3-list entries remain valid and already occupy the beginning
+!> of d3list. Rebuild only rows containing an active atom.
+      !$omp parallel do default(none) schedule(static) &
+      !$omp shared(n, sqrab, dispthr, d3offset, d3list, work) &
+      !$omp private(i, j, k, ij, nd3pos)
+      do i = work%frozen_prefix+1,n
+        ij = i*(i-1)/2
+        nd3pos = d3offset(i)
+        do j = 1,i-1
+          k = ij+j
+          if (sqrab(k) .lt. dispthr) then
+            nd3pos = nd3pos+1
+            d3list(1,nd3pos) = i
+            d3list(2,nd3pos) = j
+          end if
+        end do
       end do
-    end do
-    !$omp end parallel do
+      !$omp end parallel do
+    else
+      !$omp parallel do default(none) schedule(static) &
+      !$omp shared(n, sqrab, dispthr, d3offset, d3list) &
+      !$omp private(i, j, k, ij, nd3pos)
+      do i = 1,n
+        ij = i*(i-1)/2
+        nd3pos = d3offset(i)
+        do j = 1,i-1
+          k = ij+j
+          if (sqrab(k) .lt. dispthr) then
+            nd3pos = nd3pos+1
+            d3list(1,nd3pos) = i
+            d3list(2,nd3pos) = j
+          end if
+        end do
+      end do
+      !$omp end parallel do
+    end if
+    if (present(frozen_mask)) then
+      call work%prepare_static(n,at,xyz,frozen_mask,repthr,dispthr,param,topo,sqrab,srab)
+    end if
 !      if (pr) call timer%measure(1)
 
 !!!!!!!!!!!!
@@ -265,41 +704,97 @@ contains  !> MODULE PROCEDURES START HERE
 !!!!!!!!!!!!!
 
 !      if (pr) call timer%measure(2,'non bonded repulsion')
-    !$omp parallel do default(none) schedule(dynamic,8) reduction(+:erep, g) &
-    !$omp shared(n, at, xyz, srab, sqrab, repthr, topo, param, frozen_mask) &
-    !$omp private(iat, jat, m, ij, ati, atj, rab, r2, r3, t8, t16, t19, t26, t27)
-    do iat = 1,n
-      m = iat*(iat-1)/2
-      do jat = 1,iat-1
-        ij = m+jat
-        r2 = sqrab(ij)
-        if (r2 .gt. repthr) cycle ! cut-off
-        if (topo%bpair(ij) .eq. 1) cycle ! list avoided because of memory
-        ati = at(iat)
-        atj = at(jat)
-        rab = srab(ij)
-        t16 = r2**0.75
-        t19 = t16*t16
-        t8 = t16*topo%alphanb(ij)
-        t26 = exp(-t8)*param%repz(ati)*param%repz(atj)*param%repscaln
-        erep = erep+t26/rab !energy
-        if (present(frozen_mask)) then
-          ! A frozen--frozen pair has no direct derivative with respect to any
-          ! active coordinate. CREST discards both endpoint gradients anyway.
-          if (frozen_mask(iat).and.frozen_mask(jat)) cycle
-        end if
-        t27 = t26*(1.5d0*t8+1.0d0)/t19
-        r3 = (xyz(:,iat)-xyz(:,jat))*t27
-        if (present(frozen_mask)) then
+    if (work%static_cache_valid) then
+      erep = erep+work%cached_nb_rep_total
+      if (work%prefix_frozen) then
+!> With a frozen prefix, every remaining pair belongs to an active outer atom.
+!> Traverse the original packed rows directly to avoid indirect pair-list loads.
+        !$omp parallel do default(none) schedule(dynamic,8) reduction(+:erep, g) &
+        !$omp shared(n, at, xyz, srab, sqrab, repthr, topo, param, frozen_mask, work) &
+        !$omp private(iat, jat, m, ij, ati, atj, rab, r2, r3, t8, t16, t19, t26, t27)
+        do iat = work%frozen_prefix+1,n
+          m = iat*(iat-1)/2
+          do jat = 1,iat-1
+            ij = m+jat
+            r2 = sqrab(ij)
+            if (r2 .gt. repthr) cycle
+            if (topo%bpair(ij) .eq. 1) cycle
+            ati = at(iat)
+            atj = at(jat)
+            rab = srab(ij)
+            t16 = r2**0.75_wp
+            t19 = t16*t16
+            t8 = t16*topo%alphanb(ij)
+            t26 = exp(-t8)*param%repz(ati)*param%repz(atj)*param%repscaln
+            erep = erep+t26/rab
+            t27 = t26*(1.5_wp*t8+1.0_wp)/t19
+            r3 = (xyz(:,iat)-xyz(:,jat))*t27
+            g(:,iat) = g(:,iat)-r3
+            if (.not.frozen_mask(jat)) g(:,jat) = g(:,jat)+r3
+          end do
+        end do
+        !$omp end parallel do
+      else
+        !$omp parallel do default(none) schedule(dynamic,32) reduction(+:erep, g) &
+        !$omp shared(at, xyz, srab, sqrab, repthr, topo, param, frozen_mask, work) &
+        !$omp private(m, iat, jat, ij, ati, atj, rab, r2, r3, t8, t16, t19, t26, t27)
+        do m = 1,work%n_active_pairs
+          iat = work%active_pair_i(m)
+          jat = work%active_pair_j(m)
+          ij = work%active_pair_idx(m)
+          r2 = sqrab(ij)
+          if (r2 .gt. repthr) cycle
+          if (topo%bpair(ij) .eq. 1) cycle
+          ati = at(iat)
+          atj = at(jat)
+          rab = srab(ij)
+          t16 = r2**0.75_wp
+          t19 = t16*t16
+          t8 = t16*topo%alphanb(ij)
+          t26 = exp(-t8)*param%repz(ati)*param%repz(atj)*param%repscaln
+          erep = erep+t26/rab
+          t27 = t26*(1.5_wp*t8+1.0_wp)/t19
+          r3 = (xyz(:,iat)-xyz(:,jat))*t27
           if (.not.frozen_mask(iat)) g(:,iat) = g(:,iat)-r3
           if (.not.frozen_mask(jat)) g(:,jat) = g(:,jat)+r3
-        else
-          g(:,iat) = g(:,iat)-r3
-          g(:,jat) = g(:,jat)+r3
-        end if
+        end do
+        !$omp end parallel do
+      end if
+    else
+      !$omp parallel do default(none) schedule(dynamic,8) reduction(+:erep, g) &
+      !$omp shared(n, at, xyz, srab, sqrab, repthr, topo, param, frozen_mask) &
+      !$omp private(iat, jat, m, ij, ati, atj, rab, r2, r3, t8, t16, t19, t26, t27)
+      do iat = 1,n
+        m = iat*(iat-1)/2
+        do jat = 1,iat-1
+          ij = m+jat
+          r2 = sqrab(ij)
+          if (r2 .gt. repthr) cycle
+          if (topo%bpair(ij) .eq. 1) cycle
+          ati = at(iat)
+          atj = at(jat)
+          rab = srab(ij)
+          t16 = r2**0.75_wp
+          t19 = t16*t16
+          t8 = t16*topo%alphanb(ij)
+          t26 = exp(-t8)*param%repz(ati)*param%repz(atj)*param%repscaln
+          erep = erep+t26/rab
+          if (present(frozen_mask)) then
+            if (frozen_mask(iat).and.frozen_mask(jat)) cycle
+          end if
+          t27 = t26*(1.5_wp*t8+1.0_wp)/t19
+          r3 = (xyz(:,iat)-xyz(:,jat))*t27
+          if (present(frozen_mask)) then
+            if (.not.frozen_mask(iat)) g(:,iat) = g(:,iat)-r3
+            if (.not.frozen_mask(jat)) g(:,jat) = g(:,jat)+r3
+          else
+            g(:,iat) = g(:,iat)-r3
+            g(:,jat) = g(:,jat)+r3
+          end if
+        end do
       end do
-    end do
-    !$omp end parallel do
+      !$omp end parallel do
+    end if
 !      if (pr) call timer%measure(2)
 
 !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
@@ -333,7 +828,14 @@ contains  !> MODULE PROCEDURES START HERE
 !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
 
 !      if (pr) call timer%measure(3,'dCN')
-    call gfnff_dlogcoord(n,at,xyz,srab,cn,dcn,cnthr,param) ! new erf used in GFN0
+    if (present(frozen_mask).and.work%frozen_cache_valid) then
+      call gfnff_dlogcoord(n,at,xyz,srab,cn,dcn,cnthr,param, &
+     & frozen_mask,work%raw_cn_static,work%cn_cache_valid, &
+     & work%frozen_prefix,work%prefix_frozen)
+      work%cn_cache_thr = cnthr
+    else
+      call gfnff_dlogcoord(n,at,xyz,srab,cn,dcn,cnthr,param)
+    end if
     if (sum(topo%nr_hb) .gt. 0) call dncoord_erf(n,at,xyz,param%rcov,hb_cn,hb_dcn,900.0d0,topo) ! HB erf CN
 !      if (pr) call timer%measure(3)
 
@@ -360,7 +862,6 @@ contains  !> MODULE PROCEDURES START HERE
            & param%d3r0,sqrtZr4r2,4.0d0,param%dispscale,cn,dcn,edisp,g)
       end if
     end if
-    deallocate (d3list)
 !      if (pr) call timer%measure(5)
 
 !!!!!!!!
@@ -397,7 +898,6 @@ contains  !> MODULE PROCEDURES START HERE
   !> Each iteration owns one gradient vector, eliminating the full-array OpenMP
   !> reduction. Active-active pairs are visited once from each endpoint; their
   !> two endpoint forces are therefore accumulated without races.
-        allocate(active_atoms(nactive))
         iact = 0
         do i = 1,n
           if (.not.frozen_mask(i)) then
@@ -430,7 +930,6 @@ contains  !> MODULE PROCEDURES START HERE
           g(:,i) = gactive
         end do
         !$omp end parallel do
-        deallocate(active_atoms)
       end if
     else
       !$omp parallel do default(none) reduction (+:g) &
@@ -453,7 +952,6 @@ contains  !> MODULE PROCEDURES START HERE
       end do
       !$omp end parallel do
     end if
-    if (.not.pr) deallocate (eeqtmp)
 
 #ifdef WITH_GBSA
     if (allocated(solvation)) then
@@ -482,10 +980,8 @@ contains  !> MODULE PROCEDURES START HERE
 
 !      if (pr) call timer%measure(7,'bonds')
     if (topo%nbond .gt. 0) then
-      allocate (grab0(3,n,topo%nbond),rab0(topo%nbond))
       rab0(:) = topo%vbond(1,:) ! shifts
       call gfnffdrab(n,at,xyz,cn,dcn,topo%nbond,topo%blist,rab0,grab0)
-      deallocate (dcn)
 
       !$omp parallel do default(none) reduction(+:g, ebond) &
       !$omp shared(grab0, topo, param, rab0, srab, xyz, at, hb_cn, hb_dcn, n) &
@@ -508,17 +1004,27 @@ contains  !> MODULE PROCEDURES START HERE
       end do
       !$omp end parallel do
 
-      deallocate (hb_dcn)
 
 !!!!!!!!!!!!!!!!!!
 ! bonded REP
 !!!!!!!!!!!!!!!!!!
 
+      if (work%static_cache_valid) then
+        erep = erep+work%cached_bond_rep_total
+        nloop = work%n_dynamic_bonds
+      else
+        nloop = topo%nbond
+      end if
       !$omp parallel do default(none) reduction(+:erep, g) &
-      !$omp shared(topo, param, at, sqrab, srab, xyz, frozen_mask) &
-      !$omp private(i, iat, jat, ij, xa, ya, za, dx, dy, dz, r2, rab, ati, atj, &
+      !$omp shared(topo, param, at, sqrab, srab, xyz, frozen_mask, work, nloop) &
+      !$omp private(m, i, iat, jat, ij, xa, ya, za, dx, dy, dz, r2, rab, ati, atj, &
       !$omp& alpha, repab, t16, t19, t26, t27)
-      do i = 1,topo%nbond
+      do m = 1,nloop
+        if (work%static_cache_valid) then
+          i = work%dynamic_bond_idx(m)
+        else
+          i = m
+        end if
         iat = topo%blist(1,i)
         jat = topo%blist(2,i)
         ij = iat*(iat-1)/2+jat
@@ -534,14 +1040,11 @@ contains  !> MODULE PROCEDURES START HERE
         atj = at(jat)
         alpha = sqrt(param%repa(ati)*param%repa(atj))
         repab = param%repz(ati)*param%repz(atj)*param%repscalb
-        t16 = r2**0.75d0
+        t16 = r2**0.75_wp
         t19 = t16*t16
         t26 = exp(-alpha*t16)*repab
-        erep = erep+t26/rab !energy
-        if (present(frozen_mask)) then
-          if (frozen_mask(iat).and.frozen_mask(jat)) cycle
-        end if
-        t27 = t26*(1.5d0*alpha*t16+1.0d0)/t19
+        erep = erep+t26/rab
+        t27 = t26*(1.5_wp*alpha*t16+1.0_wp)/t19
         if (present(frozen_mask)) then
           if (.not.frozen_mask(iat)) then
             g(1,iat) = g(1,iat)-dx*t27
@@ -572,10 +1075,21 @@ contains  !> MODULE PROCEDURES START HERE
 
 !      if (pr) call timer%measure(8,'bend and torsion')
     if (topo%nangl .gt. 0) then
+      if (work%static_cache_valid) then
+        eangl = eangl+work%cached_angle_total
+        nloop = work%n_dynamic_angles
+      else
+        nloop = topo%nangl
+      end if
       !$omp parallel do default(none) reduction (+:eangl, g) &
-      !$omp shared(n, at, xyz, topo, param) &
-      !$omp private(m, j, i, k, etmp, g3tmp)
-      do m = 1,topo%nangl
+      !$omp shared(n, at, xyz, topo, param, work, nloop) &
+      !$omp private(m, i, j, k, l, etmp, g3tmp)
+      do l = 1,nloop
+        if (work%static_cache_valid) then
+          m = work%dynamic_angle_idx(l)
+        else
+          m = l
+        end if
         j = topo%alist(1,m)
         i = topo%alist(2,m)
         k = topo%alist(3,m)
@@ -593,10 +1107,21 @@ contains  !> MODULE PROCEDURES START HERE
 !!!!!!!!!!!!!!!!!!
 
     if (topo%ntors .gt. 0) then
-      !$omp parallel do default(none) reduction(+:etors, g) &
-      !$omp shared(param, topo, n, at, xyz) &
-      !$omp private(m, i, j, k, l, etmp, g4tmp)
-      do m = 1,topo%ntors
+      if (work%static_cache_valid) then
+        etors = etors+work%cached_torsion_total
+        nloop = work%n_dynamic_torsions
+      else
+        nloop = topo%ntors
+      end if
+      !$omp parallel do default(none) reduction (+:etors, g) &
+      !$omp shared(param, topo, n, at, xyz, work, nloop) &
+      !$omp private(m, i, j, k, l, nd3pos, etmp, g4tmp)
+      do nd3pos = 1,nloop
+        if (work%static_cache_valid) then
+          m = work%dynamic_torsion_idx(nd3pos)
+        else
+          m = nd3pos
+        end if
         i = topo%tlist(1,m)
         j = topo%tlist(2,m)
         k = topo%tlist(3,m)
