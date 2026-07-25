@@ -1,0 +1,315 @@
+# GFN-FF OpenMP force-loop checkpoint
+#
+# Target: CREST 3.0.2 source bundle at base commit
+# 932f6b0b810b1d3a62204bb181552a9de7ef27f4.
+#
+# Benchmark system: 938-atom host-guest structure; atoms 1-808 frozen,
+# atoms 809-938 mobile. No structures, trajectories, or chemical identities
+# are included in this patch.
+#
+# Scope:
+# - deterministic parallel distance/dispersion-list preparation;
+# - persistent per-thread hydrogen-bond energy/gradient accumulators;
+# - parallel independent D3 preparation loops;
+# - parallel hydrogen-bond candidate counting;
+# - no changes to coordination-number definitions, topology construction,
+#   or force-field equations.
+#
+# Validation:
+# - five separated structures and OMP_NUM_THREADS=1,2,4,5;
+# - worst mobile-gradient deviation: 1.7e-17 Eh/bohr;
+# - energy deviation: approximately 1e-13 Eh or below;
+# - CREST command-line single-point output agrees at printed precision;
+# - the existing test suite passes at four threads.
+#
+# Representative 200-step frozen-host MTD wall times in the test environment:
+# - 1 thread: 27.27 s
+# - 2 threads: 25.73 s
+# - 4 threads: 25.13 s
+# - 5 threads: 25.35 s
+#
+diff --git a/subprojects/gfnff/src/gfnff_engrad.F90 b/subprojects/gfnff/src/gfnff_engrad.F90
+index f56a1c4..7306aa6 100644
+--- a/subprojects/gfnff/src/gfnff_engrad.F90
++++ b/subprojects/gfnff/src/gfnff_engrad.F90
+@@ -21,6 +21,7 @@
+ !> at https://github.com/grimme-lab/xtb
+ !================================================================================!
+ module gfnff_engrad_module
++!$ use omp_lib, only: omp_get_max_threads, omp_get_thread_num
+   use iso_fortran_env,only:wp => real64,sp => real32,stdout => output_unit
+   use gfnff_ini2
+   use gfnff_data_types,only:TGFFData,TGFFNeighbourList,new,TGFFTopology
+@@ -122,7 +123,7 @@ contains  !> MODULE PROCEDURES START HERE
+     real(wp) :: edisp,ees,ebond,eangl,etors,erep,ehb,exb,ebatm,eext
+     real(wp) :: gsolv,gborn,ghb,gsasa,gshift
+ 
+-    integer  :: i,j,k,l,m,ij,nd3
++    integer  :: i,j,k,l,m,ij,nd3,nd3pos,nlocal,nthreads,tid
+     integer  :: ati,atj,iat,jat
+     integer  :: hbA,hbB
+     integer  :: lin
+@@ -139,8 +140,8 @@ contains  !> MODULE PROCEDURES START HERE
+     real(wp),allocatable :: cn(:),dcn(:,:,:),qtmp(:)
+     real(wp),allocatable :: hb_cn(:),hb_dcn(:,:,:)
+     real(wp),allocatable :: sqrab(:),srab(:)
+-    real(wp),allocatable :: g5tmp(:,:)
+-    integer,allocatable :: d3list(:,:)
++    real(wp),allocatable :: g5tmp(:,:),ghb_thread(:,:,:),ehb_thread(:)
++    integer,allocatable :: d3list(:,:),d3count(:),d3offset(:)
+     !type(tb_timer) :: timer
+     real(wp) :: dispthr,cnthr,repthr,hbthr1,hbthr2
+ 
+@@ -168,32 +169,58 @@ contains  !> MODULE PROCEDURES START HERE
+ 
+     allocate (sqrab(n*(n+1)/2),srab(n*(n+1)/2),qtmp(n),g5tmp(3,n), &
+    &         eeqtmp(2,n*(n+1)/2),d3list(2,n*(n+1)/2),dcn(3,n,n),cn(n), &
+-   &         hb_dcn(3,n,n),hb_cn(n))
++   &         hb_dcn(3,n,n),hb_cn(n),d3count(n),d3offset(n))
+ 
+ !      if (pr) call timer%new(10 + count([allocated(solvation)]),.false.)
+ 
+ !      if (pr) call timer%measure(1,'distance/D3 list')
+-    nd3 = 0
++    d3count = 0
++    !$omp parallel do default(none) schedule(static) &
++    !$omp shared(n, xyz, sqrab, srab, dispthr, d3count) &
++    !$omp private(i, j, k, ij, nlocal)
+     do i = 1,n
+       ij = i*(i-1)/2
++      nlocal = 0
+       do j = 1,i-1
+         k = ij+j
+         sqrab(k) = (xyz(1,i)-xyz(1,j))**2+&
+  &               (xyz(2,i)-xyz(2,j))**2+&
+  &               (xyz(3,i)-xyz(3,j))**2
+-        if (sqrab(k) .lt. dispthr) then
+-          nd3 = nd3+1
+-          d3list(1,nd3) = i
+-          d3list(2,nd3) = j
+-        end if
++        if (sqrab(k) .lt. dispthr) nlocal = nlocal+1
+         srab(k) = sqrt(sqrab(k))
+       end do
++      d3count(i) = nlocal
+ !> The loop above only runs over the off diagonal elements
+ !> This initializes the unitialized diagonal to zero but does not
+ !> add it to the dispersion list.
+       sqrab(ij+i) = 0.0d0
+       srab(ij+i) = 0.0d0
+     end do
++    !$omp end parallel do
++
++!> Prefix offsets preserve the original deterministic (i,j) pair order.
++    d3offset(1) = 0
++    do i = 2,n
++      d3offset(i) = d3offset(i-1)+d3count(i-1)
++    end do
++    nd3 = d3offset(n)+d3count(n)
++
++    !$omp parallel do default(none) schedule(static) &
++    !$omp shared(n, sqrab, dispthr, d3offset, d3list) &
++    !$omp private(i, j, k, ij, nd3pos)
++    do i = 1,n
++      ij = i*(i-1)/2
++      nd3pos = d3offset(i)
++      do j = 1,i-1
++        k = ij+j
++        if (sqrab(k) .lt. dispthr) then
++          nd3pos = nd3pos+1
++          d3list(1,nd3pos) = i
++          d3list(2,nd3pos) = j
++        end if
++      end do
++    end do
++    !$omp end parallel do
+ !      if (pr) call timer%measure(1)
+ 
+ !!!!!!!!!!!!
+@@ -589,27 +616,36 @@ contains  !> MODULE PROCEDURES START HERE
+ 
+ !      if (pr) call timer%measure(10,'HB/XB (incl list setup)')
+ 
+-    if (nlist%nhb1 .gt. 0) then
+-      !$omp parallel do default(none) reduction(+:ehb, g) &
+-      !$omp shared(topo, nlist, param, n, at, xyz, sqrab, srab) &
+-      !$omp private(i, j, k, l, etmp, g3tmp)
++    if (nlist%nhb1 .gt. 0.or.nlist%nhb2 .gt. 0) then
++!> Use one persistent gradient buffer per thread for both hydrogen-bond loops.
++!> This removes repeated full-array OpenMP reductions and, for HB2, avoids
++!> zeroing and adding a 3*n temporary gradient for every interaction.
++      nthreads = 1
++!$    nthreads = omp_get_max_threads()
++      allocate(ghb_thread(3,n,nthreads),ehb_thread(nthreads))
++      ghb_thread = 0.0_wp
++      ehb_thread = 0.0_wp
++
++      !$omp parallel default(none) &
++      !$omp shared(topo, nlist, param, n, at, xyz, sqrab, srab, ghb_thread, ehb_thread) &
++      !$omp private(tid, i, j, k, l, etmp, g3tmp)
++      tid = 1
++!$    tid = omp_get_thread_num()+1
++
++      !$omp do schedule(static)
+       do i = 1,nlist%nhb1
+         j = nlist%hblist1(1,i)
+         k = nlist%hblist1(2,i)
+         l = nlist%hblist1(3,i)
+         call abhgfnff_eg1(n,j,k,l,at,xyz,topo%qa,sqrab,srab,etmp,g3tmp,param,topo)
+-        g(1:3,j) = g(1:3,j)+g3tmp(1:3,1)
+-        g(1:3,k) = g(1:3,k)+g3tmp(1:3,2)
+-        g(1:3,l) = g(1:3,l)+g3tmp(1:3,3)
+-        ehb = ehb+etmp
++        ghb_thread(1:3,j,tid) = ghb_thread(1:3,j,tid)+g3tmp(1:3,1)
++        ghb_thread(1:3,k,tid) = ghb_thread(1:3,k,tid)+g3tmp(1:3,2)
++        ghb_thread(1:3,l,tid) = ghb_thread(1:3,l,tid)+g3tmp(1:3,3)
++        ehb_thread(tid) = ehb_thread(tid)+etmp
+       end do
+-      !$omp end parallel do
+-    end if
++      !$omp end do
+ 
+-    if (nlist%nhb2 .gt. 0) then
+-      !$omp parallel do default(none) reduction(+:ehb, g) &
+-      !$omp shared(topo, nlist, param, n, at, xyz, sqrab, srab) &
+-      !$omp private(i, j, k, l, etmp, g5tmp)
++      !$omp do schedule(static)
+       do i = 1,nlist%nhb2
+         j = nlist%hblist2(1,i)
+         k = nlist%hblist2(2,i)
+@@ -617,24 +653,30 @@ contains  !> MODULE PROCEDURES START HERE
+         !Carbonyl case R-C=O...H_A
+         if (at(k) .eq. 8.and.topo%nb(20,k) .eq. 1.and.at(topo%nb(1,k)) .eq. 6) then
+           call abhgfnff_eg3(n,j,k,l,at,xyz,topo%qa,sqrab,srab, &
+-             & etmp,g5tmp,param,topo)
++             & etmp,ghb_thread(:,:,tid),param,topo)
+           !Nitro case R-N=O...H_A
+         else if (at(k) .eq. 8.and.topo%nb(20,k) .eq. 1.and.at(topo%nb(1,k)) .eq. 7) then
+           call abhgfnff_eg3(n,j,k,l,at,xyz,topo%qa,sqrab,srab, &
+-             & etmp,g5tmp,param,topo)
++             & etmp,ghb_thread(:,:,tid),param,topo)
+           !N hetero aromat
+         else if (at(k) .eq. 7.and.topo%nb(20,k) .eq. 2) then
+           call abhgfnff_eg2_rnr(n,j,k,l,at,xyz,topo%qa,sqrab,srab, &
+-             & etmp,g5tmp,param,topo)
++             & etmp,ghb_thread(:,:,tid),param,topo)
+         else
+           !Default
+           call abhgfnff_eg2new(n,j,k,l,at,xyz,topo%qa,sqrab,srab, &
+-             & etmp,g5tmp,param,topo)
++             & etmp,ghb_thread(:,:,tid),param,topo)
+         end if
+-        g = g+g5tmp
+-        ehb = ehb+etmp
++        ehb_thread(tid) = ehb_thread(tid)+etmp
+       end do
+-      !$omp end parallel do
++      !$omp end do
++      !$omp end parallel
++
++      do tid = 1,nthreads
++        g = g+ghb_thread(:,:,tid)
++        ehb = ehb+ehb_thread(tid)
++      end do
++      deallocate(ghb_thread,ehb_thread)
+     end if
+ 
+ !!!!!!!!!!!!!!!!!!
+@@ -1663,7 +1705,6 @@ contains  !> MODULE PROCEDURES START HERE
+     p_bh = 1.d0+param%hbabmix
+     p_ab = -param%hbabmix
+ 
+-    gdr = 0
+     energy = 0
+ 
+     call hbonds(A,B,ca,cb,param,topo)
+@@ -1905,7 +1946,6 @@ contains  !> MODULE PROCEDURES START HERE
+     p_bh = 1.d0+param%hbabmix
+     p_ab = -param%hbabmix
+ 
+-    gdr = 0
+     energy = 0
+     vector = 0
+     lp_dist = 0.50-0.018*param%repz(at(B))
+@@ -2203,7 +2243,6 @@ contains  !> MODULE PROCEDURES START HERE
+     p_bh = 1.d0+param%hbabmix
+     p_ab = -param%hbabmix
+ 
+-    gdr = 0
+     energy = 0
+     etors = 0
+     gtors = 0
+diff --git a/subprojects/gfnff/src/gfnff_gdisp0.f90 b/subprojects/gfnff/src/gfnff_gdisp0.f90
+index 874bb81..f9202bb 100644
+--- a/subprojects/gfnff/src/gfnff_gdisp0.f90
++++ b/subprojects/gfnff/src/gfnff_gdisp0.f90
+@@ -173,6 +173,9 @@ subroutine weight_references_d4(dispm, nat, atoms, wf, cn, gwvec, gwdcn)
+    gwvec = 0.0_wp
+    gwdcn = 0.0_wp
+ 
++   !$omp parallel do default(none) schedule(static) &
++   !$omp shared(dispm, nat, atoms, wf, cn, gwvec, gwdcn) &
++   !$omp private(iat, ati, iref, norm, dnorm, gw, expw, expd, gwk, dgwk)
+    do iat = 1, nat
+       ati = atoms(iat)
+       norm = 0.0_wp
+@@ -206,6 +209,7 @@ subroutine weight_references_d4(dispm, nat, atoms, wf, cn, gwvec, gwdcn)
+ 
+       end do
+    end do
++   !$omp end parallel do
+ 
+ end subroutine weight_references_d4
+ !========================================================================================!
+@@ -281,6 +285,9 @@ subroutine get_atomic_c6_d4(dispm, nat, atoms, gwvec, gwdcn, c6, dc6dcn)
+    c6 = 0.0_wp
+    dc6dcn = 0.0_wp
+ 
++   !$omp parallel do default(none) schedule(static) &
++   !$omp shared(dispm, nat, atoms, gwvec, gwdcn, c6, dc6dcn) &
++   !$omp private(iat, jat, ati, atj, iref, jref, refc6, dc6, dc6dcni, dc6dcnj)
+    do iat = 1, nat
+       ati = atoms(iat)
+       do jat = 1, iat
+@@ -302,6 +309,7 @@ subroutine get_atomic_c6_d4(dispm, nat, atoms, gwvec, gwdcn, c6, dc6dcn)
+          dc6dcn(jat, iat) = dc6dcnj
+       end do
+    end do
++   !$omp end parallel do
+ end subroutine get_atomic_c6_d4
+ !========================================================================================!
+ 
+diff --git a/subprojects/gfnff/src/gfnff_ini2.f90 b/subprojects/gfnff/src/gfnff_ini2.f90
+index 9eabf58..2efe723 100644
+--- a/subprojects/gfnff/src/gfnff_ini2.f90
++++ b/subprojects/gfnff/src/gfnff_ini2.f90
+@@ -1086,6 +1086,9 @@ contains  !> MODULE PROCEDURES START HERE
+ 
+     nhb1 = 0
+     nhb2 = 0
++    !$omp parallel do default(none) schedule(static) reduction(+:nhb1,nhb2) &
++    !$omp shared(n, at, sqrab, topo, hbthr1, hbthr2) &
++    !$omp private(ix, i, j, ij, rab, ijnonbond, k, nh, inh, jnh)
+     do ix = 1,topo%nathbAB
+       i = topo%hbatABl(1,ix)
+       j = topo%hbatABl(2,ix)
+@@ -1106,8 +1109,11 @@ contains  !> MODULE PROCEDURES START HERE
+         end if
+       end do
+     end do
++    !$omp end parallel do
+ 
+     nxb = 0
++    !$omp parallel do default(none) schedule(static) reduction(+:nxb) &
++    !$omp shared(sqrab, topo, hbthr2) private(ix, i, j, ij, rab)
+     do ix = 1,topo%natxbAB
+       i = topo%xbatABl(1,ix)
+       j = topo%xbatABl(2,ix)
+@@ -1116,6 +1122,7 @@ contains  !> MODULE PROCEDURES START HERE
+       if (rab .gt. hbthr2) cycle
+       nxb = nxb+1
+     end do
++    !$omp end parallel do
+ 
+   end subroutine gfnff_hbset0
+ !========================================================================================!
