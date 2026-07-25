@@ -1,0 +1,207 @@
+sent(frozen_mask)) then
+-          ! A frozen--frozen pair has no direct derivative with respect to any
+-          ! active coordinate. CREST discards both endpoint gradients anyway.
+-          if (frozen_mask(iat).and.frozen_mask(jat)) cycle
+-        end if
+-        t27 = t26*(1.5d0*t8+1.0d0)/t19
+-        r3 = (xyz(:,iat)-xyz(:,jat))*t27
+-        if (present(frozen_mask)) then
++    if (work%static_cache_valid) then
++      erep = erep+work%cached_nb_rep_total
++      if (work%prefix_frozen) then
++!> With a frozen prefix, every remaining pair belongs to an active outer atom.
++!> Traverse the original packed rows directly to avoid indirect pair-list loads.
++        !$omp parallel do default(none) schedule(dynamic,8) reduction(+:erep, g) &
++        !$omp shared(n, at, xyz, srab, sqrab, repthr, topo, param, frozen_mask, work) &
++        !$omp private(iat, jat, m, ij, ati, atj, rab, r2, r3, t8, t16, t19, t26, t27)
++        do iat = work%frozen_prefix+1,n
++          m = iat*(iat-1)/2
++          do jat = 1,iat-1
++            ij = m+jat
++            r2 = sqrab(ij)
++            if (r2 .gt. repthr) cycle
++            if (topo%bpair(ij) .eq. 1) cycle
++            ati = at(iat)
++            atj = at(jat)
++            rab = srab(ij)
++            t16 = r2**0.75_wp
++            t19 = t16*t16
++            t8 = t16*topo%alphanb(ij)
++            t26 = exp(-t8)*param%repz(ati)*param%repz(atj)*param%repscaln
++            erep = erep+t26/rab
++            t27 = t26*(1.5_wp*t8+1.0_wp)/t19
++            r3 = (xyz(:,iat)-xyz(:,jat))*t27
++            g(:,iat) = g(:,iat)-r3
++            if (.not.frozen_mask(jat)) g(:,jat) = g(:,jat)+r3
++          end do
++        end do
++        !$omp end parallel do
++      else
++        !$omp parallel do default(none) schedule(dynamic,32) reduction(+:erep, g) &
++        !$omp shared(at, xyz, srab, sqrab, repthr, topo, param, frozen_mask, work) &
++        !$omp private(m, iat, jat, ij, ati, atj, rab, r2, r3, t8, t16, t19, t26, t27)
++        do m = 1,work%n_active_pairs
++          iat = work%active_pair_i(m)
++          jat = work%active_pair_j(m)
++          ij = work%active_pair_idx(m)
++          r2 = sqrab(ij)
++          if (r2 .gt. repthr) cycle
++          if (topo%bpair(ij) .eq. 1) cycle
++          ati = at(iat)
++          atj = at(jat)
++          rab = srab(ij)
++          t16 = r2**0.75_wp
++          t19 = t16*t16
++          t8 = t16*topo%alphanb(ij)
++          t26 = exp(-t8)*param%repz(ati)*param%repz(atj)*param%repscaln
++          erep = erep+t26/rab
++          t27 = t26*(1.5_wp*t8+1.0_wp)/t19
++          r3 = (xyz(:,iat)-xyz(:,jat))*t27
+           if (.not.frozen_mask(iat)) g(:,iat) = g(:,iat)-r3
+           if (.not.frozen_mask(jat)) g(:,jat) = g(:,jat)+r3
+-        else
+-          g(:,iat) = g(:,iat)-r3
+-          g(:,jat) = g(:,jat)+r3
+-        end if
++        end do
++        !$omp end parallel do
++      end if
++    else
++      !$omp parallel do default(none) schedule(dynamic,8) reduction(+:erep, g) &
++      !$omp shared(n, at, xyz, srab, sqrab, repthr, topo, param, frozen_mask) &
++      !$omp private(iat, jat, m, ij, ati, atj, rab, r2, r3, t8, t16, t19, t26, t27)
++      do iat = 1,n
++        m = iat*(iat-1)/2
++        do jat = 1,iat-1
++          ij = m+jat
++          r2 = sqrab(ij)
++          if (r2 .gt. repthr) cycle
++          if (topo%bpair(ij) .eq. 1) cycle
++          ati = at(iat)
++          atj = at(jat)
++          rab = srab(ij)
++          t16 = r2**0.75_wp
++          t19 = t16*t16
++          t8 = t16*topo%alphanb(ij)
++          t26 = exp(-t8)*param%repz(ati)*param%repz(atj)*param%repscaln
++          erep = erep+t26/rab
++          if (present(frozen_mask)) then
++            if (frozen_mask(iat).and.frozen_mask(jat)) cycle
++          end if
++          t27 = t26*(1.5_wp*t8+1.0_wp)/t19
++          r3 = (xyz(:,iat)-xyz(:,jat))*t27
++          if (present(frozen_mask)) then
++            if (.not.frozen_mask(iat)) g(:,iat) = g(:,iat)-r3
++            if (.not.frozen_mask(jat)) g(:,jat) = g(:,jat)+r3
++          else
++            g(:,iat) = g(:,iat)-r3
++            g(:,jat) = g(:,jat)+r3
++          end if
++        end do
+       end do
+-    end do
+-    !$omp end parallel do
++      !$omp end parallel do
++    end if
+ !      if (pr) call timer%measure(2)
+ 
+ !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+@@ -333,7 +828,14 @@ contains  !> MODULE PROCEDURES START HERE
+ !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+ 
+ !      if (pr) call timer%measure(3,'dCN')
+-    call gfnff_dlogcoord(n,at,xyz,srab,cn,dcn,cnthr,param) ! new erf used in GFN0
++    if (present(frozen_mask).and.work%frozen_cache_valid) then
++      call gfnff_dlogcoord(n,at,xyz,srab,cn,dcn,cnthr,param, &
++     & frozen_mask,work%raw_cn_static,work%cn_cache_valid, &
++     & work%frozen_prefix,work%prefix_frozen)
++      work%cn_cache_thr = cnthr
++    else
++      call gfnff_dlogcoord(n,at,xyz,srab,cn,dcn,cnthr,param)
++    end if
+     if (sum(topo%nr_hb) .gt. 0) call dncoord_erf(n,at,xyz,param%rcov,hb_cn,hb_dcn,900.0d0,topo) ! HB erf CN
+ !      if (pr) call timer%measure(3)
+ 
+@@ -360,7 +862,6 @@ contains  !> MODULE PROCEDURES START HERE
+            & param%d3r0,sqrtZr4r2,4.0d0,param%dispscale,cn,dcn,edisp,g)
+       end if
+     end if
+-    deallocate (d3list)
+ !      if (pr) call timer%measure(5)
+ 
+ !!!!!!!!
+@@ -397,7 +898,6 @@ contains  !> MODULE PROCEDURES START HERE
+   !> Each iteration owns one gradient vector, eliminating the full-array OpenMP
+   !> reduction. Active-active pairs are visited once from each endpoint; their
+   !> two endpoint forces are therefore accumulated without races.
+-        allocate(active_atoms(nactive))
+         iact = 0
+         do i = 1,n
+           if (.not.frozen_mask(i)) then
+@@ -430,7 +930,6 @@ contains  !> MODULE PROCEDURES START HERE
+           g(:,i) = gactive
+         end do
+         !$omp end parallel do
+-        deallocate(active_atoms)
+       end if
+     else
+       !$omp parallel do default(none) reduction (+:g) &
+@@ -453,7 +952,6 @@ contains  !> MODULE PROCEDURES START HERE
+       end do
+       !$omp end parallel do
+     end if
+-    if (.not.pr) deallocate (eeqtmp)
+ 
+ #ifdef WITH_GBSA
+     if (allocated(solvation)) then
+@@ -482,10 +980,8 @@ contains  !> MODULE PROCEDURES START HERE
+ 
+ !      if (pr) call timer%measure(7,'bonds')
+     if (topo%nbond .gt. 0) then
+-      allocate (grab0(3,n,topo%nbond),rab0(topo%nbond))
+       rab0(:) = topo%vbond(1,:) ! shifts
+       call gfnffdrab(n,at,xyz,cn,dcn,topo%nbond,topo%blist,rab0,grab0)
+-      deallocate (dcn)
+ 
+       !$omp parallel do default(none) reduction(+:g, ebond) &
+       !$omp shared(grab0, topo, param, rab0, srab, xyz, at, hb_cn, hb_dcn, n) &
+@@ -508,17 +1004,27 @@ contains  !> MODULE PROCEDURES START HERE
+       end do
+       !$omp end parallel do
+ 
+-      deallocate (hb_dcn)
+ 
+ !!!!!!!!!!!!!!!!!!
+ ! bonded REP
+ !!!!!!!!!!!!!!!!!!
+ 
++      if (work%static_cache_valid) then
++        erep = erep+work%cached_bond_rep_total
++        nloop = work%n_dynamic_bonds
++      else
++        nloop = topo%nbond
++      end if
+       !$omp parallel do default(none) reduction(+:erep, g) &
+-      !$omp shared(topo, param, at, sqrab, srab, xyz, frozen_mask) &
+-      !$omp private(i, iat, jat, ij, xa, ya, za, dx, dy, dz, r2, rab, ati, atj, &
++      !$omp shared(topo, param, at, sqrab, srab, xyz, frozen_mask, work, nloop) &
++      !$omp private(m, i, iat, jat, ij, xa, ya, za, dx, dy, dz, r2, rab, ati, atj, &
+       !$omp& alpha, repab, t16, t19, t26, t27)
+-      do i = 1,topo%nbond
++      do m = 1,nloop
++        if (work%static_cache_valid) then
++          i = work%dynamic_bond_idx(m)
++        else
++          i = m
++        end if
+         iat = topo%blist(1,i)
+         jat = topo%blist(2,i)
+         ij = iat*(iat-1)/2+jat
+@@ -534,14 +1040,11 @@ contains  !> MODULE PROCEDURES START HERE
+         atj = at(jat)
+         alpha = sqrt(param%repa(ati)*param%repa(atj))
+         repab = param%repz(ati)*param%repz(atj)*param%repscalb
+-        t16 = r2**0.75d0
++        t16 = r2**0.75_wp
+         t19 = t16*t16
+         t26 = exp(-al
