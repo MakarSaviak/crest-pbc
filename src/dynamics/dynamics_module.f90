@@ -140,6 +140,7 @@ contains  !> MODULE PROCEDURES START HERE
     real(wp) :: Tav,Epav,Ekav,Eerror
 
     real(wp),allocatable :: grd(:,:)
+    real(wp),allocatable :: grdmtd(:,:)
     real(wp),allocatable :: velo(:,:)
     real(wp),allocatable :: vel(:,:)
     real(wp),allocatable :: veln(:,:)
@@ -160,7 +161,7 @@ contains  !> MODULE PROCEDURES START HERE
     call initsignal()
 
 !>--- pre-settings and calculations
-    !$omp critical
+    !$omp critical(crest_md_setup)
     call dat%defaults() !> check for unset parameters
     term = 0
     tstep_au = dat%tstep*fstoau
@@ -193,11 +194,12 @@ contains  !> MODULE PROCEDURES START HERE
 !>--- allocate data fields
     allocate (xyz_angstrom(3,mol%nat))
     allocate (molo%at(mol%nat),molo%xyz(3,mol%nat))
-    allocate (grd(3,mol%nat),vel(3,mol%nat),velo(3,mol%nat),source=0.0_wp)
+    allocate (grd(3,mol%nat),grdmtd(3,mol%nat),source=0.0_wp)
+    allocate (vel(3,mol%nat),velo(3,mol%nat),source=0.0_wp)
     allocate (veln(3,mol%nat),acc(3,mol%nat),mass(mol%nat),source=0.0_wp)
     allocate (dat%blocke(dat%blockl),dat%blockt(dat%blockl))
     allocate (dat%blockrege(dat%maxblock))
-    !$omp end critical
+    !$omp end critical(crest_md_setup)
 
 !>--- settings printout
     if (pr) then
@@ -229,7 +231,7 @@ contains  !> MODULE PROCEDURES START HERE
     end if
 
 !>--- set atom masses
-    !$omp critical
+    !$omp critical(crest_md_setup)
     molmass = 0.0_wp
     do i = 1,mol%nat
       molmass = molmass+ams(mol%at(i))
@@ -242,7 +244,7 @@ contains  !> MODULE PROCEDURES START HERE
       end if
     end do
     molmass = molmass*amutokg
-    !$omp end critical
+    !$omp end critical(crest_md_setup)
 
 !>--- initialize velocities (or read from restart file)
     if (dat%thermostat) then
@@ -252,18 +254,24 @@ contains  !> MODULE PROCEDURES START HERE
     end if
     edum = f*dat%tsoll*0.5_wp*kB*float(nfreedom)
     rtshift = 0.0_wp
-    if(.not.dat%restart .or. .not.allocated(dat%restartfile))then 
-     call mdinitu(mol,dat,velo,mass,edum,pr)
+    if(.not.dat%restart .or. .not.allocated(dat%restartfile))then
+      !$omp critical(crest_md_rng)
+      call mdinitu(mol,dat,velo,mass,edum,pr)
+      !$omp end critical(crest_md_rng)
     else
-     call rdmdrestart(mol,dat,velo,fail,rtshift)
-     if(fail)then
+      !$omp critical(crest_md_io)
+      call rdmdrestart(mol,dat,velo,fail,rtshift)
+      !$omp end critical(crest_md_io)
+      if(fail)then
+        !$omp critical(crest_md_rng)
         call mdinitu(mol,dat,velo,mass,edum,pr)
-     else
-       call ekinet(mol%nat,velo,mass,ekin)
-       temp = 2.0_wp*ekin/float(nfreedom)/kB
-       tav = temp
-     endif
-    endif 
+        !$omp end critical(crest_md_rng)
+      else
+        call ekinet(mol%nat,velo,mass,ekin)
+        temp = 2.0_wp*ekin/float(nfreedom)/kB
+        tav = temp
+      endif
+    endif
     call ekinet(mol%nat,velo,mass,ekin)
     if(calc%nfreeze > 0)then
        do i = 1,mol%nat
@@ -276,11 +284,11 @@ contains  !> MODULE PROCEDURES START HERE
      endif
 
 !>--- initialize MTDs (if required)
-    !$omp critical
+    !$omp critical(crest_md_setup)
     if (dat%simtype == type_mtd) then
       call md_init_mtd(mol,dat,pr)
     end if
-    !$omp end critical
+    !$omp end critical(crest_md_setup)
 
     !>--- initialize trajectory file
     if (allocated(dat%trajectoryfile)) then
@@ -289,9 +297,9 @@ contains  !> MODULE PROCEDURES START HERE
       write (commentline,'(a,i0,a)') 'crest_',dat%md_index,'.trj'
       trajectory = trim(commentline)
     end if
-    !$omp critical
+    !$omp critical(crest_md_io)
     open (newunit=trj,file=trajectory)
-    !$omp end critical
+    !$omp end critical(crest_md_io)
 
 !>--- begin printout
     if (pr) then
@@ -334,10 +342,8 @@ contains  !> MODULE PROCEDURES START HERE
       !>>-- STEP 1.5: calculate metadynamics bias
       if (dat%simtype == type_mtd) then
         !> MTD energy and gradient are added to epot and grd, respectively.
-        call md_calc_mtd(mol,dat,epot,grd,pr)
-        !$omp critical
-        call md_update_mtd(mol,dat,calc,pr)
-        !$omp end critical
+        call md_calc_mtd(mol,dat,epot,grd,grdmtd,pr)
+        call md_update_mtd(mol,dat,pr)
       end if
 
       !>--- block data printouts
@@ -345,9 +351,9 @@ contains  !> MODULE PROCEDURES START HERE
       !>--- MD restart files written for each block rather than at each timestep to reduce I/O
       if(bdump)then
         rt = float(t)*dat%tstep + rtshift
-        !$omp critical
-        call wrmdrestart(mol,dat,velo,rt) 
-        !$omp end critical
+        !$omp critical(crest_md_io)
+        call wrmdrestart(mol,dat,velo,rt)
+        !$omp end critical(crest_md_io)
       endif 
 
       !===========================================!
@@ -355,11 +361,11 @@ contains  !> MODULE PROCEDURES START HERE
       if (dcount == dat%sdump) then
         dcount = 0
         dat%dumped = dat%dumped+1
-        !$omp critical
         xyz_angstrom = mol%xyz*bohr
         write (commentline,'(a,f22.12,1x,a)') 'Epot =',epot,''
+        !$omp critical(crest_md_io)
         call wrxyz(trj,mol%nat,mol%at,xyz_angstrom,commentline)
-        !$omp end critical
+        !$omp end critical(crest_md_io)
       end if
       if ((printcount == dat%printstep).or.(t == 1)) then
         if (t > 1) printcount = 0
@@ -394,11 +400,9 @@ contains  !> MODULE PROCEDURES START HERE
       endif
 
       !>--- store positions (at t); velocities are at t-1/2dt
-      !$omp critical
       molo%nat = mol%nat
       molo%at = mol%at
       molo%xyz = mol%xyz
-      !$omp end critical
 
       !>>-- STEP 2: temperature and pressure/density control
       !>--- estimate(!) velocities at t
@@ -468,9 +472,9 @@ contains  !> MODULE PROCEDURES START HERE
 !===============================================================!
 !===============================================================!
 !>--- close trajectory file
-    !$omp critical
+    !$omp critical(crest_md_io)
     close (trj)
-    !$omp end critical
+    !$omp end critical(crest_md_io)
 
 !>--- averages printout
     if (pr) then
@@ -485,7 +489,9 @@ contains  !> MODULE PROCEDURES START HERE
 
 !>--- write restart file
     rt = float(dat%length_steps)*dat%tstep + rtshift
+    !$omp critical(crest_md_io)
     call wrmdrestart(mol,dat,velo,rt)
+    !$omp end critical(crest_md_io)
 
 !>--- termination printout
     if (pr) then
@@ -502,7 +508,7 @@ contains  !> MODULE PROCEDURES START HERE
 !>--- deallocate data
     deallocate (dat%blockrege,dat%blockt,dat%blocke)
     deallocate (mass,acc,veln)
-    deallocate (vel,velo,grd)
+    deallocate (vel,velo,grd,grdmtd)
     deallocate (molo%xyz,molo%at)
     deallocate (xyz_angstrom)
 
@@ -1089,7 +1095,7 @@ contains  !> MODULE PROCEDURES START HERE
   end subroutine md_add_mtd
 
 !========================================================================================!
-  subroutine md_update_mtd(mol,dat,calc,pr)
+  subroutine md_update_mtd(mol,dat,pr)
 !*********************************************
 !* Update the collective variables for each
 !* metadynamics potential saved in mddata
@@ -1097,7 +1103,6 @@ contains  !> MODULE PROCEDURES START HERE
     implicit none
     type(coord) :: mol
     type(mddata) :: dat
-    type(calcdata) :: calc
     logical :: pr
     integer :: i
 
@@ -1117,38 +1122,31 @@ contains  !> MODULE PROCEDURES START HERE
   end subroutine md_update_mtd
 
 !========================================================================================!
-  subroutine md_calc_mtd(mol,dat,epot,grd,pr)
+  subroutine md_calc_mtd(mol,dat,epot,grd,grdmtd,pr)
 !***********************************************
 !* Calculate energy and gradient contributions
 !* from metadynamics potentials and add them to
 !* the current total energy and gradient
 !***********************************************
-!$  use omp_lib
     implicit none
     type(coord) :: mol
     type(mddata) :: dat
     real(wp),intent(inout) :: epot
     real(wp),intent(inout) :: grd(3,mol%nat)
+    real(wp),intent(inout) :: grdmtd(3,mol%nat)
     logical :: pr
     integer :: i
     real(wp) :: emtd
-    real(wp),allocatable :: grdmtd(:,:)
 
     if (dat%simtype .ne. type_mtd) return
     if (dat%npot < 1) return
 
-    !$omp critical
-    allocate (grdmtd(3,mol%nat),source=0.0_wp)
-    !$omp end critical
+    grdmtd = 0.0_wp
     do i = 1,dat%npot
       call calc_mtd(mol,dat%mtd(i),emtd,grdmtd)
       epot = epot+emtd
       grd = grd+grdmtd
     end do
-    !$omp critical
-    deallocate (grdmtd)
-    !$omp end critical
-
     return
   end subroutine md_calc_mtd
 

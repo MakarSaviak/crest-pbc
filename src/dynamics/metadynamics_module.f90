@@ -298,8 +298,11 @@ contains  !> MODULE PROCEDURES START HERE
         pot%ncur = pot%ncur+1
         pot%cvxyz(:,:,pot%ncur) = mol%xyz(:,:)
         if (pot%ncur == 1) then
-          !>--- The first one should be sligthly distorted
+          !>--- The first one should be slightly distorted. Keep the global
+          !>--- Fortran RNG serialized, but only for this one-time operation.
+          !$omp critical(crest_md_rng)
           call rmsdcv_perturb(mol%nat,pot%cvxyz(:,:,pot%ncur))
+          !$omp end critical(crest_md_rng)
         end if
         if (pr) then
           write (*,'(2x,"adding snapshot to metadynamics bias, now at ",i0," CVs")') pot%ncur
