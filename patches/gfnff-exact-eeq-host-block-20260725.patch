@@ -1,0 +1,347 @@
+From d84ea57594dab47b70bf609dc0fa4667544b0cc7 Mon Sep 17 00:00:00 2001
+From: OpenAI <local@openai.invalid>
+Date: Sat, 25 Jul 2026 23:55:52 +0000
+Subject: [PATCH] Reuse exact frozen-host EEQ inverse
+
+---
+ subprojects/gfnff/src/gfnff_engrad.F90 | 204 ++++++++++++++++++++++++-
+ test/test_gfnff.F90                    |   4 +-
+ 2 files changed, 202 insertions(+), 6 deletions(-)
+
+diff --git a/subprojects/gfnff/src/gfnff_engrad.F90 b/subprojects/gfnff/src/gfnff_engrad.F90
+index 07efb97..b12e9c4 100644
+--- a/subprojects/gfnff/src/gfnff_engrad.F90
++++ b/subprojects/gfnff/src/gfnff_engrad.F90
+@@ -74,6 +74,11 @@ module gfnff_engrad_module
+     real(sp),allocatable :: eeq_a4(:,:),eeq_x4(:),eeq_lapack_work4(:)
+     integer,allocatable :: eeq_ipiv(:)
+     real(wp),allocatable :: eeq_frozen_block(:,:)
++    real(wp),allocatable :: eeq_host_inverse(:,:),eeq_block_k(:,:),eeq_block_y(:,:)
++    real(wp),allocatable :: eeq_block_s(:,:),eeq_host_rhs(:),eeq_host_solution(:)
++    real(wp),allocatable :: eeq_block_rhs(:),eeq_block_z(:)
++    real(wp),allocatable :: eeq_host_fact_work(:),eeq_block_fact_work(:),eeq_host_inv_work(:)
++    integer,allocatable :: eeq_host_ipiv(:),eeq_block_ipiv(:)
+     integer,allocatable :: active_pair_i(:),active_pair_j(:),active_pair_idx(:)
+     integer,allocatable :: dynamic_bond_idx(:),dynamic_angle_idx(:),dynamic_torsion_idx(:)
+     integer :: n_active_pairs = 0
+@@ -86,6 +91,7 @@ module gfnff_engrad_module
+     logical :: static_cache_valid = .false.
+     logical :: cn_cache_valid = .false.
+     logical :: eeq_frozen_block_valid = .false.
++    logical :: eeq_host_inverse_valid = .false.
+     real(wp) :: static_repthr = -1.0_wp
+     real(wp) :: static_dispthr = -1.0_wp
+     real(wp) :: cn_cache_thr = -1.0_wp
+@@ -98,6 +104,7 @@ module gfnff_engrad_module
+     procedure :: prepare_frozen => gfnff_workspace_prepare_frozen
+     procedure :: prepare_static => gfnff_workspace_prepare_static
+     procedure :: prepare_eeq_frozen_block => gfnff_workspace_prepare_eeq_frozen_block
++    procedure :: prepare_eeq_host_inverse => gfnff_workspace_prepare_eeq_host_inverse
+     procedure :: release => gfnff_workspace_release
+   end type gfnff_workspace
+ 
+@@ -142,6 +149,7 @@ contains  !> MODULE PROCEDURES START HERE
+     self%static_cache_valid = .false.
+     self%cn_cache_valid = .false.
+     self%eeq_frozen_block_valid = .false.
++    self%eeq_host_inverse_valid = .false.
+     self%n_active_pairs = 0
+     self%frozen_prefix = 0
+     self%prefix_frozen = .false.
+@@ -172,6 +180,7 @@ contains  !> MODULE PROCEDURES START HERE
+       self%static_cache_valid = .false.
+       self%cn_cache_valid = .false.
+       self%eeq_frozen_block_valid = .false.
++      self%eeq_host_inverse_valid = .false.
+       self%n_active_pairs = 0
+       self%frozen_prefix = 0
+       self%prefix_frozen = .false.
+@@ -187,6 +196,7 @@ contains  !> MODULE PROCEDURES START HERE
+         self%static_cache_valid = .false.
+         self%cn_cache_valid = .false.
+         self%eeq_frozen_block_valid = .false.
++        self%eeq_host_inverse_valid = .false.
+       else
+         do i = 1,n
+           if (frozen_mask(i)) then
+@@ -195,6 +205,7 @@ contains  !> MODULE PROCEDURES START HERE
+               self%static_cache_valid = .false.
+               self%cn_cache_valid = .false.
+               self%eeq_frozen_block_valid = .false.
++              self%eeq_host_inverse_valid = .false.
+               exit
+             end if
+           end if
+@@ -247,6 +258,7 @@ contains  !> MODULE PROCEDURES START HERE
+     self%static_cache_valid = .false.
+     self%cn_cache_valid = .false.
+     self%eeq_frozen_block_valid = .false.
++    self%eeq_host_inverse_valid = .false.
+   end subroutine gfnff_workspace_prepare_frozen
+ 
+   subroutine gfnff_workspace_prepare_eeq_frozen_block(self,n,r,topo)
+@@ -260,6 +272,7 @@ contains  !> MODULE PROCEDURES START HERE
+ 
+     if (.not.self%frozen_cache_valid .or. .not.self%prefix_frozen) then
+       self%eeq_frozen_block_valid = .false.
++      self%eeq_host_inverse_valid = .false.
+       return
+     end if
+     if (self%eeq_frozen_block_valid) return
+@@ -282,6 +295,89 @@ contains  !> MODULE PROCEDURES START HERE
+     self%eeq_frozen_block_valid = .true.
+   end subroutine gfnff_workspace_prepare_eeq_frozen_block
+ 
++  subroutine gfnff_workspace_release_eeq_host_solver(self)
++    class(gfnff_workspace),intent(inout) :: self
++
++    if (allocated(self%eeq_host_inverse)) deallocate(self%eeq_host_inverse)
++    if (allocated(self%eeq_block_k)) deallocate(self%eeq_block_k)
++    if (allocated(self%eeq_block_y)) deallocate(self%eeq_block_y)
++    if (allocated(self%eeq_block_s)) deallocate(self%eeq_block_s)
++    if (allocated(self%eeq_host_rhs)) deallocate(self%eeq_host_rhs)
++    if (allocated(self%eeq_host_solution)) deallocate(self%eeq_host_solution)
++    if (allocated(self%eeq_block_rhs)) deallocate(self%eeq_block_rhs)
++    if (allocated(self%eeq_block_z)) deallocate(self%eeq_block_z)
++    if (allocated(self%eeq_host_fact_work)) deallocate(self%eeq_host_fact_work)
++    if (allocated(self%eeq_block_fact_work)) deallocate(self%eeq_block_fact_work)
++    if (allocated(self%eeq_host_inv_work)) deallocate(self%eeq_host_inv_work)
++    if (allocated(self%eeq_host_ipiv)) deallocate(self%eeq_host_ipiv)
++    if (allocated(self%eeq_block_ipiv)) deallocate(self%eeq_block_ipiv)
++    self%eeq_host_inverse_valid = .false.
++  end subroutine gfnff_workspace_release_eeq_host_solver
++
++  subroutine gfnff_workspace_prepare_eeq_host_inverse(self,n,topo,io)
++    class(gfnff_workspace),intent(inout) :: self
++    integer,intent(in) :: n
++    type(TGFFTopology),intent(in) :: topo
++    integer,intent(out) :: io
++    integer :: nf,na,p,i,j,io1,io2,stat_alloc
++    logical :: layout_ok
++
++    io = 0
++    if (.not.self%eeq_frozen_block_valid .or. .not.self%prefix_frozen) return
++    nf = self%frozen_prefix
++    na = n-nf
++    p = na+topo%nfrag
++    if (nf < 1 .or. na < 1 .or. p >= nf) return
++    if (self%eeq_host_inverse_valid) return
++
++    layout_ok = allocated(self%eeq_host_inverse) .and. &
++   &            allocated(self%eeq_block_k) .and. allocated(self%eeq_block_y) .and. &
++   &            allocated(self%eeq_block_s) .and. allocated(self%eeq_host_rhs) .and. &
++   &            allocated(self%eeq_host_solution) .and. &
++   &            allocated(self%eeq_block_rhs) .and. allocated(self%eeq_block_z) .and. &
++   &            allocated(self%eeq_host_ipiv) .and. allocated(self%eeq_block_ipiv) .and. &
++   &            allocated(self%eeq_host_inv_work)
++    if (layout_ok) then
++      layout_ok = size(self%eeq_host_inverse,1) == nf .and. &
++     &            size(self%eeq_host_inverse,2) == nf .and. &
++     &            size(self%eeq_block_s,1) == p .and. size(self%eeq_block_s,2) == p
++    end if
++    if (.not.layout_ok) call gfnff_workspace_release_eeq_host_solver(self)
++    if (.not.allocated(self%eeq_host_inverse)) then
++      allocate(self%eeq_host_inverse(nf,nf),self%eeq_block_k(nf,p), &
++     &         self%eeq_block_y(nf,p),self%eeq_block_s(p,p), &
++     &         self%eeq_host_rhs(nf),self%eeq_host_solution(nf), &
++     &         self%eeq_block_rhs(p),self%eeq_block_z(p), &
++     &         self%eeq_host_ipiv(nf),self%eeq_block_ipiv(p), &
++     &         self%eeq_host_inv_work(nf),stat=stat_alloc)
++      if (stat_alloc /= 0) then
++        call gfnff_workspace_release_eeq_host_solver(self)
++        io = -1000
++        return
++      end if
++    end if
++
++    self%eeq_host_inverse = self%eeq_frozen_block(1:nf,1:nf)
++    call sytrf_cached_wrap(self%eeq_host_inverse,self%eeq_host_ipiv, &
++   &                       self%eeq_host_fact_work,io1)
++    if (io1 /= 0) then
++      io = io1
++      return
++    end if
++    call lapack_sytri('U',nf,self%eeq_host_inverse,nf,self%eeq_host_ipiv, &
++   &                  self%eeq_host_inv_work,io2)
++    if (io2 /= 0) then
++      io = io2
++      return
++    end if
++    do i = 1,nf
++      do j = 1,i-1
++        self%eeq_host_inverse(i,j) = self%eeq_host_inverse(j,i)
++      end do
++    end do
++    self%eeq_host_inverse_valid = .true.
++  end subroutine gfnff_workspace_prepare_eeq_host_inverse
++
+   subroutine gfnff_workspace_prepare_static(self,n,at,xyz,frozen_mask,repthr,dispthr,param,topo,sqrab,srab)
+     class(gfnff_workspace),intent(inout) :: self
+     integer,intent(in) :: n,at(n)
+@@ -411,6 +507,7 @@ contains  !> MODULE PROCEDURES START HERE
+     if (allocated(self%eeq_lapack_work)) deallocate(self%eeq_lapack_work)
+     if (allocated(self%eeq_lapack_work4)) deallocate(self%eeq_lapack_work4)
+     if (allocated(self%eeq_frozen_block)) deallocate(self%eeq_frozen_block)
++    call gfnff_workspace_release_eeq_host_solver(self)
+     if (allocated(self%active_pair_i)) deallocate(self%active_pair_i)
+     if (allocated(self%active_pair_j)) deallocate(self%active_pair_j)
+     if (allocated(self%active_pair_idx)) deallocate(self%active_pair_idx)
+@@ -426,6 +523,7 @@ contains  !> MODULE PROCEDURES START HERE
+     self%static_cache_valid = .false.
+     self%cn_cache_valid = .false.
+     self%eeq_frozen_block_valid = .false.
++    self%eeq_host_inverse_valid = .false.
+     self%static_repthr = -1.0_wp
+     self%static_dispthr = -1.0_wp
+     self%cn_cache_thr = -1.0_wp
+@@ -2016,14 +2114,14 @@ contains  !> MODULE PROCEDURES START HERE
+     integer,intent(out) :: io   !> return status
+     !> LOCAL
+     integer :: m,i,j,k,ii,ij,nf
+-    integer :: io1,io2
++    integer :: io1,io2,io_block
+     real(wp) :: gammij,tsqrt2pi,tmp
+     real(wp),pointer :: A(:,:),x(:)
+     real(sp),pointer :: A4(:,:),x4(:)
+     integer,pointer :: ipiv(:)
+ !>  parameter
+     parameter(tsqrt2pi=0.797884560802866_wp)
+-    logical :: exitRun
++    logical :: exitRun,use_block_solver
+ 
+     io = 0  !> return status
+ 
+@@ -2113,9 +2211,28 @@ contains  !> MODULE PROCEDURES START HERE
+       call sytrs_wrap(A4,x4,ipiv,io2)
+       q(1:n) = real(x4(1:n),wp)
+     else
+-      call sytrf_cached_wrap(A,ipiv,work%eeq_lapack_work,io1)
+-      call sytrs_wrap(A,x,ipiv,io2)
+-      q(1:n) = x(1:n)
++      io_block = 0
++      use_block_solver = .true.
++#ifdef WITH_GBSA
++      use_block_solver = .not.allocated(gbsa)
++#endif
++      if (use_block_solver) then
++        call work%prepare_eeq_host_inverse(n,topo,io_block)
++      end if
++      use_block_solver = use_block_solver .and. io_block == 0 &
++     &                   .and. work%eeq_host_inverse_valid
++      if (use_block_solver) then
++        call solve_eeq_host_block(n,topo%nfrag,work%frozen_prefix,topo%fraglist, &
++       &                         topo%qfrag,A,x,work,q,io1,io2)
++      else
++        io1 = io_block
++        io2 = 0
++      end if
++      if (.not.use_block_solver .or. io1 /= 0 .or. io2 /= 0) then
++        call sytrf_cached_wrap(A,ipiv,work%eeq_lapack_work,io1)
++        call sytrs_wrap(A,x,ipiv,io2)
++        q(1:n) = x(1:n)
++      end if
+     end if
+ 
+     exitRun = (io1 /= 0).or.(io2 /= 0)
+@@ -2142,6 +2259,83 @@ contains  !> MODULE PROCEDURES START HERE
+ 
+   end subroutine goed_gfnff
+ 
++  subroutine solve_eeq_host_block(n,nfrag,nf,fraglist,qfrag,A,x,work,q,io1,io2)
++    integer,intent(in) :: n,nfrag,nf,fraglist(n)
++    real(wp),intent(in) :: qfrag(nfrag),A(n+nfrag,n+nfrag),x(n+nfrag)
++    type(gfnff_workspace),intent(inout) :: work
++    real(wp),intent(out) :: q(n)
++    integer,intent(out) :: io1,io2
++    integer :: na,p,i,j,k,ia
++
++    na = n-nf
++    p = na+nfrag
++    io1 = 0
++    io2 = 0
++    if (.not.work%eeq_host_inverse_valid) then
++      io1 = -1
++      return
++    end if
++    if (size(work%eeq_block_s,1) /= p) then
++      io1 = -2
++      return
++    end if
++
++    ! K couples the frozen host block to active atomic charges and all
++    ! fragment-charge multipliers. The fragment columns are fixed 0/1 entries.
++    work%eeq_block_k = 0.0_wp
++    do j = 1,na
++      do i = 1,nf
++        work%eeq_block_k(i,j) = A(i,nf+j)
++      end do
++    end do
++    do i = 1,nf
++      k = fraglist(i)
++      if (k >= 1 .and. k <= nfrag) work%eeq_block_k(i,na+k) = 1.0_wp
++    end do
++
++    ! Y = H^{-1} K and y0 = H^{-1} b_H, using the cached exact inverse of
++    ! the invariant frozen-host EEQ block H.
++    work%eeq_block_y = 0.0_wp
++    call gemm(work%eeq_host_inverse,work%eeq_block_k,work%eeq_block_y)
++    work%eeq_host_rhs = x(1:nf)
++    work%eeq_host_solution = 0.0_wp
++    call gemv(work%eeq_host_inverse,work%eeq_host_rhs,work%eeq_host_solution)
++
++    ! Dynamic Schur complement S = D - K^T H^{-1} K.
++    work%eeq_block_s = 0.0_wp
++    do j = 1,na
++      do i = 1,na
++        work%eeq_block_s(i,j) = A(nf+i,nf+j)
++      end do
++    end do
++    do ia = 1,na
++      k = fraglist(nf+ia)
++      if (k >= 1 .and. k <= nfrag) then
++        work%eeq_block_s(ia,na+k) = 1.0_wp
++        work%eeq_block_s(na+k,ia) = 1.0_wp
++      end if
++    end do
++    call gemm(work%eeq_block_k,work%eeq_block_y,work%eeq_block_s, &
++   &          transa='t',alpha=-1.0_wp,beta=1.0_wp)
++
++    work%eeq_block_rhs(1:na) = x(nf+1:n)
++    if (nfrag > 0) work%eeq_block_rhs(na+1:p) = qfrag
++    call gemv(work%eeq_block_k,work%eeq_host_solution,work%eeq_block_rhs, &
++   &          alpha=-1.0_wp,beta=1.0_wp,trans='t')
++    work%eeq_block_z = work%eeq_block_rhs
++
++    call sytrf_cached_wrap(work%eeq_block_s,work%eeq_block_ipiv, &
++   &                       work%eeq_block_fact_work,io1)
++    if (io1 /= 0) return
++    call sytrs_wrap(work%eeq_block_s,work%eeq_block_z,work%eeq_block_ipiv,io2)
++    if (io2 /= 0) return
++
++    q(nf+1:n) = work%eeq_block_z(1:na)
++    q(1:nf) = work%eeq_host_solution
++    call gemv(work%eeq_block_y,work%eeq_block_z,q(1:nf), &
++   &          alpha=-1.0_wp,beta=1.0_wp)
++  end subroutine solve_eeq_host_block
++
+ !ccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc
+ ! HB energy and analytical gradient
+ !ccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc
+diff --git a/test/test_gfnff.F90 b/test/test_gfnff.F90
+index b5c3db0..6d4dd8c 100644
+--- a/test/test_gfnff.F90
++++ b/test/test_gfnff.F90
+@@ -132,7 +132,9 @@ contains  !> Unit tests for using gfnff in crest
+     call get_testmol('caffeine',mol)
+     allocate(gref(3,mol%nat),gfrozen(3,mol%nat))
+ 
+-    nfrozen = mol%nat/2
++    ! A three-quarter frozen prefix ensures the exact EEQ host-block solver
++    ! is exercised (active atoms + fragment constraints are the small block).
++    nfrozen = 3*mol%nat/4
+     frozen%nfreeze = nfrozen
+     allocate(frozen%freezelist(mol%nat),source=.false.)
+     frozen%freezelist(1:nfrozen) = .true.
+-- 
+2.47.3
+
