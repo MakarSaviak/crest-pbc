@@ -1,0 +1,509 @@
+From 584cb8d7532a2ae98efd5daabf96ebc9c3301369 Mon Sep 17 00:00:00 2001
+From: OpenAI <local@openai.invalid>
+Date: Sat, 25 Jul 2026 23:16:06 +0000
+Subject: [PATCH] Persist exact EEQ work arrays
+
+---
+ subprojects/gfnff/src/gfnff_engrad.F90       | 196 +++++++++++++------
+ subprojects/gfnff/src/gfnff_math_wrapper.f90 |  85 ++++++++
+ 2 files changed, 226 insertions(+), 55 deletions(-)
+
+diff --git a/subprojects/gfnff/src/gfnff_engrad.F90 b/subprojects/gfnff/src/gfnff_engrad.F90
+index 5ad07e3..07efb97 100644
+--- a/subprojects/gfnff/src/gfnff_engrad.F90
++++ b/subprojects/gfnff/src/gfnff_engrad.F90
+@@ -58,6 +58,7 @@ module gfnff_engrad_module
+   !> No charge, CN, D3 coefficient, cutoff, or force-field approximation is used.
+   type :: gfnff_workspace
+     integer :: nat = 0
++    integer :: nfrag = 0
+     integer :: nbond = 0
+     integer :: nangl = 0
+     integer :: ntors = 0
+@@ -69,6 +70,10 @@ module gfnff_engrad_module
+     logical,allocatable :: frozen_pair(:),frozen_mask_ref(:)
+     real(wp),allocatable :: frozen_sqrab(:),frozen_srab(:),frozen_reference(:,:)
+     real(wp),allocatable :: raw_cn_static(:)
++    real(wp),allocatable :: eeq_a(:,:),eeq_x(:),eeq_lapack_work(:)
++    real(sp),allocatable :: eeq_a4(:,:),eeq_x4(:),eeq_lapack_work4(:)
++    integer,allocatable :: eeq_ipiv(:)
++    real(wp),allocatable :: eeq_frozen_block(:,:)
+     integer,allocatable :: active_pair_i(:),active_pair_j(:),active_pair_idx(:)
+     integer,allocatable :: dynamic_bond_idx(:),dynamic_angle_idx(:),dynamic_torsion_idx(:)
+     integer :: n_active_pairs = 0
+@@ -80,6 +85,7 @@ module gfnff_engrad_module
+     logical :: frozen_cache_valid = .false.
+     logical :: static_cache_valid = .false.
+     logical :: cn_cache_valid = .false.
++    logical :: eeq_frozen_block_valid = .false.
+     real(wp) :: static_repthr = -1.0_wp
+     real(wp) :: static_dispthr = -1.0_wp
+     real(wp) :: cn_cache_thr = -1.0_wp
+@@ -91,6 +97,7 @@ module gfnff_engrad_module
+     procedure :: ensure => gfnff_workspace_ensure
+     procedure :: prepare_frozen => gfnff_workspace_prepare_frozen
+     procedure :: prepare_static => gfnff_workspace_prepare_static
++    procedure :: prepare_eeq_frozen_block => gfnff_workspace_prepare_eeq_frozen_block
+     procedure :: release => gfnff_workspace_release
+   end type gfnff_workspace
+ 
+@@ -103,16 +110,17 @@ contains  !> MODULE PROCEDURES START HERE
+ !========================================================================================!
+ !========================================================================================!
+ 
+-  subroutine gfnff_workspace_ensure(self,n,nbond,nangl,ntors)
++  subroutine gfnff_workspace_ensure(self,n,nfrag,nbond,nangl,ntors)
+     class(gfnff_workspace),intent(inout) :: self
+-    integer,intent(in) :: n,nbond,nangl,ntors
+-    integer :: npair
++    integer,intent(in) :: n,nfrag,nbond,nangl,ntors
++    integer :: npair,m
+ 
+-    if (self%nat == n .and. self%nbond == nbond .and. self%nangl == nangl .and. &
++    if (self%nat == n .and. self%nfrag == nfrag .and. self%nbond == nbond .and. self%nangl == nangl .and. &
+    &    self%ntors == ntors .and. allocated(self%sqrab)) return
+ 
+     call self%release()
+     npair = n*(n+1)/2
++    m = n+nfrag
+     allocate(self%sqrab(npair),self%srab(npair),self%qtmp(n),self%g5tmp(3,n), &
+    &         self%eeqtmp(2,npair),self%d3list(2,npair),self%dcn(3,n,n), &
+    &         self%cn(n),self%hb_dcn(3,n,n),self%hb_cn(n), &
+@@ -125,12 +133,15 @@ contains  !> MODULE PROCEDURES START HERE
+    &         self%active_pair_j(npair),self%active_pair_idx(npair), &
+    &         self%dynamic_bond_idx(max(1,nbond)), &
+    &         self%dynamic_angle_idx(max(1,nangl)), &
+-   &         self%dynamic_torsion_idx(max(1,ntors)))
++   &         self%dynamic_torsion_idx(max(1,ntors)), &
++   &         self%eeq_a(m,m),self%eeq_x(m),self%eeq_a4(m,m),self%eeq_x4(m), &
++   &         self%eeq_ipiv(m),self%eeq_frozen_block(n,n))
+     self%frozen_pair = .false.
+     self%frozen_mask_ref = .false.
+     self%frozen_cache_valid = .false.
+     self%static_cache_valid = .false.
+     self%cn_cache_valid = .false.
++    self%eeq_frozen_block_valid = .false.
+     self%n_active_pairs = 0
+     self%frozen_prefix = 0
+     self%prefix_frozen = .false.
+@@ -142,6 +153,7 @@ contains  !> MODULE PROCEDURES START HERE
+     self%cached_angle_total = 0.0_wp
+     self%cached_torsion_total = 0.0_wp
+     self%nat = n
++    self%nfrag = nfrag
+     self%nbond = nbond
+     self%nangl = nangl
+     self%ntors = ntors
+@@ -159,6 +171,7 @@ contains  !> MODULE PROCEDURES START HERE
+       self%frozen_cache_valid = .false.
+       self%static_cache_valid = .false.
+       self%cn_cache_valid = .false.
++      self%eeq_frozen_block_valid = .false.
+       self%n_active_pairs = 0
+       self%frozen_prefix = 0
+       self%prefix_frozen = .false.
+@@ -173,6 +186,7 @@ contains  !> MODULE PROCEDURES START HERE
+         self%frozen_cache_valid = .false.
+         self%static_cache_valid = .false.
+         self%cn_cache_valid = .false.
++        self%eeq_frozen_block_valid = .false.
+       else
+         do i = 1,n
+           if (frozen_mask(i)) then
+@@ -180,6 +194,7 @@ contains  !> MODULE PROCEDURES START HERE
+               self%frozen_cache_valid = .false.
+               self%static_cache_valid = .false.
+               self%cn_cache_valid = .false.
++              self%eeq_frozen_block_valid = .false.
+               exit
+             end if
+           end if
+@@ -231,8 +246,42 @@ contains  !> MODULE PROCEDURES START HERE
+     self%frozen_cache_valid = .true.
+     self%static_cache_valid = .false.
+     self%cn_cache_valid = .false.
++    self%eeq_frozen_block_valid = .false.
+   end subroutine gfnff_workspace_prepare_frozen
+ 
++  subroutine gfnff_workspace_prepare_eeq_frozen_block(self,n,r,topo)
++    class(gfnff_workspace),intent(inout) :: self
++    integer,intent(in) :: n
++    real(wp),intent(in) :: r(n*(n+1)/2)
++    type(TGFFTopology),intent(in) :: topo
++    integer :: i,j,k,ij,nf
++    real(wp) :: gammij,tmp
++    real(wp),parameter :: tsqrt2pi = 0.797884560802866_wp
++
++    if (.not.self%frozen_cache_valid .or. .not.self%prefix_frozen) then
++      self%eeq_frozen_block_valid = .false.
++      return
++    end if
++    if (self%eeq_frozen_block_valid) return
++
++    nf = self%frozen_prefix
++    self%eeq_frozen_block(1:nf,1:nf) = 0.0_wp
++    do i = 1,nf
++      self%eeq_frozen_block(i,i) = tsqrt2pi/sqrt(topo%alpeeq(i))+topo%gameeq(i)
++      k = i*(i-1)/2
++      do j = 1,i-1
++        ij = k+j
++        gammij = 1.0_wp/sqrt(topo%alpeeq(i)+topo%alpeeq(j))
++        tmp = erf(gammij*r(ij))
++        self%eeqtmp(1,ij) = gammij
++        self%eeqtmp(2,ij) = tmp
++        self%eeq_frozen_block(j,i) = tmp/r(ij)
++        self%eeq_frozen_block(i,j) = self%eeq_frozen_block(j,i)
++      end do
++    end do
++    self%eeq_frozen_block_valid = .true.
++  end subroutine gfnff_workspace_prepare_eeq_frozen_block
++
+   subroutine gfnff_workspace_prepare_static(self,n,at,xyz,frozen_mask,repthr,dispthr,param,topo,sqrab,srab)
+     class(gfnff_workspace),intent(inout) :: self
+     integer,intent(in) :: n,at(n)
+@@ -354,6 +403,14 @@ contains  !> MODULE PROCEDURES START HERE
+     if (allocated(self%frozen_srab)) deallocate(self%frozen_srab)
+     if (allocated(self%frozen_reference)) deallocate(self%frozen_reference)
+     if (allocated(self%raw_cn_static)) deallocate(self%raw_cn_static)
++    if (allocated(self%eeq_a)) deallocate(self%eeq_a)
++    if (allocated(self%eeq_x)) deallocate(self%eeq_x)
++    if (allocated(self%eeq_a4)) deallocate(self%eeq_a4)
++    if (allocated(self%eeq_x4)) deallocate(self%eeq_x4)
++    if (allocated(self%eeq_ipiv)) deallocate(self%eeq_ipiv)
++    if (allocated(self%eeq_lapack_work)) deallocate(self%eeq_lapack_work)
++    if (allocated(self%eeq_lapack_work4)) deallocate(self%eeq_lapack_work4)
++    if (allocated(self%eeq_frozen_block)) deallocate(self%eeq_frozen_block)
+     if (allocated(self%active_pair_i)) deallocate(self%active_pair_i)
+     if (allocated(self%active_pair_j)) deallocate(self%active_pair_j)
+     if (allocated(self%active_pair_idx)) deallocate(self%active_pair_idx)
+@@ -361,12 +418,14 @@ contains  !> MODULE PROCEDURES START HERE
+     if (allocated(self%dynamic_angle_idx)) deallocate(self%dynamic_angle_idx)
+     if (allocated(self%dynamic_torsion_idx)) deallocate(self%dynamic_torsion_idx)
+     self%nat = 0
++    self%nfrag = 0
+     self%nbond = 0
+     self%nangl = 0
+     self%ntors = 0
+     self%frozen_cache_valid = .false.
+     self%static_cache_valid = .false.
+     self%cn_cache_valid = .false.
++    self%eeq_frozen_block_valid = .false.
+     self%static_repthr = -1.0_wp
+     self%static_dispthr = -1.0_wp
+     self%cn_cache_thr = -1.0_wp
+@@ -483,7 +542,7 @@ contains  !> MODULE PROCEDURES START HERE
+     ghb = 0.0d0
+     gshift = 0.0d0
+ 
+-    call work%ensure(n,topo%nbond,topo%nangl,topo%ntors)
++    call work%ensure(n,topo%nfrag,topo%nbond,topo%nangl,topo%ntors)
+     if (present(frozen_mask)) then
+       call work%prepare_frozen(n,xyz,frozen_mask)
+       if (work%static_cache_valid) then
+@@ -845,7 +904,7 @@ contains  !> MODULE PROCEDURES START HERE
+ 
+ !      if (pr) call timer%measure(4,'EEQ energy and q')
+     call goed_gfnff(accuracy .gt. 1,n,at,sqrab,srab,&         ! modified version
+-   &                dfloat(ichrg),eeqtmp,cn,nlist%q,ees,solvation,param,topo,io)  ! without dq/dr
++   &                dfloat(ichrg),eeqtmp,cn,nlist%q,ees,solvation,param,topo,work,io)  ! without dq/dr
+ !    if (pr) call timer%measure(4)
+ 
+ !!!!!!!!
+@@ -1311,7 +1370,7 @@ contains  !> MODULE PROCEDURES START HERE
+       cn = 0
+ !> asymtotically for R=inf, Etot is the SIE contaminted EES
+ !> which is computed here to get the atomization energy De,n,at(n)
+-      call goed_gfnff(.true.,n,at,sqrab,srab,dfloat(ichrg),eeqtmp,cn,qtmp,eesinf,solvation,param,topo,io)
++      call goed_gfnff(.true.,n,at,sqrab,srab,dfloat(ichrg),eeqtmp,cn,qtmp,eesinf,solvation,param,topo,work,io)
+       de = -(etot-eesinf)
+     end if
+ !> write resusts to res type
+@@ -1937,11 +1996,12 @@ contains  !> MODULE PROCEDURES START HERE
+ !       based on charge densities obtained by a neural network
+ !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+ 
+-  subroutine goed_gfnff(single,n,at,sqrab,r,chrg,eeqtmp,cn,q,es,gbsa,param,topo,io)
++  subroutine goed_gfnff(single,n,at,sqrab,r,chrg,eeqtmp,cn,q,es,gbsa,param,topo,work,io)
+     implicit none
+     character(len=*),parameter :: source = 'gfnff_eg_goed'
+     type(TGFFData),intent(in) :: param
+     type(TGFFTopology),intent(in) :: topo
++    type(gfnff_workspace),intent(inout),target :: work
+     logical,intent(in)  :: single     !> real*4 flag for solver
+     integer,intent(in)  :: n          !> number of atoms
+     integer,intent(in)  :: at(n)      !> ordinal numbers
+@@ -1951,60 +2011,91 @@ contains  !> MODULE PROCEDURES START HERE
+     real(wp),intent(in)  :: cn(n)      !> CN
+     real(wp),intent(out) :: q(n)       !> output charges
+     real(wp),intent(out) :: es         !> ES energy
+-    real(wp),intent(out) :: eeqtmp(2,n*(n+1)/2)   !> intermediates
++    real(wp),intent(inout),target :: eeqtmp(2,n*(n+1)/2)   !> intermediates
+     type(TBorn),allocatable,intent(in) :: gbsa    !> solvation object
+     integer,intent(out) :: io   !> return status
+     !> LOCAL
+-    integer :: m,i,j,k,ii,ij
++    integer :: m,i,j,k,ii,ij,nf
+     integer :: io1,io2
+-    integer,allocatable :: ipiv(:)
+-    real(wp) :: gammij,tsqrt2pi,r2,tmp
+-    real(wp),allocatable :: A(:,:),x(:)
+-    real(sp),allocatable :: A4(:,:),x4(:)
++    real(wp) :: gammij,tsqrt2pi,tmp
++    real(wp),pointer :: A(:,:),x(:)
++    real(sp),pointer :: A4(:,:),x4(:)
++    integer,pointer :: ipiv(:)
+ !>  parameter
+     parameter(tsqrt2pi=0.797884560802866_wp)
+     logical :: exitRun
+ 
+     io = 0  !> return status
+ 
+-!> # atoms + chrg constrain + frag constrain
++!> # atoms + fragment charge constraints
+     m = n+topo%nfrag
++    A => work%eeq_a
++    x => work%eeq_x
++    A4 => work%eeq_a4
++    x4 => work%eeq_x4
++    ipiv => work%eeq_ipiv
+ 
+-    allocate (A(m,m),x(m))
+-!>  setup RHS
++!> setup RHS
+     do i = 1,n
+       x(i) = topo%chieeq(i)+param%cnf(at(i))*sqrt(cn(i))
+     end do
+ 
+-    A = 0
+-!> setup A matrix
+-    !$omp parallel default(none) &
+-    !$omp shared(topo,n,sqrab,r,eeqtmp,A,at) &
+-    !$omp private(i,j,k,ij,gammij,tmp)
+-    !$omp do schedule(dynamic)
+-    do i = 1,n
+-      A(i,i) = tsqrt2pi/sqrt(topo%alpeeq(i))+topo%gameeq(i) ! J of i
+-      k = i*(i-1)/2
+-      do j = 1,i-1
+-        ij = k+j
+-        gammij = 1./sqrt(topo%alpeeq(i)+topo%alpeeq(j)) ! squared above
+-        tmp = erf(gammij*r(ij))
+-        eeqtmp(1,ij) = gammij
+-        eeqtmp(2,ij) = tmp
+-        A(j,i) = tmp/r(ij)
+-        A(i,j) = A(j,i)
++    A = 0.0_wp
++    call work%prepare_eeq_frozen_block(n,r,topo)
++
++!> setup A matrix. For a contiguous frozen prefix, retain the exact
++!> frozen-frozen block and rebuild only rows that contain active atoms.
++    if (work%eeq_frozen_block_valid) then
++      nf = work%frozen_prefix
++      A(1:nf,1:nf) = work%eeq_frozen_block(1:nf,1:nf)
++      !$omp parallel default(none) &
++      !$omp shared(topo,n,nf,r,eeqtmp,A) &
++      !$omp private(i,j,k,ij,gammij,tmp)
++      !$omp do schedule(dynamic)
++      do i = nf+1,n
++        A(i,i) = tsqrt2pi/sqrt(topo%alpeeq(i))+topo%gameeq(i)
++        k = i*(i-1)/2
++        do j = 1,i-1
++          ij = k+j
++          gammij = 1.0_wp/sqrt(topo%alpeeq(i)+topo%alpeeq(j))
++          tmp = erf(gammij*r(ij))
++          eeqtmp(1,ij) = gammij
++          eeqtmp(2,ij) = tmp
++          A(j,i) = tmp/r(ij)
++          A(i,j) = A(j,i)
++        end do
+       end do
+-    end do
+-    !$omp enddo
+-    !$omp end parallel
++      !$omp enddo
++      !$omp end parallel
++    else
++      !$omp parallel default(none) &
++      !$omp shared(topo,n,r,eeqtmp,A) &
++      !$omp private(i,j,k,ij,gammij,tmp)
++      !$omp do schedule(dynamic)
++      do i = 1,n
++        A(i,i) = tsqrt2pi/sqrt(topo%alpeeq(i))+topo%gameeq(i)
++        k = i*(i-1)/2
++        do j = 1,i-1
++          ij = k+j
++          gammij = 1.0_wp/sqrt(topo%alpeeq(i)+topo%alpeeq(j))
++          tmp = erf(gammij*r(ij))
++          eeqtmp(1,ij) = gammij
++          eeqtmp(2,ij) = tmp
++          A(j,i) = tmp/r(ij)
++          A(i,j) = A(j,i)
++        end do
++      end do
++      !$omp enddo
++      !$omp end parallel
++    end if
+ 
+-!> fragment charge constrain
++!> fragment charge constraints
+     do i = 1,topo%nfrag
+       x(n+i) = topo%qfrag(i)
+       do j = 1,n
+         if (topo%fraglist(j) .eq. i) then
+-          A(n+i,j) = 1
+-          A(j,n+i) = 1
++          A(n+i,j) = 1.0_wp
++          A(j,n+i) = 1.0_wp
+         end if
+       end do
+     end do
+@@ -2015,27 +2106,22 @@ contains  !> MODULE PROCEDURES START HERE
+     end if
+ #endif
+ 
+-    allocate (ipiv(m))
+-
+     if (single) then
+-      allocate (A4(m,m),x4(m))
+-      A4 = A
+-      x4 = x
+-      deallocate (A,x)
+-      call ssytrf_wrap(a4,ipiv,io1)
+-      call sytrs_wrap(a4,x4,ipiv,io2)
+-      q(1:n) = x4(1:n)
+-      deallocate (A4,x4)
++      A4 = real(A,sp)
++      x4 = real(x,sp)
++      call sytrf_cached_wrap(A4,ipiv,work%eeq_lapack_work4,io1)
++      call sytrs_wrap(A4,x4,ipiv,io2)
++      q(1:n) = real(x4(1:n),wp)
+     else
+-      call dsytrf_wrap(a,ipiv,io1)
+-      call sytrs_wrap(a,x,ipiv,io2)
++      call sytrf_cached_wrap(A,ipiv,work%eeq_lapack_work,io1)
++      call sytrs_wrap(A,x,ipiv,io2)
+       q(1:n) = x(1:n)
+-      deallocate (A,x)
+     end if
+ 
+     exitRun = (io1 /= 0).or.(io2 /= 0)
+     if (exitRun) then
+       write (stdout,'("Solving linear equations failed ",a)') source
++      io = max(abs(io1),abs(io2))
+       return
+     end if
+ 
+@@ -2051,7 +2137,7 @@ contains  !> MODULE PROCEDURES START HERE
+         es = es+q(i)*q(j)*tmp/r(ij)
+       end do
+       es = es-q(i)*(topo%chieeq(i)+param%cnf(at(i))*sqrt(cn(i))) &
+-     &        +q(i)*q(i)*0.5d0*(topo%gameeq(i)+tsqrt2pi/sqrt(topo%alpeeq(i)))
++     &        +q(i)*q(i)*0.5_wp*(topo%gameeq(i)+tsqrt2pi/sqrt(topo%alpeeq(i)))
+     end do
+ 
+   end subroutine goed_gfnff
+diff --git a/subprojects/gfnff/src/gfnff_math_wrapper.f90 b/subprojects/gfnff/src/gfnff_math_wrapper.f90
+index c8d5c2b..db957ac 100644
+--- a/subprojects/gfnff/src/gfnff_math_wrapper.f90
++++ b/subprojects/gfnff/src/gfnff_math_wrapper.f90
+@@ -54,6 +54,10 @@ module gfnff_math_wrapper
+     module procedure ssytrf_wrap
+     module procedure dsytrf_wrap
+   end interface sytrf_wrap
++  interface sytrf_cached_wrap
++    module procedure ssytrf_cached_wrap
++    module procedure dsytrf_cached_wrap
++  end interface sytrf_cached_wrap
+   interface lapack_sytrf
+     pure subroutine ssytrf(uplo,n,a,lda,ipiv,work,lwork,info)
+       import :: sp
+@@ -416,6 +420,87 @@ contains
+     end if
+   end subroutine dsytrf_wrap
+ 
++  !> Variant of SYTRF that retains the optimal LAPACK work array between calls.
++  !> The factorization and pivoting are identical to sytrf_wrap; only the
++  !> workspace query/allocation is avoided after the first call.
++  subroutine ssytrf_cached_wrap(amat,ipiv,work,info,uplo)
++    character(len=*),parameter :: source = 'lapack_sytrf'
++    real(sp),intent(inout) :: amat(:,:)
++    integer,intent(out) :: ipiv(:)
++    real(sp),allocatable,intent(inout) :: work(:)
++    integer,intent(out) :: info
++    character(len=1),intent(in),optional :: uplo
++    character(len=1) :: ula
++    integer :: n,lda,lwork,stat_alloc
++    real(sp) :: test(1)
++
++    if (present(uplo)) then
++      ula = uplo
++    else
++      ula = 'u'
++    end if
++    lda = max(1,size(amat,1))
++    n = size(amat,2)
++    if (.not.allocated(work)) then
++      lwork = -1
++      call lapack_sytrf(ula,n,amat,lda,ipiv,test,lwork,info)
++      if (info /= 0) then
++        write (stderr,'("Factorisation workspace query failed ",a)') source
++        return
++      end if
++      lwork = max(1,nint(test(1)))
++      allocate(work(lwork),stat=stat_alloc)
++      if (stat_alloc /= 0) then
++        info = -1000
++        write (stderr,'("Factorisation workspace allocation failed ",a)') source
++        return
++      end if
++    end if
++    call lapack_sytrf(ula,n,amat,lda,ipiv,work,size(work),info)
++    if (info /= 0) then
++      write (stderr,'("Factorisation of matrix failed ",a)') source
++    end if
++  end subroutine ssytrf_cached_wrap
++
++  subroutine dsytrf_cached_wrap(amat,ipiv,work,info,uplo)
++    character(len=*),parameter :: source = 'lapack_sytrf'
++    real(wp),intent(inout) :: amat(:,:)
++    integer,intent(out) :: ipiv(:)
++    real(wp),allocatable,intent(inout) :: work(:)
++    integer,intent(out) :: info
++    character(len=1),intent(in),optional :: uplo
++    character(len=1) :: ula
++    integer :: n,lda,lwork,stat_alloc
++    real(wp) :: test(1)
++
++    if (present(uplo)) then
++      ula = uplo
++    else
++      ula = 'u'
++    end if
++    lda = max(1,size(amat,1))
++    n = size(amat,2)
++    if (.not.allocated(work)) then
++      lwork = -1
++      call lapack_sytrf(ula,n,amat,lda,ipiv,test,lwork,info)
++      if (info /= 0) then
++        write (stderr,'("Factorisation workspace query failed ",a)') source
++        return
++      end if
++      lwork = max(1,nint(test(1)))
++      allocate(work(lwork),stat=stat_alloc)
++      if (stat_alloc /= 0) then
++        info = -1000
++        write (stderr,'("Factorisation workspace allocation failed ",a)') source
++        return
++      end if
++    end if
++    call lapack_sytrf(ula,n,amat,lda,ipiv,work,size(work),info)
++    if (info /= 0) then
++      write (stderr,'("Factorisation of matrix failed ",a)') source
++    end if
++  end subroutine dsytrf_cached_wrap
++
+ !=======================================================================================!
+ !> SYTRI computes the inverse of a real symmetric indefinite matrix
+ !> A using the factorization A = U*D*U**T or A = L*D*L**T computed by
+-- 
+2.47.3
+
