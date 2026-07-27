@@ -74,6 +74,9 @@ contains
     if (any(ats(1:nat,1) /= prepared_ref%at)) then
       error stop 'Multi-input NCI: elements/order differ from parsed reference.'
     end if
+    if (.not.all(ieee_is_finite(xyz_ang(:,1:nat,1:ninputs)))) then
+      error stop 'Multi-input NCI: supplied frames contain non-finite coordinates.'
+    end if
 
     call validate_global_selections(env,nat)
     nelec=sum(ats(1:nat,1))-env%chrg
@@ -119,6 +122,9 @@ contains
     end if
     if (any(canonical_ref%at /= ats(1:nat,1))) then
       error stop 'Multi-input NCI: canonical reference elements/order differ.'
+    end if
+    if (.not.all(ieee_is_finite(canonical_ref%xyz))) then
+      error stop 'Multi-input NCI: canonical reference contains non-finite coordinates.'
     end if
 
     allocate(raw_bohr(3,nat,ninputs),xyz_bohr(3,nat,ninputs))
