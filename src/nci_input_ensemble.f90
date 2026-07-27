@@ -36,7 +36,7 @@ contains
     real(wp),allocatable :: xyz_ang(:,:,:),raw_bohr(:,:,:),xyz_bohr(:,:,:)
     real(wp),allocatable :: rmsd_gradient(:,:)
     real(wp) :: rotation(3,3),raw_center(3),target_center(3),det
-    real(wp) :: prepared_rmsd,max_fixed_delta,max_prepared_delta
+    real(wp) :: fit_rmsd,aligned_rmsd,max_fixed_delta,max_prepared_delta
     logical :: is_xyz
 
     ninputs = 1
@@ -125,9 +125,9 @@ contains
     allocate(rmsd_gradient(3,nat),source=0.0_wp)
     raw_bohr=xyz_ang(:,1:nat,:)/bohr
     call rmsd(nat,raw_bohr(:,:,1),canonical_ref%xyz,1,rotation, &
-      raw_center,target_center,prepared_rmsd,.false.,rmsd_gradient)
+      raw_center,target_center,fit_rmsd,.false.,rmsd_gradient)
 
-    if (.not.ieee_is_finite(prepared_rmsd) .or. prepared_rmsd < 0.0_wp) then
+    if (.not.ieee_is_finite(fit_rmsd) .or. fit_rmsd < 0.0_wp) then
       error stop 'Multi-input NCI: canonical-reference rigid fit failed.'
     end if
     if (.not.all(ieee_is_finite(rotation)) .or. &
@@ -148,8 +148,16 @@ contains
       end do
     end do
 
+    aligned_rmsd=sqrt(sum((xyz_bohr(:,:,1)-canonical_ref%xyz)**2)/real(nat,wp))
     max_prepared_delta=maxval(abs(xyz_bohr(:,:,1)-canonical_ref%xyz))
-    if (prepared_rmsd > transform_tolerance .or. &
+    write(stdout,'(1x,a,es12.4,a)') 'Rigid-fit solver RMSD          : ', &
+      fit_rmsd,' Bohr'
+    write(stdout,'(1x,a,es12.4,a)') 'Canonical-reference RMSD       : ', &
+      aligned_rmsd,' Bohr'
+    write(stdout,'(1x,a,es12.4,a)') 'Canonical-reference max delta  : ', &
+      max_prepared_delta,' Bohr'
+    write(stdout,'(1x,a,f16.12)') 'Common transform determinant   : ',det
+    if (aligned_rmsd > transform_tolerance .or. &
         max_prepared_delta > transform_tolerance) then
       error stop 'Multi-input NCI: transformed frame 1 differs from canonical reference.'
     end if
@@ -169,12 +177,6 @@ contains
 
     write(stdout,'(1x,a,i0)') 'Validated NCI input structures : ',ninputs
     write(stdout,'(1x,a,i0)') 'Frozen atoms checked           : ',nfixed
-    write(stdout,'(1x,a,es12.4,a)') 'Canonical-reference RMSD       : ', &
-      prepared_rmsd,' Bohr'
-    write(stdout,'(1x,a,es12.4,a)') 'Canonical-reference max delta  : ', &
-      max_prepared_delta,' Bohr'
-    write(stdout,'(1x,a,f16.12)') 'Common transform determinant  : ',det
-
     deallocate(rmsd_gradient,xyz_bohr,raw_bohr,topoi,topo0,xyz_ang,comments,ats,nats)
   end subroutine load_nci_input_ensemble
 
