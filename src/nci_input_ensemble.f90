@@ -2,13 +2,14 @@
 ! Multi-input NCI placements for the first iMTD-GC iteration.
 !================================================================================!
 module nci_input_ensemble
+  use, intrinsic :: ieee_arithmetic,only:ieee_is_finite
   use crest_parameters,only:wp,stdout,bohr
   use crest_data,only:systemdata
   use crest_calculator,only:calcdata
   use optimize_module,only:optimize_geometry
   use strucrd,only:coord,rdensembleparam,rdensemble,checkcoordtype,wrensemble
   use dynamics_module,only:mddata
-  use axis_module,only:axis,cma
+  use ls_rmsd,only:rmsd
   implicit none
   private
 
@@ -27,13 +28,15 @@ contains
     type(coord),allocatable,intent(out) :: mols(:)
     integer,intent(out) :: ninputs
 
-    integer :: filetype,nat,natmax,iframe,iatom,iaxis
+    type(coord) :: canonical_ref
+    integer :: filetype,nat,natmax,iframe,iatom
     integer :: ntopo,nfixed,nelec
     integer,allocatable :: nats(:),ats(:,:),topo0(:),topoi(:)
     character(len=512),allocatable :: comments(:)
-    real(wp),allocatable :: xyz_ang(:,:,:),xyz_bohr(:,:,:),aligned_first(:,:)
-    real(wp) :: rot(3),avmom,evec(3,3),center(3),det
-    real(wp) :: shifted(3),max_fixed_delta,max_transform_delta,max_prepared_delta
+    real(wp),allocatable :: xyz_ang(:,:,:),raw_bohr(:,:,:),xyz_bohr(:,:,:)
+    real(wp),allocatable :: rmsd_gradient(:,:)
+    real(wp) :: rotation(3,3),raw_center(3),target_center(3),det
+    real(wp) :: prepared_rmsd,max_fixed_delta,max_prepared_delta
     logical :: is_xyz
 
     ninputs = 1
@@ -105,34 +108,56 @@ contains
       end if
     end do
 
-    call axis(nat,ats(1:nat,1),xyz_ang(:,1:nat,1),rot,avmom,evec)
-    call cma(nat,ats(1:nat,1),xyz_ang(:,1:nat,1),center)
-    allocate(aligned_first(3,nat))
-    call axis(nat,ats(1:nat,1),xyz_ang(:,1:nat,1),aligned_first,rot)
-    det=evec(1,1)*(evec(2,2)*evec(3,3)-evec(2,3)*evec(3,2)) &
-       -evec(1,2)*(evec(2,1)*evec(3,3)-evec(2,3)*evec(3,1)) &
-       +evec(1,3)*(evec(2,1)*evec(3,2)-evec(2,2)*evec(3,1))
-    if (det < 0.0_wp) evec(:,1)=-evec(:,1)
+    ! The ordinary CREST input path has already written its canonical,
+    ! transformed but unoptimized first frame to `coord`.  The NCI trial
+    ! optimization may subsequently have changed prepared_ref internally, so
+    ! raw frame 1 must be fitted to `coord`, not to prepared_ref.  One proper
+    ! rigid transform is then applied unchanged to all supplied placements.
+    call canonical_ref%open('coord')
+    if (canonical_ref%nat /= nat) then
+      error stop 'Multi-input NCI: canonical reference atom count differs.'
+    end if
+    if (any(canonical_ref%at /= ats(1:nat,1))) then
+      error stop 'Multi-input NCI: canonical reference elements/order differ.'
+    end if
 
-    allocate(xyz_bohr(3,nat,ninputs))
+    allocate(raw_bohr(3,nat,ninputs),xyz_bohr(3,nat,ninputs))
+    allocate(rmsd_gradient(3,nat),source=0.0_wp)
+    raw_bohr=xyz_ang(:,1:nat,:)/bohr
+    call rmsd(nat,raw_bohr(:,:,1),canonical_ref%xyz,1,rotation, &
+      raw_center,target_center,prepared_rmsd,.false.,rmsd_gradient)
+
+    if (.not.ieee_is_finite(prepared_rmsd) .or. prepared_rmsd < 0.0_wp) then
+      error stop 'Multi-input NCI: canonical-reference rigid fit failed.'
+    end if
+    if (.not.all(ieee_is_finite(rotation)) .or. &
+        .not.all(ieee_is_finite(raw_center)) .or. &
+        .not.all(ieee_is_finite(target_center))) then
+      error stop 'Multi-input NCI: canonical transform is non-finite.'
+    end if
+
+    det=determinant3(rotation)
+    if (.not.ieee_is_finite(det) .or. abs(det-1.0_wp) > transform_tolerance) then
+      error stop 'Multi-input NCI: canonical transform is not a proper rotation.'
+    end if
+
     do iframe=1,ninputs
       do iatom=1,nat
-        shifted=xyz_ang(:,iatom,iframe)-center
-        xyz_bohr(:,iatom,iframe)=matmul(transpose(evec),shifted)/bohr
+        xyz_bohr(:,iatom,iframe)=matmul(rotation, &
+          raw_bohr(:,iatom,iframe)-raw_center)+target_center
       end do
     end do
-    max_transform_delta=maxval(abs(xyz_bohr(:,:,1)-aligned_first/bohr))
-    if (max_transform_delta > transform_tolerance) then
-      error stop 'Multi-input NCI: failed to reconstruct common axis transform.'
+
+    max_prepared_delta=maxval(abs(xyz_bohr(:,:,1)-canonical_ref%xyz))
+    if (prepared_rmsd > transform_tolerance .or. &
+        max_prepared_delta > transform_tolerance) then
+      error stop 'Multi-input NCI: transformed frame 1 differs from canonical reference.'
     end if
-    max_prepared_delta=maxval(abs(xyz_bohr(:,:,1)-prepared_ref%xyz))
-    if (max_prepared_delta > transform_tolerance) then
-      error stop 'Multi-input NCI: transformed frame 1 differs from CREST reference.'
-    end if
-    deallocate(aligned_first)
+    call canonical_ref%deallocate()
 
     allocate(mols(ninputs))
-    do iframe=1,ninputs
+    mols(1)=prepared_ref
+    do iframe=2,ninputs
       mols(iframe)%nat=nat
       mols(iframe)%at=ats(1:nat,iframe)
       mols(iframe)%xyz=xyz_bohr(:,:,iframe)
@@ -144,10 +169,13 @@ contains
 
     write(stdout,'(1x,a,i0)') 'Validated NCI input structures : ',ninputs
     write(stdout,'(1x,a,i0)') 'Frozen atoms checked           : ',nfixed
-    write(stdout,'(1x,a,es12.4,a)') 'Common-transform check error   : ', &
-      max_transform_delta,' Bohr'
+    write(stdout,'(1x,a,es12.4,a)') 'Canonical-reference RMSD       : ', &
+      prepared_rmsd,' Bohr'
+    write(stdout,'(1x,a,es12.4,a)') 'Canonical-reference max delta  : ', &
+      max_prepared_delta,' Bohr'
+    write(stdout,'(1x,a,f16.12)') 'Common transform determinant  : ',det
 
-    deallocate(topoi,topo0,xyz_bohr,xyz_ang,comments,ats,nats)
+    deallocate(rmsd_gradient,xyz_bohr,raw_bohr,topoi,topo0,xyz_ang,comments,ats,nats)
   end subroutine load_nci_input_ensemble
 
   subroutine validate_global_selections(env,nat)
@@ -204,6 +232,13 @@ contains
     call new_ompautoset(env,'max',0,outer_threads,inner_threads)
     deallocate(topo,grad)
   end subroutine preoptimize_additional_inputs
+
+  pure real(wp) function determinant3(matrix)
+    real(wp),intent(in) :: matrix(3,3)
+    determinant3=matrix(1,1)*(matrix(2,2)*matrix(3,3)-matrix(2,3)*matrix(3,2)) &
+      -matrix(1,2)*(matrix(2,1)*matrix(3,3)-matrix(2,3)*matrix(3,1)) &
+      +matrix(1,3)*(matrix(2,1)*matrix(3,2)-matrix(2,2)*matrix(3,1))
+  end function determinant3
 
   subroutine write_nci_input_starts(mols)
     type(coord),intent(in) :: mols(:)
