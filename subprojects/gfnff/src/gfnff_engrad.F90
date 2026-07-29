@@ -173,6 +173,7 @@ contains  !> MODULE PROCEDURES START HERE
     real(wp),intent(in) :: xyz(3,n)
     logical,intent(in) :: frozen_mask(n)
     integer :: i,j,ij,k,m
+    real(wp) :: frozen_delta,cache_scale,cache_tolerance
 
     if (count(frozen_mask) < 2) then
       self%frozen_pair = .false.
@@ -198,18 +199,27 @@ contains  !> MODULE PROCEDURES START HERE
         self%eeq_frozen_block_valid = .false.
         self%eeq_host_inverse_valid = .false.
       else
+        ! Preserve the tolerant frozen-coordinate validation while avoiding
+        ! three full-size SPREAD temporaries on every energy/gradient call.
+        frozen_delta = 0.0_wp
+        cache_scale = 1.0_wp
         do i = 1,n
-          if (frozen_mask(i)) then
-            if (any(xyz(:,i) /= self%frozen_reference(:,i))) then
-              self%frozen_cache_valid = .false.
-              self%static_cache_valid = .false.
-              self%cn_cache_valid = .false.
-              self%eeq_frozen_block_valid = .false.
-              self%eeq_host_inverse_valid = .false.
-              exit
-            end if
-          end if
+          if (.not.frozen_mask(i)) cycle
+          do k = 1,3
+            frozen_delta = max(frozen_delta, &
+           &                   abs(xyz(k,i)-self%frozen_reference(k,i)))
+            cache_scale = max(cache_scale,abs(xyz(k,i)), &
+           &                  abs(self%frozen_reference(k,i)))
+          end do
         end do
+        cache_tolerance = 128.0_wp*epsilon(1.0_wp)*cache_scale
+        if (frozen_delta > cache_tolerance) then
+          self%frozen_cache_valid = .false.
+          self%static_cache_valid = .false.
+          self%cn_cache_valid = .false.
+          self%eeq_frozen_block_valid = .false.
+          self%eeq_host_inverse_valid = .false.
+        end if
       end if
     end if
     if (self%frozen_cache_valid) return

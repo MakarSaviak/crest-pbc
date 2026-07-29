@@ -256,11 +256,14 @@ contains    !> MODULE PROCEDURES START HERE
     if (present(frozen_mask)) then
       if (.not.allocated(calc%ff_dat%frozen_mask)) then
         allocate(calc%ff_dat%frozen_mask(mol%nat))
+        calc%ff_dat%frozen_mask = frozen_mask
       else if (size(calc%ff_dat%frozen_mask) /= mol%nat) then
         deallocate(calc%ff_dat%frozen_mask)
         allocate(calc%ff_dat%frozen_mask(mol%nat))
+        calc%ff_dat%frozen_mask = frozen_mask
+      else if (any(calc%ff_dat%frozen_mask .neqv. frozen_mask)) then
+        calc%ff_dat%frozen_mask = frozen_mask
       end if
-      calc%ff_dat%frozen_mask = frozen_mask
     else if (allocated(calc%ff_dat%frozen_mask)) then
       deallocate(calc%ff_dat%frozen_mask)
     end if

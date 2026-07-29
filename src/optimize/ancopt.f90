@@ -217,7 +217,6 @@ contains  !> MODULE PROCEDURES START HERE
         end do
         call OPT%new(molopt%xyz,h,pr,linear,fail)
       end if
-      if (iter == 0) call dump_anc_debug(OPT)
       if (fail) then
         iostatus = -1
         exit ANC_microiter

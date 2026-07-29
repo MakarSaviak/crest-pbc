@@ -346,7 +346,12 @@ contains    !> MODULE PROCEDURES START HERE
         calc%ff_dat%solvent = calc%solvent
       end if
     end if
-    if (allocated(calc%gff_fragments)) then
+    ! Fragment IDs are topology input.  Rebuild them only when the GFN-FF
+    ! topology itself is about to be initialized or explicitly refreshed.
+    ! The calculator object persists for the lifetime of an OpenMP worker, so
+    ! reparsing these atom lists on every energy/gradient call is redundant.
+    if (calc%apiclean) loadnew = .true.
+    if (loadnew .and. allocated(calc%gff_fragments)) then
       allocate(frag_ids(mol%nat),source=0)
       do f = 1,size(calc%gff_fragments)
         call get_atlist(mol%nat,selected,trim(calc%gff_fragments(f)),mol%at)
@@ -358,7 +363,6 @@ contains    !> MODULE PROCEDURES START HERE
       calc%ff_dat%user_fraglist = frag_ids
       deallocate(frag_ids)
     end if
-    if (calc%apiclean) loadnew = .true.
 #endif
   end subroutine gfnff_init
   subroutine gfnff_properties(calc,mol,iostatus)
