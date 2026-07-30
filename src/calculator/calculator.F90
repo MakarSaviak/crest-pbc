@@ -26,6 +26,8 @@ module crest_calculator
 !>--- potentials and API's
   use subprocess_engrad !> driver exports for subprocesses
   use api_engrad  !> contains many potentials
+  use api_helpers,only:gfnff_init
+  use gfnff_api,only:gfnff_api_setup
 !>--- other
   use constraints
   use nonadiabatic_module
@@ -56,6 +58,8 @@ module crest_calculator
 !>--- public module routines
   public :: potential_core
   public :: engrad
+  public :: prepare_gfnff_topology
+  public :: request_gfnff_hbond_update
   interface engrad
     module procedure :: engrad_mol
   end interface engrad
@@ -73,6 +77,85 @@ module crest_calculator
 !========================================================================================!
 contains  !> MODULE PROCEDURES START HERE
 !========================================================================================!
+!========================================================================================!
+
+  subroutine prepare_gfnff_topology(mol,calc,iostatus,ninitialized,ngfnff)
+!***********************************************************************
+!* Initialize every GFN-FF topology in a calculator from one canonical
+!* structure before the calculator is cloned for OpenMP workers.
+!*
+!* This deliberately stops after gfnff_api_setup: no singlepoint is run,
+!* so charge/gradient results and the per-worker EEQ/workspace caches are
+!* still created by the worker's first real evaluation.
+!***********************************************************************
+    implicit none
+    type(coord),intent(in) :: mol
+    type(calcdata),intent(inout) :: calc
+    integer,intent(out) :: iostatus
+    integer,intent(out) :: ninitialized,ngfnff
+    integer :: i,io
+    logical :: loadnew
+
+    iostatus = 0
+    ninitialized = 0
+    ngfnff = 0
+    do i = 1,calc%ncalculations
+      if (calc%calcs(i)%id /= jobtype%gfnff) cycle
+      ngfnff = ngfnff+1
+
+      call gfnff_init(calc%calcs(i),mol,loadnew)
+      if (.not.loadnew) cycle
+
+      !> Match the mask state that the first regular GFN-FF evaluation
+      !> would install, without preparing any geometry-dependent workspace.
+#ifdef WITH_GFNFF
+      if (calc%nfreeze > 0 .and. allocated(calc%freezelist)) then
+        if (size(calc%freezelist) /= mol%nat) then
+          if (allocated(calc%calcs(i)%ff_dat)) deallocate(calc%calcs(i)%ff_dat)
+          iostatus = 1
+          return
+        end if
+        calc%calcs(i)%ff_dat%frozen_mask = calc%freezelist
+      else if (allocated(calc%calcs(i)%ff_dat%frozen_mask)) then
+        deallocate(calc%calcs(i)%ff_dat%frozen_mask)
+      end if
+#endif
+
+      call gfnff_api_setup(mol,calc%calcs(i)%chrg,calc%calcs(i)%ff_dat,io)
+      if (io /= 0) then
+        !> Do not leave a failed allocation looking initialized to a retry.
+        if (allocated(calc%calcs(i)%ff_dat)) deallocate(calc%calcs(i)%ff_dat)
+        iostatus = io
+        return
+      end if
+      ninitialized = ninitialized+1
+    end do
+  end subroutine prepare_gfnff_topology
+
+!========================================================================================!
+
+  subroutine request_gfnff_hbond_update(calc)
+!***********************************************************************
+!* Request one full HB/XB neighbour-list rebuild on the next GFN-FF
+!* evaluation.  No topology, EEQ, frozen-host, or other workspace state
+!* is released.  The ensemble-optimization caller invokes this once at
+!* each new input-geometry boundary.
+!***********************************************************************
+    implicit none
+    type(calcdata),intent(inout) :: calc
+#ifdef WITH_GFNFF
+    integer :: i
+
+    if (.not.allocated(calc%calcs)) return
+    do i = 1,min(calc%ncalculations,size(calc%calcs))
+      if (calc%calcs(i)%id /= jobtype%gfnff) cycle
+      if (.not.allocated(calc%calcs(i)%ff_dat)) cycle
+      if (.not.allocated(calc%calcs(i)%ff_dat%nlist)) cycle
+      calc%calcs(i)%ff_dat%nlist%force_hbond_update = .true.
+    end do
+#endif
+  end subroutine request_gfnff_hbond_update
+
 !========================================================================================!
 
   subroutine engrad_mol(mol,calc,energy,gradient,iostatus)

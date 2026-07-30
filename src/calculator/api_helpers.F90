@@ -333,7 +333,7 @@ contains    !> MODULE PROCEDURES START HERE
         calc%ff_dat%refgeo = calc%refgeo
       end if
       if (allocated(calc%parametrisation)) then
-        calc%ff_dat%refgeo = calc%parametrisation
+        calc%ff_dat%parametrisation = calc%parametrisation
       end if
       if (allocated(calc%refcharges)) then
         calc%ff_dat%refcharges = calc%refcharges

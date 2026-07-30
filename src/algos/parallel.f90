@@ -267,7 +267,8 @@ subroutine crest_oloop(env,nat,nall,at,xyz,eread,dump,customcalc)
 
   type(coord),allocatable :: mols(:)
   type(coord),allocatable :: molsnew(:)
-  integer :: i,j,k,l,io,ich,ich2,c,z,job_id,zcopy
+  type(coord) :: canonical_mol
+  integer :: i,j,k,l,io,ich,ich2,c,z,job_id,zcopy,ninitialized,ngfnff
   logical :: pr,wr,ex
   type(calcdata),allocatable :: calculations(:)
   real(wp) :: energy,gnorm
@@ -276,6 +277,7 @@ subroutine crest_oloop(env,nat,nall,at,xyz,eread,dump,customcalc)
   character(len=80) :: atmp
   real(wp) :: percent,runtime
   type(calcdata),pointer :: mycalc
+  type(calcdata),target :: local_template
   type(timer) :: profiler
   integer :: T,Tn  !> threads and threads per core
   logical :: nested
@@ -288,10 +290,13 @@ subroutine crest_oloop(env,nat,nall,at,xyz,eread,dump,customcalc)
 
 !>--- check which calc to use
   if(present(customcalc))then
-    mycalc => customcalc
+    local_template = customcalc
   else
-    mycalc => env%calc
+    local_template = env%calc
   endif
+  !> Always seed a call-local template. Neither env%calc nor an INTENT(IN)
+  !> custom calculator is mutated by canonical topology preparation.
+  mycalc => local_template
 
 !>--- check if we have any calculation settings allocated
   if (mycalc%ncalculations < 1) then
@@ -299,16 +304,42 @@ subroutine crest_oloop(env,nat,nall,at,xyz,eread,dump,customcalc)
     return
   end if
 
-!>--- prepare calculation objects for parallelization (one per thread)
+!>--- establish the outer worker count before preparing the shared topology
   call new_ompautoset(env,'auto_nested',nall,T,Tn)
   nested = env%omp_allow_nested
+
+!>--- initialize from ensemble frame 1 before cloning the worker calculators
+!  The historical worker-local setup ran inside the outer OpenMP region and
+!  therefore generated every topology with one active thread.  Preserve those
+!  exact parameters while doing the work only once: temporarily serialize the
+!  canonical setup, then restore the selected outer worker count before copies
+!  or optimization work are created.
+  canonical_mol%nat = nat
+  allocate (canonical_mol%at(nat),canonical_mol%xyz(3,nat))
+  canonical_mol%at = at
+  canonical_mol%xyz = xyz(:,:,1)
+  call omp_set_num_threads(1)
+  call prepare_gfnff_topology(canonical_mol,mycalc,io,ninitialized,ngfnff)
+  call omp_set_num_threads(T)
+  call canonical_mol%deallocate()
+  if (io /= 0) then
+    write (stdout,'(1x,a,i0)') 'Canonical GFN-FF topology initialization failed; iostat=',io
+    env%iostatus_meta = status_failed
+    return
+  end if
+  if (ngfnff > 0) then
+    if (ninitialized > 0) then
+      write (stdout,'(1x,a)') 'Canonical GFN-FF topology ready before worker cloning (initialized).'
+    else
+      write (stdout,'(1x,a)') 'Canonical GFN-FF topology ready before worker cloning (retained).'
+    end if
+  end if
 
 !>--- prepare objects for parallelization
   allocate (calculations(T),source=mycalc)
   allocate (mols(T),molsnew(T))
   do i = 1,T
     do j = 1,mycalc%ncalculations
-      calculations(i)%calcs(j) = mycalc%calcs(j)
       !>--- directories and io preparation
       ex = directory_exist(mycalc%calcs(j)%calcspace)
       if (.not.ex) then
@@ -379,6 +410,10 @@ subroutine crest_oloop(env,nat,nall,at,xyz,eread,dump,customcalc)
     !$omp end critical
 
     !>-- geometry optimization
+    !> Each worker calculator persists across ensemble members.  Rebuild only
+    !> its geometry-dependent GFN-FF HB/XB list at this input boundary; retain
+    !> canonical topology, exact EEQ, frozen-host caches, and all workspaces.
+    call request_gfnff_hbond_update(calculations(job))
     call optimize_geometry(mols(job),molsnew(job),calculations(job),energy,grads(:,:,job),pr,wr,io)
 
     !$omp critical

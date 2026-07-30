@@ -21,6 +21,7 @@
 !> at https://github.com/grimme-lab/xtb
 !================================================================================!
 module gfnff_ini2
+!$ use omp_lib,only:omp_get_max_threads
   use iso_fortran_env,only:wp => real64,sp => real32,stdout=>output_unit
 
   use gfnff_data_types,only:TGFFData,TGFFNeighbourList,TGFFTopology
@@ -704,7 +705,7 @@ contains  !> MODULE PROCEDURES START HERE
 
 !========================================================================================!
 
-  subroutine gfnff_hbset(n,at,xyz,sqrab,topo,nlist,hbthr1,hbthr2)
+  subroutine gfnff_hbset(n,at,xyz,sqrab,topo,nlist,hbthr1,hbthr2,force_update)
     use gfnff_param
     implicit none
     type(TGFFTopology),intent(in) :: topo
@@ -714,14 +715,17 @@ contains  !> MODULE PROCEDURES START HERE
     real(wp) sqrab(n*(n+1)/2)
     real(wp) xyz(3,n)
     real(wp),intent(in) :: hbthr1,hbthr2
+    logical,intent(in),optional :: force_update
 
     integer i,j,k,nh,ia,ix,ij,inh,jnh
     real(wp) rab,rmsd
-    logical ijnonbond
+    logical ijnonbond,force_rebuild
 
     rmsd = sqrt(sum((xyz-nlist%hbrefgeo)**2))/dble(n)
+    force_rebuild = .false.
+    if (present(force_update)) force_rebuild = force_update
 
-    if (rmsd .lt. 1.d-6.or.rmsd .gt. 0.3d0) then ! update list if first call or substantial move occured
+    if (force_rebuild.or.rmsd .lt. 1.d-6.or.rmsd .gt. 0.3d0) then ! explicit, first, or substantial move
 
       nlist%nhb1 = 0
       nlist%nhb2 = 0
@@ -1081,48 +1085,84 @@ contains  !> MODULE PROCEDURES START HERE
     real(wp),intent(in) :: hbthr1,hbthr2
 
     integer i,j,k,nh,ia,ix,ij,inh,jnh
-    logical ijnonbond
+    logical ijnonbond,serial_inner
     real(wp) rab
 
     nhb1 = 0
     nhb2 = 0
-    !$omp parallel do default(none) schedule(static) reduction(+:nhb1,nhb2) &
-    !$omp shared(n, at, sqrab, topo, hbthr1, hbthr2) &
-    !$omp private(ix, i, j, ij, rab, ijnonbond, k, nh, inh, jnh)
-    do ix = 1,topo%nathbAB
-      i = topo%hbatABl(1,ix)
-      j = topo%hbatABl(2,ix)
-      ij = j+i*(i-1)/2
-      rab = sqrab(ij)
-      if (rab .gt. hbthr1) cycle
-      ijnonbond = topo%bpair(ij) .ne. 1
-      do k = 1,topo%nathbH
-        nh = topo%hbatHl(k)
-        inh = lin(i,nh)
-        jnh = lin(j,nh)
-        if (topo%bpair(inh) .eq. 1.and.ijnonbond) then
-          nhb2 = nhb2+1
-        elseif (topo%bpair(jnh) .eq. 1.and.ijnonbond) then
-          nhb2 = nhb2+1
-        elseif (rab+sqrab(inh)+sqrab(jnh) .lt. hbthr2) then
-          nhb1 = nhb1+1
-        end if
+    serial_inner = .true.
+!$  serial_inner = omp_get_max_threads() == 1
+    if (serial_inner) then
+      do ix = 1,topo%nathbAB
+        i = topo%hbatABl(1,ix)
+        j = topo%hbatABl(2,ix)
+        ij = j+i*(i-1)/2
+        rab = sqrab(ij)
+        if (rab .gt. hbthr1) cycle
+        ijnonbond = topo%bpair(ij) .ne. 1
+        do k = 1,topo%nathbH
+          nh = topo%hbatHl(k)
+          inh = lin(i,nh)
+          jnh = lin(j,nh)
+          if (topo%bpair(inh) .eq. 1.and.ijnonbond) then
+            nhb2 = nhb2+1
+          elseif (topo%bpair(jnh) .eq. 1.and.ijnonbond) then
+            nhb2 = nhb2+1
+          elseif (rab+sqrab(inh)+sqrab(jnh) .lt. hbthr2) then
+            nhb1 = nhb1+1
+          end if
+        end do
       end do
-    end do
-    !$omp end parallel do
+    else
+      !$omp parallel do default(none) schedule(static) reduction(+:nhb1,nhb2) &
+      !$omp shared(n, at, sqrab, topo, hbthr1, hbthr2) &
+      !$omp private(ix, i, j, ij, rab, ijnonbond, k, nh, inh, jnh)
+      do ix = 1,topo%nathbAB
+        i = topo%hbatABl(1,ix)
+        j = topo%hbatABl(2,ix)
+        ij = j+i*(i-1)/2
+        rab = sqrab(ij)
+        if (rab .gt. hbthr1) cycle
+        ijnonbond = topo%bpair(ij) .ne. 1
+        do k = 1,topo%nathbH
+          nh = topo%hbatHl(k)
+          inh = lin(i,nh)
+          jnh = lin(j,nh)
+          if (topo%bpair(inh) .eq. 1.and.ijnonbond) then
+            nhb2 = nhb2+1
+          elseif (topo%bpair(jnh) .eq. 1.and.ijnonbond) then
+            nhb2 = nhb2+1
+          elseif (rab+sqrab(inh)+sqrab(jnh) .lt. hbthr2) then
+            nhb1 = nhb1+1
+          end if
+        end do
+      end do
+      !$omp end parallel do
+    end if
 
     nxb = 0
-    !$omp parallel do default(none) schedule(static) reduction(+:nxb) &
-    !$omp shared(sqrab, topo, hbthr2) private(ix, i, j, ij, rab)
-    do ix = 1,topo%natxbAB
-      i = topo%xbatABl(1,ix)
-      j = topo%xbatABl(2,ix)
-      ij = j+i*(i-1)/2
-      rab = sqrab(ij)
-      if (rab .gt. hbthr2) cycle
-      nxb = nxb+1
-    end do
-    !$omp end parallel do
+    if (serial_inner) then
+      do ix = 1,topo%natxbAB
+        i = topo%xbatABl(1,ix)
+        j = topo%xbatABl(2,ix)
+        ij = j+i*(i-1)/2
+        rab = sqrab(ij)
+        if (rab .gt. hbthr2) cycle
+        nxb = nxb+1
+      end do
+    else
+      !$omp parallel do default(none) schedule(static) reduction(+:nxb) &
+      !$omp shared(sqrab, topo, hbthr2) private(ix, i, j, ij, rab)
+      do ix = 1,topo%natxbAB
+        i = topo%xbatABl(1,ix)
+        j = topo%xbatABl(2,ix)
+        ij = j+i*(i-1)/2
+        rab = sqrab(ij)
+        if (rab .gt. hbthr2) cycle
+        nxb = nxb+1
+      end do
+      !$omp end parallel do
+    end if
 
   end subroutine gfnff_hbset0
 !========================================================================================!
