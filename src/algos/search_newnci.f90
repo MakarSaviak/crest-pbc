@@ -31,6 +31,7 @@ subroutine crest_search_newnci(env,tim)
   use iomod
   use utilities
   use cregen_interface
+  use crest_multilevel_interface,only:crest_multilevel_oloop
   implicit none
   type(systemdata),intent(inout) :: env
   type(timer),intent(inout)      :: tim

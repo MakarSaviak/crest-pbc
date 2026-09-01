@@ -127,6 +127,13 @@ contains  !> MODULE PROCEDURES START HERE
 
 !       open (55, file="fragment.out")
 
+    ! Upstream GFN-FF initializes this matrix to zero.  This fork uses an
+    ! automatic array instead of allocate(...,source=0), so initialize it
+    ! explicitly before only the intra-system entries are populated below.
+    ! Otherwise cross-system entries are undefined and magdist=rmaxab may
+    ! trap on a signaling NaN under floating-point exception checking.
+    rmaxab = 0.0_sp
+
     nci_frag_size = 50
     fragcount = 0
     fragvec = 0

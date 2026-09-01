@@ -39,20 +39,43 @@ module cregen_interface
 !*******************************************************
   implicit none
   interface
-    subroutine newcregen(env,quickset,infile)
+    subroutine newcregen(env,quickset,infile,input_buffer,output_buffer,memory_produced, &
+    & preserve_input)
       use crest_parameters
       use crest_data
       use crest_restartlog
       use strucrd
+      use crest_poststage_ensemble,only:poststage_ensemble
       implicit none
       type(systemdata),intent(inout) :: env
       integer,intent(in),optional :: quickset
       character(len=*),intent(in),optional :: infile
+      type(poststage_ensemble),intent(inout),optional :: input_buffer
+      type(poststage_ensemble),intent(inout),optional :: output_buffer
+      logical,intent(out),optional :: memory_produced
+      logical,intent(in),optional :: preserve_input
     end subroutine newcregen
+  end interface
+
+  interface
+    subroutine cregen_file_wr(env,fname,nat,nall,at,xyz,comments,poststage_out)
+      use crest_parameters,only:wp
+      use crest_data,only:systemdata
+      use crest_poststage_ensemble,only:poststage_ensemble
+      implicit none
+      type(systemdata),intent(inout) :: env
+      character(len=*),intent(in) :: fname
+      integer,intent(in) :: nat,nall
+      integer,intent(in) :: at(nat)
+      real(wp),intent(in) :: xyz(3,nat,nall)
+      character(len=*),intent(in) :: comments(nall)
+      type(poststage_ensemble),intent(inout),optional :: poststage_out
+    end subroutine cregen_file_wr
   end interface
 end module cregen_interface
 
-subroutine newcregen(env,quickset,infile)
+subroutine newcregen(env,quickset,infile,input_buffer,output_buffer,memory_produced, &
+& preserve_input)
 !****************************
 !* The main CREGEN routine
 !****************************
@@ -60,11 +83,17 @@ subroutine newcregen(env,quickset,infile)
   use crest_data
   use crest_restartlog
   use strucrd
+  use crest_poststage_ensemble,only:poststage_ensemble,round_fixed_decimal_10
+  use omp_lib,only:omp_get_wtime
   implicit none
   !> INPUT
   type(systemdata),intent(inout) :: env   !> MAIN STORAGE OS SYSTEM DATA
   integer,intent(in),optional :: quickset !> quick access to predefined CREGEN modes
   character(len=*),intent(in),optional :: infile
+  type(poststage_ensemble),intent(inout),optional :: input_buffer
+  type(poststage_ensemble),intent(inout),optional :: output_buffer
+  logical,intent(out),optional :: memory_produced
+  logical,intent(in),optional :: preserve_input
   !> LOCAL
   integer :: simpleset
   character(len=258) :: fname  !> input file
@@ -107,13 +136,37 @@ subroutine newcregen(env,quickset,infile)
   logical :: anal
   logical :: saveelow
   logical :: userinput
+  logical :: memory_mode,preserve_memory_input
 
 !>--- printout directions
   integer :: prch  !> the main printout channel
   logical :: pr1,pr2,pr3,pr4
+  real(wp) :: stage_clock,cregen_clock
+
+  interface
+    subroutine cregen_file_wr(env,fname,nat,nall,at,xyz,comments,poststage_out)
+      use crest_parameters,only:wp
+      use crest_data,only:systemdata
+      use crest_poststage_ensemble,only:poststage_ensemble
+      implicit none
+      type(systemdata),intent(inout) :: env
+      character(len=*),intent(in) :: fname
+      integer,intent(in) :: nat,nall
+      integer,intent(in) :: at(nat)
+      real(wp),intent(in) :: xyz(3,nat,nall)
+      character(len=*),intent(in) :: comments(nall)
+      type(poststage_ensemble),intent(inout),optional :: poststage_out
+    end subroutine cregen_file_wr
+  end interface
 
 !>--- restart skip & tracking
+  memory_mode = present(input_buffer)
+  preserve_memory_input = .false.
+  if (present(preserve_input)) preserve_memory_input = preserve_input
+  if (present(memory_produced)) memory_produced = .false.
+  if (present(output_buffer)) call output_buffer%clear()
   if (trackrestart(env)) return
+  cregen_clock = omp_get_wtime()
 
 !====================================================================!
 !>  S E T T I N G S
@@ -152,24 +205,73 @@ subroutine newcregen(env,quickset,infile)
 !>  E N S E M B L E   P R O C E S S I N G
 !=====================================================================!
 
-!>--- read in the ensemble parameters
-  call rdensembleparam(fname,nat,nallref)
+!>--- read in the ensemble parameters or consume a canonical in-memory input
+  stage_clock = omp_get_wtime()
+  if (memory_mode) then
+    if (.not.input_buffer%valid()) then
+      write(stdout,*) '**ERROR** invalid in-memory CREGEN input ensemble'
+      env%iostatus_meta = status_failed
+      if (prch /= stdout) close(prch)
+      return
+    end if
+    nat = input_buffer%nat
+    nallref = input_buffer%nall
+  else
+    call rdensembleparam(fname,nat,nallref)
+  end if
+  if (nat < 1 .or. nallref < 1) then
+    write(stdout,*) '**ERROR** empty CREGEN input ensemble'
+    env%iostatus_meta = status_failed
+    if (prch /= stdout) close(prch)
+    return
+  end if
 
 !>--- print a summary about the ensemble and thresholds
   if (pr1) call cregen_pr1(prch,env,nat,nallref,rthr,bthr,pthr,ewin)
 
 !>--- allocate space and read in the ensemble
-  allocate (at(nat),comments(nallref),xyz(3,nat,nallref))
-  call rdensemble(fname,nat,nallref,at,xyz,comments)
+  if (memory_mode) then
+    if (preserve_memory_input) then
+      allocate(at(nat),comments(nallref),xyz(3,nat,nallref))
+      at = input_buffer%at
+      comments = input_buffer%comments
+      xyz = input_buffer%xyz
+    else
+      call move_alloc(input_buffer%at,at)
+      call move_alloc(input_buffer%xyz,xyz)
+      call move_alloc(input_buffer%comments,comments)
+      call input_buffer%clear()
+    end if
+  else
+    allocate (at(nat),comments(nallref),xyz(3,nat,nallref))
+    call rdensemble(fname,nat,nallref,at,xyz,comments)
+  end if
+  write(stdout,'(1x,a,f12.3,a)') 'CREGEN input ingest wall time: ', &
+  & omp_get_wtime()-stage_clock,' sec'
   !call rdensemble(fname,nallref,structures)
   !allocate(references, source=structures)
  
 !>--- track ensemble for restart
+  stage_clock = omp_get_wtime()
   call trackensemble(fname,nat,nallref,at,xyz,comments)
+  write(stdout,'(1x,a,f12.3,a)') 'CREGEN input restart snapshot wall time: ', &
+  & omp_get_wtime()-stage_clock,' sec'
 
 !>--- check if the ensemble contains broken structures? i.e., fusion or dissociation
   if (checkbroken) then
+    stage_clock = omp_get_wtime()
     call discardbroken(prch,env,topocheck,nat,nallref,at,xyz,comments,nall)
+    write(stdout,'(1x,a,f12.3,a)') 'CREGEN broken-structure check wall time: ', &
+    & omp_get_wtime()-stage_clock,' sec'
+    if (env%iostatus_meta /= status_normal) goto 900
+    !> Match the established all-topology-rejected fallback before any
+    !> zero-extent resize: retain the canonical reference as the sole frame.
+    if (nall == 0) then
+      call rdcoord('coord',nat,at,xyz(:,:,1))
+      xyz(:,:,1) = xyz(:,:,1)*bohr
+      write (comments(1),'(f18.8)') env%elowest
+      nall = 1
+    end if
 !>--- if structures were discarded, resize xyz
     if (nall .lt. nallref) then
       xyzref = xyz(:,:,1:nall)
@@ -183,7 +285,11 @@ subroutine newcregen(env,quickset,infile)
 
 !>--- compare neighbourlists to sort out chemically transformed structures
   if (topocheck) then
+    stage_clock = omp_get_wtime()
     call cregen_topocheck(prch,env,checkez,nat,nall,at,xyz,comments,nallnew)
+    write(stdout,'(1x,a,f12.3,a)') 'CREGEN topology total wall time: ', &
+    & omp_get_wtime()-stage_clock,' sec'
+    if (env%iostatus_meta /= status_normal) goto 900
 !>--- if structures were discarded, resize xyz
     if (nallnew .lt. nall) then
 !>-- special fallback if all are discared
@@ -206,7 +312,10 @@ subroutine newcregen(env,quickset,infile)
 
 !>--- sort the ensemble by its energies and make a cut (EWIN)
   if (sortE) then
+    stage_clock = omp_get_wtime()
     call cregen_esort(prch,nat,nall,xyz,comments,nallnew,ewin)
+    write(stdout,'(1x,a,f12.3,a)') 'CREGEN energy sort/cut wall time: ', &
+    & omp_get_wtime()-stage_clock,' sec'
     !>--- if structures were discarded, resize xyz
     if (nallnew .lt. nall) then
       nall = nallnew
@@ -219,8 +328,11 @@ subroutine newcregen(env,quickset,infile)
 
 !>--- do the rotational constants and RMSD check
   if (sortRMSD) then
+    stage_clock = omp_get_wtime()
     allocate (group(0:nall))
     call cregen_CRE(prch,env,nat,nall,at,xyz,comments,nallnew,group,.false.)
+    write(stdout,'(1x,a,f12.3,a)') 'CREGEN RMSD/grouping wall time: ', &
+    & omp_get_wtime()-stage_clock,' sec'
 !>--- if structures were discarded, resize xyz
     if (nallnew .lt. nall) then
       nall = nallnew
@@ -243,8 +355,11 @@ subroutine newcregen(env,quickset,infile)
     call cregen_groupinfo(nall,ng,group,degen)
   end if
   if (sortRMSD2) then
+    stage_clock = omp_get_wtime()
     allocate (group(0:nall))
     call cregen_CRE(prch,env,nat,nall,at,xyz,comments,nallnew,group,.true.)
+    write(stdout,'(1x,a,f12.3,a)') 'CREGEN RMSD2/grouping wall time: ', &
+    & omp_get_wtime()-stage_clock,' sec'
   end if
 
 !=====================================================================!
@@ -252,17 +367,34 @@ subroutine newcregen(env,quickset,infile)
 !=====================================================================!
 
 !>--- align all structures to the first structure using the RMSD
+  stage_clock = omp_get_wtime()
   call cregen_rmsdalign(nat,nall,at,xyz)
+  write(stdout,'(1x,a,f12.3,a)') 'CREGEN final alignment wall time: ', &
+  & omp_get_wtime()-stage_clock,' sec'
 
 !>--- write new file with ALL remaining structures
   if (newfile) then
-    call cregen_file_wr(env,oname,nat,nall,at,xyz,comments)
+    stage_clock = omp_get_wtime()
+    if (present(output_buffer)) then
+      call cregen_file_wr(env,oname,nat,nall,at,xyz,comments,output_buffer)
+    else
+      call cregen_file_wr(env,oname,nat,nall,at,xyz,comments)
+    end if
+    if (env%iostatus_meta /= status_normal) goto 900
+    write(stdout,'(1x,a,f12.3,a)') 'CREGEN sorted artifact write wall time: ', &
+    & omp_get_wtime()-stage_clock,' sec'
 !>--- track ensemble for restart
+    stage_clock = omp_get_wtime()
     call trackensemble(oname,nat,nall,at,xyz,comments)
+    write(stdout,'(1x,a,f12.3,a)') 'CREGEN output restart snapshot wall time: ', &
+    & omp_get_wtime()-stage_clock,' sec'
   end if
 !>--- write a file containing only conformers (no rotamers)
   if (conffile) then
+    stage_clock = omp_get_wtime()
     call cregen_conffile(env,cname,nat,nall,at,xyz,comments,ng,degen)
+    write(stdout,'(1x,a,f12.3,a)') 'CREGEN conformer artifact wall time: ', &
+    & omp_get_wtime()-stage_clock,' sec'
   end if
   if (saveelow) then
     env%elowest = grepenergy(comments(1))
@@ -295,6 +427,7 @@ subroutine newcregen(env,quickset,infile)
   end if
 
 !>--- deallocate data
+900 continue
   if (prch .ne. stdout) then
     close (prch)
   end if
@@ -302,6 +435,14 @@ subroutine newcregen(env,quickset,infile)
   if (allocated(degen)) deallocate (degen)
   if (allocated(group)) deallocate (group)
   deallocate (xyz,comments,at)
+  if (present(memory_produced)) then
+    memory_produced = .false.
+    if (present(output_buffer)) then
+      memory_produced = output_buffer%valid().and.env%iostatus_meta == status_normal
+    end if
+  end if
+  write(stdout,'(1x,a,f12.3,a)') 'CREGEN complete wall time: ', &
+  & omp_get_wtime()-cregen_clock,' sec'
   return
 end subroutine newcregen
 
@@ -636,6 +777,8 @@ subroutine discardbroken(ch,env,topocheck,nat,nall,at,xyz,comments,newnall)
   use crest_data
   use strucrd
   use miscdata,only:rcov
+  use iso_fortran_env,only:int64
+!$ use omp_lib,only:omp_get_wtime,omp_get_max_threads,omp_get_num_threads
   implicit none
   !> INPUT
   type(systemdata) :: env    ! MAIN STORAGE OS SYSTEM DATA
@@ -650,6 +793,8 @@ subroutine discardbroken(ch,env,topocheck,nat,nall,at,xyz,comments,newnall)
   !> LOCAL
   integer :: llan
   integer,allocatable :: order(:),orderref(:)
+  logical,allocatable :: discard_frame(:)
+  real(wp),allocatable :: frame_energy(:)
   integer :: nat0
   real(wp),allocatable :: cref(:,:),c0(:,:),c1(:,:)
   integer,allocatable  :: at0(:),atdum(:)
@@ -661,6 +806,12 @@ subroutine discardbroken(ch,env,topocheck,nat,nall,at,xyz,comments,newnall)
   logical :: distok,distcheck
   real(wp) :: cnorm
   logical :: dissoc
+  real(wp) :: broken_frames_t0,broken_frames_t1
+  integer :: broken_workers,broken_team
+  integer :: broken_alloc_status,broken_local_alloc_status
+  integer(int64) :: broken_scratch_bytes,broken_memory_workers
+  integer(int64),parameter :: broken_scratch_budget = &
+  & 4_int64*1024_int64*1024_int64*1024_int64
 
   !>--- if we don't wish to include all atoms:
   substruc = (nat .ne. env%rednat.and.env%subRMSD)
@@ -689,33 +840,122 @@ subroutine discardbroken(ch,env,topocheck,nat,nall,at,xyz,comments,newnall)
   allocate (bond(nat0,nat0),cn(nat0))
   call mreclm(frag0,nat0,at0,c0,atdum,bond,rcov,cn)
 
+  !>--- the legacy frame loop reused these arrays serially.  Release them
+  !>    before making one private heap-backed copy per OpenMP worker.
+  deallocate (bond,cn,atdum,c1)
   allocate (order(nall),orderref(nall))
-  !>--- loop over the structures
+  allocate (discard_frame(nall),source=.false.)
+  allocate (frame_energy(nall))
+
+  !>--- keep comment parsing serial.  The expensive coordinate, distance,
+  !>    and fragment work below is frame-local; parsing first also avoids
+  !>    concurrent formatted internal I/O without changing its result.
+  do j = 1,nall
+    frame_energy(j) = grepenergy(comments(j))
+  end do
+
+  !> One frame owns bond and the private BREF automatic array inside MRECLM,
+  !> plus the coordinate and vector work arrays.  Cap aggregate scratch
+  !> conservatively while preserving useful parallelism for large systems.
+  if (topocheck) then
+    broken_scratch_bytes = 16_int64*int(nat0,int64)*int(nat0,int64) &
+    & +40_int64*int(nat0,int64)
+  else
+    broken_scratch_bytes = 28_int64*int(nat0,int64)
+  end if
+  broken_workers = 1
+!$ broken_workers = max(1,min(nall,omp_get_max_threads()))
+  broken_memory_workers = max(1_int64,broken_scratch_budget/ &
+  & max(1_int64,broken_scratch_bytes))
+  broken_workers = int(min(int(broken_workers,int64),broken_memory_workers))
+  broken_team = 1
+  broken_alloc_status = 0
+  if (broken_scratch_bytes > broken_scratch_budget) then
+    write (ch,'(" **ERROR** CREGEN broken-frame scratch exceeds budget / bytes:",i0)') &
+    & broken_scratch_bytes
+    env%iostatus_meta = status_failed
+    newnall = 0
+    goto 900
+  end if
+
+  !>--- evaluate frames independently, retaining each frame's original
+  !>    arithmetic and call ordering.  Only the later serial fold assigns
+  !>    output slots, so scheduling cannot affect ensemble ordering.
+  broken_frames_t0 = 0.0_wp
+!$ broken_frames_t0 = omp_get_wtime()
+  !$omp parallel default(none) &
+  !$omp shared(env,topocheck,nat,nat0,nall,at,at0,xyz,substruc,frag0) &
+  !$omp shared(frame_energy,discard_frame,broken_team,broken_alloc_status) &
+  !$omp private(j,erj,c1,atdum,bond,cn,frag,distok,cnorm,dissoc) &
+  !$omp private(broken_local_alloc_status) &
+  !$omp num_threads(broken_workers)
+  !$omp single
+!$ broken_team = omp_get_num_threads()
+  !$omp end single
+  broken_local_alloc_status = 0
+  allocate (c1(3,nat0),atdum(nat0),stat=broken_local_alloc_status)
+  if (broken_local_alloc_status == 0 .and.topocheck) then
+    allocate (bond(nat0,nat0),cn(nat0),source=0.0_wp, &
+    & stat=broken_local_alloc_status)
+  end if
+  if (broken_local_alloc_status /= 0) then
+    !$omp critical(crest_broken_alloc_status)
+    if (broken_alloc_status == 0) broken_alloc_status = broken_local_alloc_status
+    !$omp end critical(crest_broken_alloc_status)
+  end if
+  !$omp barrier
+
+  if (broken_alloc_status == 0) then
+    !$omp do schedule(static)
+    do j = 1,nall
+      erj = frame_energy(j)
+      if (.not.substruc) then
+        c1(:,:) = xyz(:,:,j)/bohr
+      else
+        call maskedxyz(nat,nat0,xyz(:,:,j),c1,at,atdum,env%includeRMSD)
+        c1 = c1/bohr
+      end if
+      distok = distcheck(nat0,c1)
+      cnorm = sum(abs(c1))
+
+      dissoc = .false.
+      if (abs(erj) .gt. 1.0d-6.and.cnorm .gt. 1.0d-6 &
+      &   .and.distok.and.topocheck) then
+        call mreclm(frag,nat0,at0,c1,atdum,bond,rcov,cn)
+        if (frag .gt. frag0) dissoc = .true.
+      end if
+      discard_frame(j) = dissoc.or.(cnorm .lt. 1.0d-6).or.(.not.distok)
+    end do
+    !$omp end do
+  end if
+
+  if (allocated(bond)) deallocate (bond)
+  if (allocated(cn)) deallocate (cn)
+  if (allocated(atdum)) deallocate (atdum)
+  if (allocated(c1)) deallocate (c1)
+  !$omp end parallel
+  broken_frames_t1 = broken_frames_t0
+!$ broken_frames_t1 = omp_get_wtime()
+  write (ch,'(" CREGEN broken-frame work wall / s       :",f12.6)') &
+  & broken_frames_t1-broken_frames_t0
+  write (ch,'(" CREGEN broken-frame workers requested/actual:",i6," /",i6)') &
+  & broken_workers,broken_team
+  write (ch,'(" CREGEN broken-frame scratch per worker / MiB:",f12.3)') &
+  & real(broken_scratch_bytes,wp)/(1024.0_wp*1024.0_wp)
+  if (broken_alloc_status /= 0) then
+    write (ch,'(" **ERROR** CREGEN broken-frame worker allocation failed; stat=",i0)') &
+    & broken_alloc_status
+    env%iostatus_meta = status_failed
+    newnall = 0
+    goto 900
+  end if
+
+  !>--- deterministic serial fold reproduces accepted input order and the
+  !>    legacy reverse-tail placement of rejected structures exactly.
   newnall = 0
   llan = nall
   do j = 1,nall
-    erj = grepenergy(comments(j)) !> get energy of structure j
-    if (.not.substruc) then
-      c1(:,:) = xyz(:,:,j)/bohr
-    else
-      call maskedxyz(nat,nat0,xyz(:,:,j),c1,at,at0,env%includeRMSD)
-      c1 = c1/bohr
-    end if
-    distok = distcheck(nat0,c1) !> distance check
-    cnorm = sum(abs(c1))        !> clash check
-
-    !>--- further checks: dissociation?
-    dissoc = .false.
-    if (abs(erj) .gt. 1.0d-6.and.cnorm .gt. 1.0d-6 &
-    &   .and.distok.and.topocheck) then
-      dissoc = .false.
-      call mreclm(frag,nat0,at0,c1,atdum,bond,rcov,cn)
-      if (frag .gt. frag0) then
-        dissoc = .true.
-      end if
-    end if
-
-    if (dissoc.or.(cnorm .lt. 1.0d-6).or.(.not.distok)) then
+    if (discard_frame(j)) then
       !>--- move broken structures to the end of the matrix
       orderref(j) = llan
       llan = llan-1
@@ -738,8 +978,11 @@ subroutine discardbroken(ch,env,topocheck,nat,nall,at,xyz,comments,newnall)
   end if
   !>--- otherwise the ensemble is ok
 
+900 continue
   if (allocated(orderref)) deallocate (orderref)
   if (allocated(order)) deallocate (order)
+  if (allocated(discard_frame)) deallocate (discard_frame)
+  if (allocated(frame_energy)) deallocate (frame_energy)
   if (allocated(cn)) deallocate (cn)
   if (allocated(bond)) deallocate (bond)
   if (allocated(atdum)) deallocate (atdum)
@@ -764,6 +1007,8 @@ subroutine cregen_topocheck(ch,env,checkez,nat,nall,at,xyz,comments,newnall)
   use miscdata,only:rcov
   use utilities
   use crest_cn_module
+  use iso_fortran_env,only:int64
+!$ use omp_lib,only:omp_get_wtime,omp_get_max_threads,omp_get_num_threads
   implicit none
   type(systemdata) :: env    ! MAIN STORAGE OS SYSTEM DATA
   integer,intent(in) :: ch ! printout channel
@@ -785,18 +1030,28 @@ subroutine cregen_topocheck(ch,env,checkez,nat,nall,at,xyz,comments,newnall)
   integer :: j,l
   integer :: ntopo,ncc,ccfail
   logical :: discard
+  logical,allocatable :: discard_frame(:),ezfail_frame(:)
   integer,allocatable :: ezat(:,:)
   real(wp),allocatable :: ezdihedref(:)
   real(wp),allocatable :: ezdihed(:)
   real(wp) :: winkeldiff
+  real(wp) :: topo_ref_t0,topo_ref_t1
+  real(wp) :: topo_frames_t0,topo_frames_t1
+  integer :: topo_workers,topo_team
+  integer :: topo_alloc_status,topo_local_alloc_status
+  integer(int64) :: topology_scratch_bytes,topology_memory_workers
+  integer(int64),parameter :: topology_scratch_budget = &
+  & 4_int64*1024_int64*1024_int64*1024_int64
 
   !>--- read the reference structure
+  topo_ref_t0 = 0.0_wp
+!$ topo_ref_t0 = omp_get_wtime()
   allocate (cref(3,nat),atdum(nat))
   call rdcoord('coord',nat,atdum,cref)
 
   !>--- get the reference topology matrix (bonds)
   ntopo = nat*(nat+1)/2
-  allocate (toporef(ntopo),topo(ntopo))
+  allocate (toporef(ntopo))
   allocate (neighmat(nat,nat),source=.false.)
   allocate (bond(nat,nat),cn(nat),source=0.0_wp)
   cn = 0.0d0
@@ -812,13 +1067,14 @@ subroutine cregen_topocheck(ch,env,checkez,nat,nall,at,xyz,comments,newnall)
   nbonds = sum(toporef)
   write (ch,'('' # bonds in reference structure :'',i6)') nbonds
   !>--- if required, check for C=C bonds (based only on structure!)
+  ncc = 0
   if (checkez) then
     cref = cref*bohr
     call nezcc(nat,atdum,cref,cn,ntopo,toporef,ncc)
     if (ncc > 0) then
       write (ch,'(''   => # of C=C bonds :'',i6)') ncc
       allocate (ezat(4,ncc))
-      allocate (ezdihedref(ncc),ezdihed(ncc),source=0.0d0)
+      allocate (ezdihedref(ncc),source=0.0d0)
       call ezccat(nat,atdum,cref,cn,ntopo,toporef,ncc,ezat)
       call ezccdihed(nat,cref,ncc,ezat,ezdihedref)
       !do i=1,ncc
@@ -827,46 +1083,135 @@ subroutine cregen_topocheck(ch,env,checkez,nat,nall,at,xyz,comments,newnall)
     end if
   end if
 
+  topo_ref_t1 = topo_ref_t0
+!$ topo_ref_t1 = omp_get_wtime()
+  write (ch,'(" CREGEN topology reference setup wall / s :",f12.6)') &
+  &  topo_ref_t1-topo_ref_t0
+
+  !>--- frame scratch is allocated privately once per OpenMP thread below
+  deallocate (cn,bond)
+  deallocate (neighmat)
+
   allocate (order(nall),orderref(nall))
-  allocate (c1(3,nat))
-  !>--- loop over the structures
+  allocate (discard_frame(nall),ezfail_frame(nall),source=.false.)
+
+  !> One frame owns two nat-by-nat work arrays plus smaller vectors.  Limit
+  !> the team both by useful frame work and by a conservative aggregate
+  !> scratch budget without encoding a particular system size or layout.
+  topology_scratch_bytes = 8_int64*(int(nat,int64)*int(nat,int64) &
+  & +4_int64*int(nat,int64)+int(ncc,int64)) &
+  & +4_int64*(int(nat,int64)*int(nat,int64)+int(ntopo,int64))
+  topo_workers = 1
+!$ topo_workers = max(1,min(nall,omp_get_max_threads()))
+  topology_memory_workers = max(1_int64,topology_scratch_budget/ &
+  & max(1_int64,topology_scratch_bytes))
+  topo_workers = int(min(int(topo_workers,int64),topology_memory_workers))
+  topo_team = 1
+  topo_alloc_status = 0
+
+  !>--- loop over the structures with heap-backed scratch private to each thread
+  topo_frames_t0 = 0.0_wp
+!$ topo_frames_t0 = omp_get_wtime()
+  !$omp parallel default(none) &
+  !$omp shared(env,checkez,nat,nall,at,xyz,ntopo,toporef,ncc,ezat,ezdihedref) &
+  !$omp shared(discard_frame,ezfail_frame,topo_team,topo_alloc_status) &
+  !$omp private(j,l,discard,winkeldiff,c1,cn,bond,topo,neighmat,ezdihed) &
+  !$omp private(topo_local_alloc_status) &
+  !$omp num_threads(topo_workers)
+  !$omp single
+!$ topo_team = omp_get_num_threads()
+  !$omp end single
+  topo_local_alloc_status = 0
+  allocate (c1(3,nat),stat=topo_local_alloc_status)
+  if (topo_local_alloc_status == 0) then
+    allocate (cn(nat),bond(nat,nat),source=0.0_wp,stat=topo_local_alloc_status)
+  end if
+  if (topo_local_alloc_status == 0) then
+    allocate (topo(ntopo),stat=topo_local_alloc_status)
+  end if
+  if (topo_local_alloc_status == 0) then
+    allocate (neighmat(nat,nat),source=.false.,stat=topo_local_alloc_status)
+  end if
+  if (topo_local_alloc_status == 0 .and.checkez.and.ncc > 0) then
+    allocate (ezdihed(ncc),source=0.0_wp,stat=topo_local_alloc_status)
+  end if
+  if (topo_local_alloc_status /= 0) then
+    !$omp critical(crest_topology_alloc_status)
+    if (topo_alloc_status == 0) topo_alloc_status = topo_local_alloc_status
+    !$omp end critical(crest_topology_alloc_status)
+  end if
+  !$omp barrier
+
+  if (topo_alloc_status == 0) then
+    !$omp do schedule(static)
+    do j = 1,nall
+      c1(1:3,1:nat) = xyz(1:3,1:nat,j)/bohr
+      !>--- generate topo and compare
+      discard = .false.
+      cn = 0.0d0
+      bond = 0.0d0
+      call calc_ncoord(nat,at,c1,rcov,cn,400.0_wp,bond)
+      if (allocated(env%excludeTOPO)) then
+        call bondtotopo_excl(nat,at,bond,cn,ntopo,topo,neighmat,env%excludeTOPO)
+      else
+        call bondtotopo(nat,at,bond,cn,ntopo,topo,neighmat)
+      end if
+      do l = 1,ntopo
+        if (toporef(l) .ne. topo(l)) then
+          discard = .true.   !> if there is any mismatch in neighbor lists
+          exit
+        end if
+      end do
+      !>--- get E/Z info of C=C, discard isomers
+      if (checkez.and..not.discard.and.ncc > 0) then
+        c1 = c1*bohr
+        call ezccdihed(nat,c1,ncc,ezat,ezdihed)
+        do l = 1,ncc
+          winkeldiff = ezdihedref(l)-ezdihed(l)
+          winkeldiff = abs(winkeldiff)
+          if (winkeldiff > 90.0_wp) then
+            discard = .true.
+            ezfail_frame(j) = .true.
+            exit
+          end if
+        end do
+      end if
+
+      discard_frame(j) = discard
+    end do
+    !$omp end do
+  end if
+
+  if (allocated(ezdihed)) deallocate (ezdihed)
+  if (allocated(neighmat)) deallocate (neighmat)
+  if (allocated(topo)) deallocate (topo)
+  if (allocated(cn)) deallocate (cn)
+  if (allocated(bond)) deallocate (bond)
+  if (allocated(c1)) deallocate (c1)
+  !$omp end parallel
+  topo_frames_t1 = topo_frames_t0
+!$ topo_frames_t1 = omp_get_wtime()
+  write (ch,'(" CREGEN topology frame work wall / s      :",f12.6)') &
+  &  topo_frames_t1-topo_frames_t0
+  write (ch,'(" CREGEN topology workers requested/actual:",i6," /",i6)') &
+  & topo_workers,topo_team
+  write (ch,'(" CREGEN topology scratch per worker / MiB:",f12.3)') &
+  & real(topology_scratch_bytes,wp)/(1024.0_wp*1024.0_wp)
+  if (topo_alloc_status /= 0) then
+    write (ch,'(" **ERROR** CREGEN topology worker allocation failed; stat=",i0)') &
+    & topo_alloc_status
+    env%iostatus_meta = status_failed
+    newnall = 0
+    goto 900
+  end if
+
+  !>--- deterministic serial fold preserves the legacy stable ordering exactly
   ccfail = 0
   newnall = 0
   llan = nall
   do j = 1,nall
-    c1(1:3,1:nat) = xyz(1:3,1:nat,j)/bohr
-    !>--- generate topo and compare
-    discard = .false.
-    cn = 0.0d0
-    bond = 0.0d0
-    call calc_ncoord(nat,at,c1,rcov,cn,400.0_wp,bond)
-    if (allocated(env%excludeTOPO)) then
-      call bondtotopo_excl(nat,at,bond,cn,ntopo,topo,neighmat,env%excludeTOPO)
-    else
-      call bondtotopo(nat,at,bond,cn,ntopo,topo,neighmat)
-    end if
-    do l = 1,ntopo
-      if (toporef(l) .ne. topo(l)) then
-        discard = .true.   !> if there is any mismatch in neighbor lists
-        exit
-      end if
-    end do
-    !>--- get E/Z info of C=C, discard isomers
-    if (checkez.and..not.discard.and.ncc > 0) then
-      c1 = c1*bohr
-      call ezccdihed(nat,c1,ncc,ezat,ezdihed)
-      do l = 1,ncc
-        winkeldiff = ezdihedref(l)-ezdihed(l)
-        winkeldiff = abs(winkeldiff)
-        if (winkeldiff > 90.0_wp) then
-          discard = .true.
-          ccfail = ccfail+1
-          exit
-        end if
-      end do
-    end if
-
-    if (discard) then
+    if (ezfail_frame(j)) ccfail = ccfail+1
+    if (discard_frame(j)) then
       !>-- move broken structures to the end of the matrix
       orderref(j) = llan
       llan = llan-1
@@ -876,6 +1221,7 @@ subroutine cregen_topocheck(ch,env,checkez,nat,nall,at,xyz,comments,newnall)
     end if
   end do
 
+  allocate (c1(3,nat))
   !>--- sort the xyz array (only if structures have been discarded)
   if (newnall .lt. nall) then
     order = orderref
@@ -896,15 +1242,18 @@ subroutine cregen_topocheck(ch,env,checkez,nat,nall,at,xyz,comments,newnall)
   !>--- otherwise the ensemble is ok
 
   deallocate (c1)
-  deallocate (orderref,order)
+
+900 continue
+  if (allocated(c1)) deallocate (c1)
+  if (allocated(discard_frame)) deallocate (discard_frame)
+  if (allocated(ezfail_frame)) deallocate (ezfail_frame)
+  if (allocated(orderref)) deallocate (orderref)
+  if (allocated(order)) deallocate (order)
   if (allocated(ezdihedref)) deallocate (ezdihedref)
-  if (allocated(ezdihed)) deallocate (ezdihed)
   if (allocated(ezat)) deallocate (ezat)
-  deallocate (cn,bond)
-  deallocate (neighmat)
-  deallocate (topo,toporef)
-  deallocate (atdum)
-  deallocate (cref)
+  if (allocated(toporef)) deallocate (toporef)
+  if (allocated(atdum)) deallocate (atdum)
+  if (allocated(cref)) deallocate (cref)
   return
 
 contains
@@ -1143,6 +1492,7 @@ subroutine cregen_CRE(ch,env,nat,nall,at,xyz,comments,nallout,group,nosort)
   use ls_rmsd
   use axis_module
   use utilities
+!$ use omp_lib,only:omp_get_wtime,omp_get_max_threads,omp_get_num_threads
   implicit none
   type(systemdata) :: env
   integer,intent(in) :: ch
@@ -1166,8 +1516,10 @@ subroutine cregen_CRE(ch,env,nat,nall,at,xyz,comments,nallout,group,nosort)
   integer,allocatable :: includeRMSD(:)
   real(wp),allocatable :: c0(:,:),c1(:,:),cdum(:,:)
   real(wp),allocatable :: c0h(:,:),c1h(:,:)
+  real(wp),allocatable :: caxis(:,:)
   integer,allocatable  :: maskheavy(:)
   integer,allocatable :: at0(:)
+  integer,allocatable :: ataxis(:)
   logical :: substruc
   integer :: nat0
   real(wp),allocatable :: rot(:,:)
@@ -1190,6 +1542,8 @@ subroutine cregen_CRE(ch,env,nat,nall,at,xyz,comments,nallout,group,nosort)
   real(wp) :: r
   integer :: i,j,k,l,natnoh
   logical :: heavy
+  real(wp) :: axis_t0,axis_t1,rmsd_t0,rmsd_t1
+  integer :: axis_team,rmsd_team
 
 !>--- set parameters
   call cregen_filldata1(env,ewin,rthr,ethr,bthr,athr,pthr,T,couthr)
@@ -1220,15 +1574,35 @@ subroutine cregen_CRE(ch,env,nat,nall,at,xyz,comments,nallout,group,nosort)
   end if
 
 !>--- transform the coordinates to CMA and get rot.constants
+  axis_team = 1
+  axis_t0 = 0.0_wp
+!$ axis_t0 = omp_get_wtime()
+  !$omp parallel default(none) &
+  !$omp shared(nat,nat0,nall,at,xyz,rot,substruc,includeRMSD,axis_team) &
+  !$omp private(i,caxis,ataxis,bdum)
+  !$omp single
+!$ axis_team = omp_get_num_threads()
+  !$omp end single
+  allocate (caxis(3,nat0),ataxis(nat0))
+  if (.not.substruc) ataxis = at
+  !$omp do schedule(static)
   do i = 1,nall
     call axis(nat,at,xyz(:,:,i)) !>-- all coordinates to CMA
     if (substruc) then
-      call maskedxyz(nat,nat0,xyz(:,:,i),c1,at,at0,includeRMSD)
+      call maskedxyz(nat,nat0,xyz(:,:,i),caxis,at,ataxis,includeRMSD)
     else
-      c1(:,:) = xyz(:,:,i)
+      caxis(:,:) = xyz(:,:,i)
     end if
-    call axis(nat0,at0,c1,rot(1:3,i),bdum)  !>-- B0 in MHz
+    call axis(nat0,ataxis,caxis,rot(1:3,i),bdum)  !>-- B0 in MHz
   end do
+  !$omp end do
+  deallocate (ataxis,caxis)
+  !$omp end parallel
+  axis_t1 = axis_t0
+!$ axis_t1 = omp_get_wtime()
+  write (ch,'(" CREGEN axis/rotational work wall / s      :",f12.6)') &
+  & axis_t1-axis_t0
+  write (ch,'(" CREGEN axis/rotational workers actual     :",i6)') axis_team
 
 !>--- RMSD part
   allocate (double(nall),source=0)
@@ -1263,14 +1637,21 @@ subroutine cregen_CRE(ch,env,nat,nall,at,xyz,comments,nallout,group,nosort)
   klong = 0
   write (stdout,'(a)',advance='no') 'CREGEN> running RMSDs ...'
   flush (stdout)
+  rmsd_team = 1
+  rmsd_t0 = 0.0_wp
+!$ rmsd_t0 = omp_get_wtime()
   !++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++!
   if (.not.substruc) then !regular case, all atoms included in RMSD
     if (.not.heavy) then    !really, the regular case
+      !$omp parallel default(none) &
+      !$omp shared(nall,nat,xyz,rmat,rmap1,rmap2,er,ethr,enantio,rmsd_team) &
+      !$omp private(i,j,klong,c0,c1,xdum,ydum,Udum,gdum,rdum,rdum2,de)
+      !$omp single
+!$ rmsd_team = omp_get_num_threads()
+      !$omp end single
+      !$omp do schedule(static,1)
       do i = 1,nall
         c0(1:3,1:nat) = xyz(1:3,1:nat,i)
-!$OMP PARALLEL PRIVATE ( j,klong,c1,xdum,ydum,Udum,gdum,rdum,rdum2,de) &
-!$OMP SHARED ( i,c0,rmat,nat,xyz,rmap1,rmap2,er,ethr,enantio)
-!$OMP DO
         do j = 1,i-1
           de = (er(i)-er(j))*autokcal
           if (de .lt. ethr) then
@@ -1286,20 +1667,25 @@ subroutine cregen_CRE(ch,env,nat,nall,at,xyz,comments,nallout,group,nosort)
             rmat(klong) = real(min(rdum,rdum2),sp)
           end if
         end do
-!$OMP END DO
-!$OMP END PARALLEL
       end do
+      !$omp end do
+      !$omp end parallel
     else  !> heavy atom case
       natnoh = nat-counth(nat,at)
       allocate (c0h(3,natnoh),c1h(3,natnoh),source=0.0_wp)
       allocate (maskheavy(nat),source=0)
       call heavymask(nat,at,maskheavy)
       write (*,*) 'doing heavy atom rmsds with ',natnoh,' atoms'
+      !$omp parallel default(none) &
+      !$omp shared(nall,nat,natnoh,xyz,rmat,rmap1,rmap2,er,ethr) &
+      !$omp shared(enantio,maskheavy,rmsd_team) &
+      !$omp private(i,j,klong,c0h,c1h,xdum,ydum,Udum,gdum,rdum,rdum2,de)
+      !$omp single
+!$ rmsd_team = omp_get_num_threads()
+      !$omp end single
+      !$omp do schedule(static,1)
       do i = 1,nall
         call maskedxyz2(nat,natnoh,xyz(:,:,i),c0h,maskheavy)
-!$OMP PARALLEL PRIVATE ( j,klong,c1h,xdum,ydum,Udum,gdum,rdum,rdum2,de) &
-!$OMP SHARED ( i,c0h,rmat,nat,xyz,rmap1,rmap2,er,ethr,enantio,maskheavy)
-!$OMP DO
         do j = 1,i-1
           de = (er(i)-er(j))*autokcal
           if (de .lt. ethr) then
@@ -1315,19 +1701,24 @@ subroutine cregen_CRE(ch,env,nat,nall,at,xyz,comments,nallout,group,nosort)
             rmat(klong) = real(min(rdum,rdum2),sp)
           end if
         end do
-!$OMP END DO
-!$OMP END PARALLEL
       end do
+      !$omp end do
+      !$omp end parallel
       deallocate (maskheavy,c1h,c0h)
     end if
     !++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++!
   else !substruc == .true., RMSDs only on a part of the structure
     !++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++!
+    !$omp parallel default(none) &
+    !$omp shared(nall,nat,nat0,xyz,rmat,rmap1,rmap2,er,ethr,includeRMSD) &
+    !$omp shared(enantio,rmsd_team) &
+    !$omp private(i,j,klong,c0,c1,xdum,ydum,Udum,gdum,rdum,rdum2,de)
+    !$omp single
+!$ rmsd_team = omp_get_num_threads()
+    !$omp end single
+    !$omp do schedule(static,1)
     do i = 1,nall
       call maskedxyz2(nat,nat0,xyz(:,:,i),c0,includeRMSD)
-!$OMP PARALLEL PRIVATE ( j,klong,c1,xdum,ydum,Udum,gdum,rdum,rdum2,de) &
-!$OMP SHARED ( i,c0,rmat,nat,nat0,xyz,rmap1,rmap2,er,ethr,includeRMSD,enantio )
-!$OMP DO
       do j = 1,i-1
         de = (er(i)-er(j))*autokcal
         if (de .lt. ethr) then
@@ -1343,11 +1734,16 @@ subroutine cregen_CRE(ch,env,nat,nall,at,xyz,comments,nallout,group,nosort)
           rmat(klong) = real(min(rdum,rdum2),sp)
         end if
       end do
-!$OMP END DO
-!$OMP END PARALLEL
     end do
+    !$omp end do
+    !$omp end parallel
   end if
+  rmsd_t1 = rmsd_t0
+!$ rmsd_t1 = omp_get_wtime()
   write (stdout,'(1x,a)') 'done.'
+  write (ch,'(" CREGEN RMSD matrix work wall / s          :",f12.6)') &
+  & rmsd_t1-rmsd_t0
+  write (ch,'(" CREGEN RMSD matrix workers actual         :",i6)') rmsd_team
   !++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++!
 !>-- Now, with the RMSDs and rotational constants we can kick out duplicates
   do i = 1,nall
@@ -1419,8 +1815,11 @@ subroutine cregen_CRE(ch,env,nat,nall,at,xyz,comments,nallout,group,nosort)
   end if
 
 !>-- finally, determine conformer groups and their rotamers
-  allocate (c1(3,nat))
   allocate (enuc(nallout))
+!$omp parallel default(none) shared(nallout,nat,xyz,at,enuc) &
+!$omp private(k,c1,i,j,r)
+  allocate (c1(3,nat))
+!$omp do schedule(static)
   do k = 1,nallout
     c1(1:3,1:nat) = xyz(1:3,1:nat,k)
     enuc(k) = 0.0_wp
@@ -1433,6 +1832,9 @@ subroutine cregen_CRE(ch,env,nat,nall,at,xyz,comments,nallout,group,nosort)
       end do
     end do
   end do
+!$omp end do
+  deallocate (c1)
+!$omp end parallel
 !>-- check energy, rot. const. and nuclear permutation
   double = 0 !>-- re-use "double"
   SORTI: do i = 1,nallout
@@ -1473,7 +1875,7 @@ subroutine cregen_CRE(ch,env,nat,nall,at,xyz,comments,nallout,group,nosort)
     write (ch,'(1x,a,i10)') 'total number unique points remaining :',nallout
   end if
 
-  deallocate (enuc,c1,double)
+  deallocate (enuc,double)
   deallocate (order,orderref)
   if (allocated(ecoul)) deallocate (ecoul)
   deallocate (er)
@@ -2102,29 +2504,65 @@ end subroutine maskedxyz2
 
 !=========================================================================================!
 
-subroutine cregen_file_wr(env,fname,nat,nall,at,xyz,comments)
+subroutine cregen_file_wr(env,fname,nat,nall,at,xyz,comments,poststage_out)
 !*********************************
 !* write the output ensemble file
 !*********************************
-  use crest_parameters,only:wp
+  use crest_parameters,only:wp,stdout
+  use iso_fortran_env,only:int64
   use crest_data
   use strucrd
   use utilities,only:boltz
+  use iomod,only:remove
+  use crest_poststage_ensemble,only:poststage_ensemble,poststage_comment_length, &
+  & round_fixed_decimal_10,write_canonical_ensemble_fast
+!$ use omp_lib,only:omp_get_wtime,omp_get_max_threads,omp_get_num_threads
   implicit none
-  type(systemdata) :: env
-  character(len=*) :: fname
-  integer :: nat,nall
-  integer :: at(nat)
-  real(wp) :: xyz(3,nat,nall)
-  character(len=*) :: comments(nall)
-  character(len=128) :: newcomment
-
-  integer :: ich,i
-  real(wp),allocatable :: c0(:,:),xdum(:)
+  type(systemdata),intent(inout) :: env
+  character(len=*),intent(in) :: fname
+  integer,intent(in) :: nat,nall
+  integer,intent(in) :: at(nat)
+  real(wp),intent(in) :: xyz(3,nat,nall)
+  character(len=*),intent(in) :: comments(nall)
+  type(poststage_ensemble),intent(inout),optional :: poststage_out
+  character(len=poststage_comment_length) :: newcomment
+  character(len=poststage_comment_length),allocatable :: output_comments(:)
+  character(len=1024) :: artifact_message
+  integer :: i,j,k,io,artifact_status
+  integer(int64) :: artifact_bytes
+  logical :: capture_failed
+  logical,allocatable :: capture_frame_failed(:)
   real(wp) :: eref,T
+  real(wp) :: capture_t0,capture_t1,artifact_write_seconds
+  integer :: capture_workers,capture_team
+  integer(int64) :: capture_fallbacks,frame_fallbacks
+  logical :: used_fallback
+  real(wp) :: rounded
   real(wp),allocatable :: er(:),erel(:),p(:)
   character(len=40),allocatable :: origin(:)
   real(wp),parameter :: autokcal = 627.509541_wp
+
+  capture_failed = .false.
+  if (present(poststage_out)) then
+    call poststage_out%clear()
+    allocate(poststage_out%at(nat),poststage_out%xyz(3,nat,nall), &
+    & poststage_out%eread(nall),poststage_out%comments(nall), &
+    & stat=io)
+    if (io /= 0) then
+      env%iostatus_meta = status_failed
+      call poststage_out%clear()
+      call remove(fname)
+      return
+    end if
+    poststage_out%at = at
+    allocate(capture_frame_failed(nall),source=.false.,stat=io)
+    if (io /= 0) then
+      env%iostatus_meta = status_failed
+      call poststage_out%clear()
+      call remove(fname)
+      return
+    end if
+  end if
 
   allocate (er(nall),erel(nall),p(nall),origin(nall))
   eref = grepenergy(comments(1))
@@ -2138,19 +2576,101 @@ subroutine cregen_file_wr(env,fname,nat,nall,at,xyz,comments)
   T = env%tboltz
   call boltz(nall,T,erel,p)
 
-  allocate (c0(3,nat),xdum(3))
-  open (newunit=ich,file=fname)
+  allocate(output_comments(nall),stat=io)
+  if (io /= 0) then
+    env%iostatus_meta = status_failed
+    if (present(poststage_out)) call poststage_out%clear()
+    call remove(fname)
+    if (allocated(capture_frame_failed)) deallocate(capture_frame_failed)
+    deallocate(origin,p,erel,er)
+    return
+  end if
   do i = 1,nall
-    c0(:,:) = xyz(:,:,i)
     if (env%trackorigin) then
       write (newcomment,*) er(i),p(i),'!'//trim(origin(i))
     else
       write (newcomment,*) er(i),p(i)
     end if
-    call wrxyz(ich,nat,at,c0,newcomment)
+    output_comments(i) = trim(newcomment)
+    if (present(poststage_out)) then
+      poststage_out%comments(i) = output_comments(i)
+      poststage_out%eread(i) = grepenergy(output_comments(i))
+    end if
   end do
-  close (ich)
-  deallocate (xdum,c0)
+
+  artifact_message = ''
+  artifact_bytes = 0_int64
+  artifact_write_seconds = 0.0_wp
+  call write_canonical_ensemble_fast(fname,at,xyz,output_comments,artifact_bytes, &
+  & artifact_write_seconds,artifact_status,artifact_message)
+  if (artifact_status /= status_normal) then
+    env%iostatus_meta = status_failed
+    if (present(poststage_out)) call poststage_out%clear()
+    call remove(fname)
+    if (len_trim(artifact_message) > 0) write(stdout,'(1x,a)') trim(artifact_message)
+    if (allocated(capture_frame_failed)) deallocate(capture_frame_failed)
+    deallocate(output_comments,origin,p,erel,er)
+    return
+  end if
+  write(stdout,'(1x,a,i0,a,f12.3,a)') &
+  & 'CREGEN buffered C artifact bytes: ',artifact_bytes, &
+  & '; writer-internal time: ',artifact_write_seconds,' sec'
+  if (present(poststage_out)) then
+    capture_workers = 1
+!$ capture_workers = max(1,min(16,nall,omp_get_max_threads()))
+    capture_team = 1
+    capture_fallbacks = 0_int64
+    capture_t0 = 0.0_wp
+!$ capture_t0 = omp_get_wtime()
+    if (.not.capture_failed) then
+      !$omp parallel default(none) &
+      !$omp shared(nat,nall,at,xyz,poststage_out,capture_frame_failed,capture_team) &
+      !$omp private(i,j,k,io,rounded,used_fallback,frame_fallbacks) &
+      !$omp reduction(+:capture_fallbacks) &
+      !$omp num_threads(capture_workers)
+      !$omp single
+!$ capture_team = omp_get_num_threads()
+      !$omp end single
+      !$omp do schedule(static)
+      do i = 1,nall
+        frame_fallbacks = 0_int64
+        do j = 1,nat
+          do k = 1,3
+            call round_fixed_decimal_10(xyz(k,j,i),rounded,io,used_fallback)
+            if (io /= 0) then
+              capture_frame_failed(i) = .true.
+            else
+              poststage_out%xyz(k,j,i) = rounded
+              if (used_fallback) frame_fallbacks = frame_fallbacks+1_int64
+            end if
+          end do
+        end do
+        capture_fallbacks = capture_fallbacks+frame_fallbacks
+      end do
+      !$omp end do
+      !$omp end parallel
+      capture_failed = any(capture_frame_failed)
+    end if
+    capture_t1 = capture_t0
+!$ capture_t1 = omp_get_wtime()
+    write (stdout,'(1x,a,f12.3,a)') 'CREGEN in-memory output canonicalization wall time: ', &
+    & capture_t1-capture_t0,' sec'
+    write (stdout,'(1x,a,i0,a,i0)') &
+    & 'CREGEN in-memory output canonicalization workers requested/actual: ', &
+    & capture_workers,' / ',capture_team
+    write (stdout,'(1x,a,i0)') &
+    & 'CREGEN fixed-decimal near-boundary fallbacks: ',capture_fallbacks
+    if (capture_failed) then
+      call poststage_out%clear()
+      env%iostatus_meta = status_failed
+      call remove(fname)
+    else
+      poststage_out%nat = nat
+      poststage_out%nall = nall
+    end if
+    deallocate (capture_frame_failed)
+  end if
+  deallocate(output_comments)
   deallocate (origin,p,erel,er)
   return
 end subroutine cregen_file_wr
@@ -2250,9 +2770,7 @@ subroutine cregen_rmsdalign(nat,nall,at,xyz)
   do j = 1,nat
     if (at(j) > 2) nath = nath+1
   end do
-  allocate (c0(3,nath),c1(3,nath),source=0.0d0)
-
-  allocate (c2(3,nat))
+  allocate (c0(3,nath),source=0.0d0)
   !>--- get the reference structure (the first one)
   i = 0
   do j = 1,nat
@@ -2262,6 +2780,11 @@ subroutine cregen_rmsdalign(nat,nall,at,xyz)
     end if
   end do
 
+!$omp parallel default(none) shared(nat,nall,nath,at,xyz,c0) &
+!$omp private(k,i,j,c1,c2,g,U,x_center,y_center,rmsdval)
+  allocate (c1(3,nath),source=0.0d0)
+  allocate (c2(3,nat))
+!$omp do schedule(static)
   do k = 2,nall
     !>--- and the other strucutres into c1
     i = 0
@@ -2276,9 +2799,11 @@ subroutine cregen_rmsdalign(nat,nall,at,xyz)
     c2 = matmul(U(1:3,1:3),xyz(1:3,1:nat,k))
     xyz(1:3,1:nat,k) = c2
   end do
+!$omp end do
+  deallocate (c2,c1)
+!$omp end parallel
 
-  deallocate (c2)
-  deallocate (c1,c0)
+  deallocate (c0)
   return
 end subroutine cregen_rmsdalign
 

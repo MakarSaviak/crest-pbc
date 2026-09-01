@@ -31,13 +31,13 @@ list(APPEND srcs
   "${dir}/protonate.f90"
   "${dir}/hessian_tools.f90"
   "${dir}/ConfSolv.F90"
+  "${dir}/multilevel_interface.F90"
   "${dir}/search_conformers.f90"
   "${dir}/search_entropy.f90"
   "${dir}/parallel.f90"
 )
 
 set(srcs ${srcs} PARENT_SCOPE)
-
 
 
 

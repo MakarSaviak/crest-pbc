@@ -181,6 +181,13 @@ subroutine trialMD_calculator(env)
 !>--- End loop
   end do iterativ
 
+!>--- Do not leak the successful trial trajectory's calculator history into
+!>--- independent production trajectories.  Preserve the successfully
+!>--- initialized canonical topology, then release only geometry-dependent
+!>--- GFN-FF workspaces; parameters, fragments, frozen masks, and calculation
+!>--- settings remain.
+  call reset_gfnff_trial_history(env%calc)
+
 !>--- transfer final settings to global settings
   env%mdstep = MD%tstep
   env%mddat%tstep = MD%tstep
@@ -287,6 +294,7 @@ subroutine trialOPT_calculator(env)
   !> LOCAL
   type(coord) :: mol,molopt
   type(calcdata) :: tmpcalc
+  type(constraint),allocatable :: auto_nci_walls(:)
   integer :: io,T,Tn
   real(wp) :: energy
   real(wp),allocatable :: grd(:,:)
@@ -304,6 +312,14 @@ subroutine trialOPT_calculator(env)
   call env%ref%to(molopt)
   allocate(grd(3,mol%nat), source=0.0_wp)
   tmpcalc = env%calc  !> create copy of calculator
+  call tmpcalc%detach_auto_nci_walls(auto_nci_walls)
+  if (env%NCI.and..not.env%legacy) then
+    if (size(auto_nci_walls) /= 1) then
+      error stop 'Initial optimization: expected exactly one automatic NCI wall'
+    end if
+  end if
+  write(stdout,'(1x,a,i0,a,i0)') 'Initial optimization NCI walls removed: ', &
+    & size(auto_nci_walls),'; remaining calculator constraints: ',tmpcalc%nconstraints
   tmpcalc%optlev = -1 !> set loose convergence thresholds 
 
 !>--- perform geometry optimization

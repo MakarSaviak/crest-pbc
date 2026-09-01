@@ -117,9 +117,12 @@ subroutine crest_search_1(env,tim)
   call tim%start(3,'Geometry optimization')
   dump = .true.
   call crest_oloop(env,nat,nall,at,xyz,eread,dump)
+  if (env%iostatus_meta /= status_normal) then
+    call tim%stop(3)
+    return
+  end if
   call tim%stop(3)
 
 !==========================================================!
   return
 end subroutine crest_search_1
-

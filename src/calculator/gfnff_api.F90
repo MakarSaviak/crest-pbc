@@ -27,6 +27,7 @@ module gfnff_api
   use strucrd
 #ifdef WITH_GFNFF
   use gfnff_interface
+  use gfnff_restart,only:write_restart_gff
 #endif
   implicit none
   private
@@ -39,6 +40,7 @@ module gfnff_api
   public :: gfnff_printout
   public :: gfnff_getwbos
   public :: gfnff_dump_sasa
+  public :: gfnff_write_topology_restart
 
 #ifndef WITH_GFNFF
   !> these are placeholders if no gfnff module is used!
@@ -86,6 +88,42 @@ contains  !> MODULE PROCEDURES START HERE
     error stop
 #endif
   end subroutine gfnff_api_setup
+
+!========================================================================================!
+
+  subroutine gfnff_write_topology_restart(nat,ff_dat,fname,iostat)
+!***********************************************************************!
+!* Export an already initialized static GFN-FF topology.  This routine
+!* never invokes topology generation or a singlepoint calculation.
+!***********************************************************************! 
+    integer,intent(in) :: nat
+    type(gfnff_data),allocatable,intent(in) :: ff_dat
+    character(len=*),intent(in) :: fname
+    integer,intent(out) :: iostat
+
+    iostat = 1
+#ifdef WITH_GFNFF
+    if (nat < 1) then
+      iostat = 2
+      return
+    end if
+    if (.not.allocated(ff_dat)) then
+      iostat = 3
+      return
+    end if
+    if (.not.allocated(ff_dat%topo)) then
+      iostat = 4
+      return
+    end if
+    if (len_trim(fname) == 0) then
+      iostat = 5
+      return
+    end if
+    call write_restart_gff(trim(fname),nat,ff_dat%version,ff_dat%topo,iostat)
+#else
+    iostat = 6
+#endif
+  end subroutine gfnff_write_topology_restart
 
 !========================================================================================!
 
@@ -175,4 +213,3 @@ contains  !> MODULE PROCEDURES START HERE
 !========================================================================================!
 !========================================================================================!
 end module gfnff_api
-

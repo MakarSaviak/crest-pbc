@@ -205,6 +205,10 @@ subroutine crest_ensemble_optimization(env,tim)
   write (stdout,'(1x,a,i0,a,1x,a)') 'Optimizing all ',nall,' structures of file',trim(ensnam)
 !>--- call the loop
   call crest_oloop(env,nat,nall,at,xyz,eread,.true.)
+  if (env%iostatus_meta /= status_normal) then
+    call tim%stop(14)
+    return
+  end if
 
 !========================================================================================!
 !>--- output
@@ -229,6 +233,10 @@ subroutine crest_ensemble_optimization(env,tim)
   if (allocated(env%refine_queue)) then
     write(stdout,*)
     call crest_refine(env,ensemblefile,ensemblefile//'.refine')
+    if (env%iostatus_meta /= status_normal) then
+      call tim%stop(14)
+      return
+    end if
     write(stdout,'(/,a,a,a)') 'Refined ensemble written to <',ensemblefile,'.refine>'
   endif 
 
@@ -253,6 +261,7 @@ subroutine crest_ensemble_screening(env,tim)
   use strucrd
   use optimize_module
   use iomod 
+  use crest_multilevel_interface,only:crest_multilevel_oloop
   implicit none
   type(systemdata),intent(inout) :: env
   type(timer),intent(inout)      :: tim
@@ -331,4 +340,3 @@ subroutine crest_ensemble_screening(env,tim)
   call tim%stop(14)
   return
 end subroutine crest_ensemble_screening
-

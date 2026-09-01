@@ -69,6 +69,16 @@ module calc_type
 
 !=========================================================================================!
 
+  ! GCC 12 miscompiles intrinsic assignment of a deferred-length allocatable
+  ! character array nested in calculation_settings: it copies one element's
+  ! payload while retaining the full array descriptor.  Wrapping each string
+  ! gives every array element its own scalar allocatable character descriptor,
+  ! for which GCC 12 emits the required deep copy.
+  public :: alloc_string
+  type :: alloc_string
+    character(len=:),allocatable :: value
+  end type alloc_string
+
   public :: calculation_settings
   type :: calculation_settings
 !**********************************************************************
@@ -159,7 +169,7 @@ module calc_type
 
 !>--- GFN-FF data
     type(gfnff_data),allocatable :: ff_dat
-    character(len=:),allocatable :: gff_fragments(:)
+    type(alloc_string),allocatable :: gff_fragments(:)
 
 !>--- libpvol data
     integer  :: pvmodel = 1            !> libpvol model type (0=XHCFF, 1=PV)
@@ -278,6 +288,9 @@ module calc_type
     procedure :: copy => calculation_copy
     procedure :: printconstraints => calculation_print_constraints
     procedure :: removeconstraint => calculation_remove_constraint
+    procedure :: detach_auto_nci_walls => calculation_detach_auto_nci_walls
+    procedure :: attach_auto_nci_walls => calculation_attach_auto_nci_walls
+    procedure :: rebind_constraint_freeze_masks => calculation_rebind_constraint_freeze_masks
     procedure :: info => calculation_info
     procedure :: ONIOMexpand => calculation_ONIOMexpand
     procedure :: active => calc_set_active
@@ -398,6 +411,7 @@ contains  !>--- Module routines start here
     integer :: i,j
 
     if (self%nconstraints < 1) then
+      if (allocated(self%cons)) deallocate(self%cons)
       allocate (self%cons(1))
       self%nconstraints = 1
       self%cons(1) = constr
@@ -423,6 +437,7 @@ contains  !>--- Module routines start here
     integer :: i,j
 
     if (self%nconstraints < 1) then
+      if (allocated(self%cons)) deallocate(self%cons)
       allocate (self%cons(k))
       self%nconstraints = k
       self%cons(1:k) = constr(1:k)
@@ -478,6 +493,12 @@ contains  !>--- Module routines start here
 
     i = self%nconstraints-1
     j = self%nconstraints
+    if (i == 0) then
+      if (allocated(self%cons)) deallocate(self%cons)
+      self%nconstraints = 0
+      call self%rebind_constraint_freeze_masks()
+      return
+    end if
     allocate (conslist(i))
     if (d == 1) then
       conslist(1:i) = self%cons(2:j)
@@ -491,9 +512,207 @@ contains  !>--- Module routines start here
     end if
     call move_alloc(conslist,self%cons)
     self%nconstraints = i
+    call self%rebind_constraint_freeze_masks()
 
     return
   end subroutine calculation_remove_constraint
+
+!=========================================================================================!
+
+  subroutine calculation_rebind_constraint_freeze_masks(self)
+    implicit none
+    class(calcdata),intent(inout) :: self
+    integer :: i
+
+    if (self%nconstraints < 0) then
+      error stop 'calcdata: negative constraint count during freeze-mask rebind'
+    end if
+    if (self%nconstraints == 0) then
+      if (allocated(self%cons)) then
+        if (size(self%cons) /= 0) then
+          error stop 'calcdata: zero constraint count with a nonempty array'
+        end if
+      end if
+    else
+      if (.not.allocated(self%cons)) then
+        error stop 'calcdata: constraint array is absent during freeze-mask rebind'
+      end if
+      if (size(self%cons) /= self%nconstraints) then
+        error stop 'calcdata: constraint array/count mismatch during freeze-mask rebind'
+      end if
+    end if
+    if (self%nfreeze < 0) then
+      error stop 'calcdata: negative freeze count during freeze-mask rebind'
+    end if
+    if (allocated(self%freezelist)) then
+      if (count(self%freezelist) /= self%nfreeze) then
+        error stop 'calcdata: freeze count/mask mismatch during rebind'
+      end if
+    else if (self%nfreeze /= 0) then
+      error stop 'calcdata: freeze count is set but freeze mask is absent'
+    end if
+
+    do i=1,self%nconstraints
+      nullify(self%cons(i)%freezeptr)
+      self%cons(i)%frozenatms=.false.
+      if (self%nfreeze>0) call self%cons(i)%addfreeze(self%freezelist)
+    end do
+  end subroutine calculation_rebind_constraint_freeze_masks
+
+!=========================================================================================!
+
+  subroutine calculation_detach_auto_nci_walls(self,walls)
+    implicit none
+    class(calcdata),intent(inout) :: self
+    type(constraint),allocatable,intent(out) :: walls(:)
+    type(constraint),allocatable :: kept(:)
+    integer :: i,iw,ik,nremove,nkeep
+    logical :: seen_auto
+
+    if (self%nconstraints < 0) then
+      error stop 'calcdata: negative constraint count'
+    end if
+    if (self%nconstraints == 0) then
+      if (allocated(self%cons)) then
+        if (size(self%cons) /= 0) then
+          error stop 'calcdata: zero constraint count with a nonempty array'
+        end if
+        deallocate(self%cons)
+      end if
+      call self%rebind_constraint_freeze_masks()
+      allocate(walls(0))
+      return
+    end if
+    if (.not.allocated(self%cons)) then
+      error stop 'calcdata: constraint array is absent'
+    end if
+    if (size(self%cons) /= self%nconstraints) then
+      error stop 'calcdata: constraint array/count mismatch'
+    end if
+
+    nremove = 0
+    seen_auto = .false.
+    do i = 1,self%nconstraints
+      if (self%cons(i)%auto_nci_wall) then
+        seen_auto = .true.
+        if (.not.self%cons(i)%is_exact_auto_nci_wall(self%cons(i)%n)) then
+          error stop 'calcdata: malformed automatic NCI wall during detach'
+        end if
+        nremove = nremove+1
+      else if (seen_auto) then
+        error stop 'calcdata: automatic NCI wall is not a constraint suffix'
+      end if
+    end do
+    if (nremove == 0) then
+      call self%rebind_constraint_freeze_masks()
+      allocate(walls(0))
+      return
+    end if
+
+    nkeep = self%nconstraints-nremove
+    allocate(walls(nremove))
+    if (nkeep > 0) allocate(kept(nkeep))
+
+    iw = 0
+    ik = 0
+    do i = 1,self%nconstraints
+      if (self%cons(i)%auto_nci_wall) then
+        iw = iw+1
+        walls(iw) = self%cons(i)
+        ! freezeptr is process-local state and intrinsic assignment is shallow.
+        ! The restored wall is rebound explicitly by attach_auto_nci_walls.
+        nullify(walls(iw)%freezeptr)
+        walls(iw)%frozenatms = .false.
+      else
+        ik = ik+1
+        kept(ik) = self%cons(i)
+      end if
+    end do
+    if (iw /= nremove .or. ik /= nkeep) then
+      error stop 'calcdata: automatic NCI wall detach count changed unexpectedly'
+    end if
+
+    deallocate(self%cons)
+    if (nkeep > 0) call move_alloc(kept,self%cons)
+    self%nconstraints = nkeep
+    call self%rebind_constraint_freeze_masks()
+  end subroutine calculation_detach_auto_nci_walls
+
+!=========================================================================================!
+
+  subroutine calculation_attach_auto_nci_walls(self,walls)
+    implicit none
+    class(calcdata),intent(inout) :: self
+    type(constraint),intent(in) :: walls(:)
+    integer :: first,i
+
+    call self%rebind_constraint_freeze_masks()
+    if (size(walls) == 0) return
+    if (self%nconstraints < 0) then
+      error stop 'calcdata: negative constraint count before NCI wall restore'
+    end if
+    if (self%nconstraints == 0) then
+      if (allocated(self%cons)) then
+        if (size(self%cons) /= 0) then
+          error stop 'calcdata: zero constraint count with a nonempty array'
+        end if
+        deallocate(self%cons)
+      end if
+    else
+      if (.not.allocated(self%cons)) then
+        error stop 'calcdata: constraint array is absent before NCI wall restore'
+      end if
+      if (size(self%cons) /= self%nconstraints) then
+        error stop 'calcdata: constraint array/count mismatch before NCI wall restore'
+      end if
+      do i = 1,self%nconstraints
+        if (self%cons(i)%auto_nci_wall) then
+          error stop 'calcdata: automatic NCI wall is already attached'
+        end if
+      end do
+    end if
+    do i = 1,size(walls)
+      if (.not.walls(i)%is_exact_auto_nci_wall(walls(i)%n)) then
+        error stop 'calcdata: attempt to restore a malformed automatic NCI wall'
+      end if
+    end do
+
+    if (self%nfreeze < 0) then
+      error stop 'calcdata: negative freeze count before NCI wall restore'
+    end if
+    if (self%nfreeze > 0) then
+      if (.not.allocated(self%freezelist)) then
+        error stop 'calcdata: freeze count is set but freeze mask is absent'
+      end if
+      if (count(self%freezelist) /= self%nfreeze) then
+        error stop 'calcdata: freeze count/mask mismatch before NCI wall restore'
+      end if
+      do i = 1,size(walls)
+        if (size(walls(i)%atms) > 0) then
+          if (maxval(walls(i)%atms) > size(self%freezelist)) then
+            error stop 'calcdata: freeze mask is too short for automatic NCI wall'
+          end if
+        end if
+      end do
+    else if (allocated(self%freezelist)) then
+      if (any(self%freezelist)) then
+        error stop 'calcdata: zero freeze count with a nonempty freeze selection'
+      end if
+    end if
+
+    first = self%nconstraints+1
+    call calculation_add_constraintlist(self,size(walls),walls)
+    if (self%nconstraints /= first+size(walls)-1) then
+      error stop 'calcdata: automatic NCI wall restore count changed unexpectedly'
+    end if
+    if (.not.allocated(self%cons)) then
+      error stop 'calcdata: automatic NCI wall restore produced no array'
+    end if
+    if (size(self%cons) /= self%nconstraints) then
+      error stop 'calcdata: automatic NCI wall restore produced a bad array size'
+    end if
+    call self%rebind_constraint_freeze_masks()
+  end subroutine calculation_attach_auto_nci_walls
 
 !=========================================================================================!
   subroutine calculation_print_constraints(self,chnl)

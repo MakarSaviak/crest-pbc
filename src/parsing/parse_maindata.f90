@@ -113,6 +113,14 @@ contains   !> MODULE PROCEDURES START HERE
       env%Threads = val
       env%autothreads = .true.
       env%threadssetmanual = .true.
+    case ('nci_next_iteration_trajectories')
+      select case (val)
+      case (4,6)
+        env%nci_next_iteration_trajectories = val
+      case default
+        write (stdout,'("invalid nci_next_iteration_trajectories: ",i0," (allowed: 4 or 6)")') val
+        call creststop(status_config)
+      end select
     case default
       rd = .false.
     end select

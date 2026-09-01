@@ -310,14 +310,63 @@ contains    !> MODULE PROCEDURES START HERE
 !========================================================================================!
 
 !>--- GFN-FF setup/helper routines
+  subroutine gfnff_fragment_ids(calc,mol,frag_ids,iostat_out,message)
+!*******************************************************************************
+!* Resolve configured GFN-FF fragment selections with the same CREST atom-list
+!* semantics used by normal GFN-FF initialization.  Keeping this operation in
+!* one helper prevents a process-MTD validator from inventing a second parser
+!* or a different fallback rule for atoms not covered by a user selection.
+!*******************************************************************************
+    type(calculation_settings),intent(in) :: calc
+    type(coord),intent(in) :: mol
+    integer,allocatable,intent(out) :: frag_ids(:)
+    integer,intent(out) :: iostat_out
+    character(len=*),intent(out) :: message
+    integer :: f
+    logical,allocatable :: selected(:)
+
+    iostat_out = 0
+    message = ''
+    if (mol%nat < 1) then
+      iostat_out = 1
+      message = 'GFN-FF fragment mapping received a nonpositive atom count'
+      return
+    end if
+    if (.not.allocated(calc%gff_fragments)) return
+    if (size(calc%gff_fragments) < 1) then
+      iostat_out = 2
+      message = 'GFN-FF fragment array is allocated but empty'
+      return
+    end if
+    allocate(frag_ids(mol%nat),source=0)
+    do f = 1,size(calc%gff_fragments)
+      if (.not.allocated(calc%gff_fragments(f)%value)) then
+        iostat_out = 3
+        message = 'GFN-FF fragment string is unallocated'
+        deallocate(frag_ids)
+        return
+      end if
+      if (len_trim(calc%gff_fragments(f)%value) == 0) then
+        iostat_out = 4
+        message = 'GFN-FF fragment string is empty'
+        deallocate(frag_ids)
+        return
+      end if
+      call get_atlist(mol%nat,selected,trim(calc%gff_fragments(f)%value),mol%at)
+      where(selected) frag_ids = f
+      deallocate(selected)
+    end do
+    if (any(frag_ids == 0)) frag_ids = frag_ids+1
+  end subroutine gfnff_fragment_ids
+
   subroutine gfnff_init(calc,mol,loadnew)
     implicit none
     type(calculation_settings),intent(inout) :: calc
     type(coord),intent(in) :: mol
     logical,intent(out) :: loadnew
-    integer :: nel,nao,nlev,f
+    integer :: nel,nao,nlev,frag_io
     integer,allocatable :: frag_ids(:)
-    logical,allocatable :: selected(:)
+    character(len=256) :: fragment_message
     loadnew = .false.
 #ifdef WITH_GFNFF
     if (.not.allocated(calc%ff_dat)) then
@@ -333,7 +382,7 @@ contains    !> MODULE PROCEDURES START HERE
         calc%ff_dat%refgeo = calc%refgeo
       end if
       if (allocated(calc%parametrisation)) then
-        calc%ff_dat%refgeo = calc%parametrisation
+        calc%ff_dat%parametrisation = calc%parametrisation
       end if
       if (allocated(calc%refcharges)) then
         calc%ff_dat%refcharges = calc%refcharges
@@ -352,13 +401,8 @@ contains    !> MODULE PROCEDURES START HERE
     ! reparsing these atom lists on every energy/gradient call is redundant.
     if (calc%apiclean) loadnew = .true.
     if (loadnew .and. allocated(calc%gff_fragments)) then
-      allocate(frag_ids(mol%nat),source=0)
-      do f = 1,size(calc%gff_fragments)
-        call get_atlist(mol%nat,selected,trim(calc%gff_fragments(f)),mol%at)
-        where(selected) frag_ids = f
-        deallocate(selected)
-      end do
-      if (any(frag_ids == 0)) frag_ids = frag_ids+1
+      call gfnff_fragment_ids(calc,mol,frag_ids,frag_io,fragment_message)
+      if (frag_io /= 0) error stop '**ERROR** '//trim(fragment_message)
       if (allocated(calc%ff_dat%user_fraglist)) deallocate(calc%ff_dat%user_fraglist)
       calc%ff_dat%user_fraglist = frag_ids
       deallocate(frag_ids)

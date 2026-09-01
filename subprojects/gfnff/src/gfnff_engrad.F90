@@ -22,10 +22,11 @@
 !================================================================================!
 module gfnff_engrad_module
 !$ use omp_lib, only: omp_get_max_threads, omp_get_thread_num
-  use iso_fortran_env,only:wp => real64,sp => real32,stdout => output_unit
+  use iso_fortran_env,only:wp => real64,stdout => output_unit
   use gfnff_ini2
   use gfnff_data_types,only:TGFFData,TGFFNeighbourList,new,TGFFTopology
   use gfnff_gbsa,only:TBorn
+  use gfnff_gdisp0,only:d3_workspace
   use gfnff_param,only:sqrtZr4r2
   use gfnff_helpers
   use gfnff_math_wrapper
@@ -65,13 +66,13 @@ module gfnff_engrad_module
     real(wp),allocatable :: grab0(:,:,:),rab0(:),eeqtmp(:,:)
     real(wp),allocatable :: cn(:),dcn(:,:,:),qtmp(:)
     real(wp),allocatable :: hb_cn(:),hb_dcn(:,:,:)
-    real(wp),allocatable :: sqrab(:),srab(:),g5tmp(:,:)
+    real(wp),allocatable :: sqrab(:),srab(:),g5tmp(:,:),serial_grad(:,:)
     integer,allocatable :: d3list(:,:),d3count(:),d3offset(:),active_atoms(:)
     logical,allocatable :: frozen_pair(:),frozen_mask_ref(:)
     real(wp),allocatable :: frozen_sqrab(:),frozen_srab(:),frozen_reference(:,:)
     real(wp),allocatable :: raw_cn_static(:)
+    type(d3_workspace) :: d3_scratch
     real(wp),allocatable :: eeq_a(:,:),eeq_x(:),eeq_lapack_work(:)
-    real(sp),allocatable :: eeq_a4(:,:),eeq_x4(:),eeq_lapack_work4(:)
     integer,allocatable :: eeq_ipiv(:)
     real(wp),allocatable :: eeq_frozen_block(:,:)
     real(wp),allocatable :: eeq_host_inverse(:,:),eeq_block_k(:,:),eeq_block_y(:,:)
@@ -129,6 +130,7 @@ contains  !> MODULE PROCEDURES START HERE
     npair = n*(n+1)/2
     m = n+nfrag
     allocate(self%sqrab(npair),self%srab(npair),self%qtmp(n),self%g5tmp(3,n), &
+   &         self%serial_grad(3,n), &
    &         self%eeqtmp(2,npair),self%d3list(2,npair),self%dcn(3,n,n), &
    &         self%cn(n),self%hb_dcn(3,n,n),self%hb_cn(n), &
    &         self%d3count(n),self%d3offset(n),self%active_atoms(n), &
@@ -141,7 +143,7 @@ contains  !> MODULE PROCEDURES START HERE
    &         self%dynamic_bond_idx(max(1,nbond)), &
    &         self%dynamic_angle_idx(max(1,nangl)), &
    &         self%dynamic_torsion_idx(max(1,ntors)), &
-   &         self%eeq_a(m,m),self%eeq_x(m),self%eeq_a4(m,m),self%eeq_x4(m), &
+   &         self%eeq_a(m,m),self%eeq_x(m), &
    &         self%eeq_ipiv(m),self%eeq_frozen_block(n,n))
     self%frozen_pair = .false.
     self%frozen_mask_ref = .false.
@@ -499,6 +501,7 @@ contains  !> MODULE PROCEDURES START HERE
     if (allocated(self%sqrab)) deallocate(self%sqrab)
     if (allocated(self%srab)) deallocate(self%srab)
     if (allocated(self%g5tmp)) deallocate(self%g5tmp)
+    if (allocated(self%serial_grad)) deallocate(self%serial_grad)
     if (allocated(self%d3list)) deallocate(self%d3list)
     if (allocated(self%d3count)) deallocate(self%d3count)
     if (allocated(self%d3offset)) deallocate(self%d3offset)
@@ -509,13 +512,11 @@ contains  !> MODULE PROCEDURES START HERE
     if (allocated(self%frozen_srab)) deallocate(self%frozen_srab)
     if (allocated(self%frozen_reference)) deallocate(self%frozen_reference)
     if (allocated(self%raw_cn_static)) deallocate(self%raw_cn_static)
+    call self%d3_scratch%release()
     if (allocated(self%eeq_a)) deallocate(self%eeq_a)
     if (allocated(self%eeq_x)) deallocate(self%eeq_x)
-    if (allocated(self%eeq_a4)) deallocate(self%eeq_a4)
-    if (allocated(self%eeq_x4)) deallocate(self%eeq_x4)
     if (allocated(self%eeq_ipiv)) deallocate(self%eeq_ipiv)
     if (allocated(self%eeq_lapack_work)) deallocate(self%eeq_lapack_work)
-    if (allocated(self%eeq_lapack_work4)) deallocate(self%eeq_lapack_work4)
     if (allocated(self%eeq_frozen_block)) deallocate(self%eeq_frozen_block)
     call gfnff_workspace_release_eeq_host_solver(self)
     if (allocated(self%active_pair_i)) deallocate(self%active_pair_i)
@@ -576,7 +577,7 @@ contains  !> MODULE PROCEDURES START HERE
   &          param,topo,nlist,solvation,update,version,accuracy,io,work,frozen_mask)
 
     use gfnff_param,only:efield,gffVersion,gfnff_thresholds
-    use gfnff_gdisp0
+    use gfnff_gdisp0,only:d3_gradient
     use gfnff_cn
     use gfnff_rab
     implicit none
@@ -610,7 +611,7 @@ contains  !> MODULE PROCEDURES START HERE
     integer  :: ati,atj,iat,jat
     integer  :: hbA,hbB
     integer  :: lin
-    logical  :: ex,require_update
+    logical  :: ex,require_update,force_hbond_update,serial_inner
     integer  :: nhb1,nhb2,nxb
     real(wp) ::  r2,rab,qq0,erff,dd,dum1,r3(3),t8,dum,t22,t39
     real(wp) ::  dx,dy,dz,yy,t4,t5,t6,alpha,t20
@@ -622,11 +623,11 @@ contains  !> MODULE PROCEDURES START HERE
     real(wp),pointer :: grab0(:,:,:),rab0(:),eeqtmp(:,:)
     real(wp),pointer :: cn(:),dcn(:,:,:),qtmp(:)
     real(wp),pointer :: hb_cn(:),hb_dcn(:,:,:)
-    real(wp),pointer :: sqrab(:),srab(:),g5tmp(:,:)
+    real(wp),pointer :: sqrab(:),srab(:),g5tmp(:,:),gserial(:,:)
     real(wp),allocatable :: ghb_thread(:,:,:),ehb_thread(:)
     integer,pointer :: d3list(:,:),d3count(:),d3offset(:),active_atoms(:)
     !type(tb_timer) :: timer
-    real(wp) :: dispthr,cnthr,repthr,hbthr1,hbthr2
+    real(wp) :: dispthr,cnthr,repthr,hbthr1,hbthr2,serial_energy
 
     call gfnff_thresholds(accuracy,dispthr,cnthr,repthr,hbthr1,hbthr2)
 
@@ -651,6 +652,11 @@ contains  !> MODULE PROCEDURES START HERE
     gshift = 0.0d0
 
     call work%ensure(n,topo%nfrag,topo%nbond,topo%nangl,topo%ntors)
+    ! A CREST optimization worker sets its task-local OpenMP team size to one.
+    ! Bypass the nested GFN-FF fork/reduction machinery only in that case;
+    ! multi-threaded dynamics continues through the original OpenMP regions.
+    serial_inner = .true.
+!$  serial_inner = omp_get_max_threads() == 1
     if (present(frozen_mask)) then
       call work%prepare_frozen(n,xyz,frozen_mask)
       if (work%static_cache_valid) then
@@ -671,6 +677,7 @@ contains  !> MODULE PROCEDURES START HERE
     srab => work%srab
     qtmp => work%qtmp
     g5tmp => work%g5tmp
+    gserial => work%serial_grad
     eeqtmp => work%eeqtmp
     d3list => work%d3list
     dcn => work%dcn
@@ -693,10 +700,111 @@ contains  !> MODULE PROCEDURES START HERE
 !> distance arrays; only rows belonging to active atoms are recomputed.
         if (.not.work%static_cache_valid) then
           d3count(1:work%frozen_prefix) = 0
+          if (serial_inner) then
+            do i = 1,work%frozen_prefix
+              ij = i*(i-1)/2
+              nlocal = 0
+              do j = 1,i-1
+                k = ij+j
+                if (sqrab(k) .lt. dispthr) nlocal = nlocal+1
+              end do
+              d3count(i) = nlocal
+            end do
+          else
+            !$omp parallel do default(none) schedule(static) &
+            !$omp shared(sqrab, dispthr, d3count, work) &
+            !$omp private(i, j, k, ij, nlocal)
+            do i = 1,work%frozen_prefix
+              ij = i*(i-1)/2
+              nlocal = 0
+              do j = 1,i-1
+                k = ij+j
+                if (sqrab(k) .lt. dispthr) nlocal = nlocal+1
+              end do
+              d3count(i) = nlocal
+            end do
+            !$omp end parallel do
+          end if
+        end if
+
+        if (serial_inner) then
+          do i = work%frozen_prefix+1,n
+            ij = i*(i-1)/2
+            nlocal = 0
+            do j = 1,i-1
+              k = ij+j
+              sqrab(k) = (xyz(1,i)-xyz(1,j))**2 + &
+             &           (xyz(2,i)-xyz(2,j))**2 + &
+             &           (xyz(3,i)-xyz(3,j))**2
+              srab(k) = sqrt(sqrab(k))
+              if (sqrab(k) .lt. dispthr) nlocal = nlocal+1
+            end do
+            d3count(i) = nlocal
+          end do
+        else
           !$omp parallel do default(none) schedule(static) &
-          !$omp shared(sqrab, dispthr, d3count, work) &
+          !$omp shared(n, xyz, sqrab, srab, dispthr, d3count, work) &
           !$omp private(i, j, k, ij, nlocal)
-          do i = 1,work%frozen_prefix
+          do i = work%frozen_prefix+1,n
+            ij = i*(i-1)/2
+            nlocal = 0
+            do j = 1,i-1
+              k = ij+j
+              sqrab(k) = (xyz(1,i)-xyz(1,j))**2 + &
+             &           (xyz(2,i)-xyz(2,j))**2 + &
+             &           (xyz(3,i)-xyz(3,j))**2
+              srab(k) = sqrt(sqrab(k))
+              if (sqrab(k) .lt. dispthr) nlocal = nlocal+1
+            end do
+            d3count(i) = nlocal
+          end do
+          !$omp end parallel do
+        end if
+      else
+!> General-mask fallback: update the packed list of every pair containing at
+!> least one active atom, then rebuild threshold counts in original row order.
+        d3count = 0
+        if (serial_inner) then
+          do m = 1,work%n_active_pairs
+            i = work%active_pair_i(m)
+            j = work%active_pair_j(m)
+            k = work%active_pair_idx(m)
+            sqrab(k) = (xyz(1,i)-xyz(1,j))**2 + &
+           &           (xyz(2,i)-xyz(2,j))**2 + &
+           &           (xyz(3,i)-xyz(3,j))**2
+            srab(k) = sqrt(sqrab(k))
+          end do
+        else
+          !$omp parallel do default(none) schedule(static) &
+          !$omp shared(xyz, sqrab, srab, work) &
+          !$omp private(m, i, j, k)
+          do m = 1,work%n_active_pairs
+            i = work%active_pair_i(m)
+            j = work%active_pair_j(m)
+            k = work%active_pair_idx(m)
+            sqrab(k) = (xyz(1,i)-xyz(1,j))**2 + &
+           &           (xyz(2,i)-xyz(2,j))**2 + &
+           &           (xyz(3,i)-xyz(3,j))**2
+            srab(k) = sqrt(sqrab(k))
+          end do
+          !$omp end parallel do
+        end if
+
+        if (serial_inner) then
+          do i = 1,n
+            ij = i*(i-1)/2
+            nlocal = 0
+            do j = 1,i-1
+              k = ij+j
+              if (sqrab(k) .lt. dispthr) nlocal = nlocal+1
+            end do
+            d3count(i) = nlocal
+          end do
+        else
+          !$omp parallel do default(none) schedule(static) &
+          !$omp shared(n, sqrab, dispthr, d3count) &
+          !$omp private(i, j, k, ij, nlocal)
+          do i = 1,n
             ij = i*(i-1)/2
             nlocal = 0
             do j = 1,i-1
@@ -707,11 +815,11 @@ contains  !> MODULE PROCEDURES START HERE
           end do
           !$omp end parallel do
         end if
-
-        !$omp parallel do default(none) schedule(static) &
-        !$omp shared(n, xyz, sqrab, srab, dispthr, d3count, work) &
-        !$omp private(i, j, k, ij, nlocal)
-        do i = work%frozen_prefix+1,n
+      end if
+    else
+      d3count = 0
+      if (serial_inner) then
+        do i = 1,n
           ij = i*(i-1)/2
           nlocal = 0
           do j = 1,i-1
@@ -723,61 +831,30 @@ contains  !> MODULE PROCEDURES START HERE
             if (sqrab(k) .lt. dispthr) nlocal = nlocal+1
           end do
           d3count(i) = nlocal
+          sqrab(ij+i) = 0.0_wp
+          srab(ij+i) = 0.0_wp
         end do
-        !$omp end parallel do
       else
-!> General-mask fallback: update the packed list of every pair containing at
-!> least one active atom, then rebuild threshold counts in original row order.
-        d3count = 0
         !$omp parallel do default(none) schedule(static) &
-        !$omp shared(xyz, sqrab, srab, work) &
-        !$omp private(m, i, j, k)
-        do m = 1,work%n_active_pairs
-          i = work%active_pair_i(m)
-          j = work%active_pair_j(m)
-          k = work%active_pair_idx(m)
-          sqrab(k) = (xyz(1,i)-xyz(1,j))**2 + &
-         &           (xyz(2,i)-xyz(2,j))**2 + &
-         &           (xyz(3,i)-xyz(3,j))**2
-          srab(k) = sqrt(sqrab(k))
-        end do
-        !$omp end parallel do
-
-        !$omp parallel do default(none) schedule(static) &
-        !$omp shared(n, sqrab, dispthr, d3count) &
+        !$omp shared(n, xyz, sqrab, srab, dispthr, d3count) &
         !$omp private(i, j, k, ij, nlocal)
         do i = 1,n
           ij = i*(i-1)/2
           nlocal = 0
           do j = 1,i-1
             k = ij+j
+            sqrab(k) = (xyz(1,i)-xyz(1,j))**2 + &
+           &           (xyz(2,i)-xyz(2,j))**2 + &
+           &           (xyz(3,i)-xyz(3,j))**2
+            srab(k) = sqrt(sqrab(k))
             if (sqrab(k) .lt. dispthr) nlocal = nlocal+1
           end do
           d3count(i) = nlocal
+          sqrab(ij+i) = 0.0_wp
+          srab(ij+i) = 0.0_wp
         end do
         !$omp end parallel do
       end if
-    else
-      d3count = 0
-      !$omp parallel do default(none) schedule(static) &
-      !$omp shared(n, xyz, sqrab, srab, dispthr, d3count) &
-      !$omp private(i, j, k, ij, nlocal)
-      do i = 1,n
-        ij = i*(i-1)/2
-        nlocal = 0
-        do j = 1,i-1
-          k = ij+j
-          sqrab(k) = (xyz(1,i)-xyz(1,j))**2 + &
-         &           (xyz(2,i)-xyz(2,j))**2 + &
-         &           (xyz(3,i)-xyz(3,j))**2
-          srab(k) = sqrt(sqrab(k))
-          if (sqrab(k) .lt. dispthr) nlocal = nlocal+1
-        end do
-        d3count(i) = nlocal
-        sqrab(ij+i) = 0.0_wp
-        srab(ij+i) = 0.0_wp
-      end do
-      !$omp end parallel do
     end if
 
 !> Prefix offsets preserve the original deterministic (i,j) pair order.
@@ -790,39 +867,69 @@ contains  !> MODULE PROCEDURES START HERE
     if (work%prefix_frozen.and.work%static_cache_valid) then
 !> Frozen-prefix D3-list entries remain valid and already occupy the beginning
 !> of d3list. Rebuild only rows containing an active atom.
-      !$omp parallel do default(none) schedule(static) &
-      !$omp shared(n, sqrab, dispthr, d3offset, d3list, work) &
-      !$omp private(i, j, k, ij, nd3pos)
-      do i = work%frozen_prefix+1,n
-        ij = i*(i-1)/2
-        nd3pos = d3offset(i)
-        do j = 1,i-1
-          k = ij+j
-          if (sqrab(k) .lt. dispthr) then
-            nd3pos = nd3pos+1
-            d3list(1,nd3pos) = i
-            d3list(2,nd3pos) = j
-          end if
+      if (serial_inner) then
+        do i = work%frozen_prefix+1,n
+          ij = i*(i-1)/2
+          nd3pos = d3offset(i)
+          do j = 1,i-1
+            k = ij+j
+            if (sqrab(k) .lt. dispthr) then
+              nd3pos = nd3pos+1
+              d3list(1,nd3pos) = i
+              d3list(2,nd3pos) = j
+            end if
+          end do
         end do
-      end do
-      !$omp end parallel do
+      else
+        !$omp parallel do default(none) schedule(static) &
+        !$omp shared(n, sqrab, dispthr, d3offset, d3list, work) &
+        !$omp private(i, j, k, ij, nd3pos)
+        do i = work%frozen_prefix+1,n
+          ij = i*(i-1)/2
+          nd3pos = d3offset(i)
+          do j = 1,i-1
+            k = ij+j
+            if (sqrab(k) .lt. dispthr) then
+              nd3pos = nd3pos+1
+              d3list(1,nd3pos) = i
+              d3list(2,nd3pos) = j
+            end if
+          end do
+        end do
+        !$omp end parallel do
+      end if
     else
-      !$omp parallel do default(none) schedule(static) &
-      !$omp shared(n, sqrab, dispthr, d3offset, d3list) &
-      !$omp private(i, j, k, ij, nd3pos)
-      do i = 1,n
-        ij = i*(i-1)/2
-        nd3pos = d3offset(i)
-        do j = 1,i-1
-          k = ij+j
-          if (sqrab(k) .lt. dispthr) then
-            nd3pos = nd3pos+1
-            d3list(1,nd3pos) = i
-            d3list(2,nd3pos) = j
-          end if
+      if (serial_inner) then
+        do i = 1,n
+          ij = i*(i-1)/2
+          nd3pos = d3offset(i)
+          do j = 1,i-1
+            k = ij+j
+            if (sqrab(k) .lt. dispthr) then
+              nd3pos = nd3pos+1
+              d3list(1,nd3pos) = i
+              d3list(2,nd3pos) = j
+            end if
+          end do
         end do
-      end do
-      !$omp end parallel do
+      else
+        !$omp parallel do default(none) schedule(static) &
+        !$omp shared(n, sqrab, dispthr, d3offset, d3list) &
+        !$omp private(i, j, k, ij, nd3pos)
+        do i = 1,n
+          ij = i*(i-1)/2
+          nd3pos = d3offset(i)
+          do j = 1,i-1
+            k = ij+j
+            if (sqrab(k) .lt. dispthr) then
+              nd3pos = nd3pos+1
+              d3list(1,nd3pos) = i
+              d3list(2,nd3pos) = j
+            end if
+          end do
+        end do
+        !$omp end parallel do
+      end if
     end if
     if (present(frozen_mask)) then
       call work%prepare_static(n,at,xyz,frozen_mask,repthr,dispthr,param,topo,sqrab,srab)
@@ -834,6 +941,10 @@ contains  !> MODULE PROCEDURES START HERE
 !!!!!!!!!!!!
 
 !      if (pr) call timer%measure(10,'HB/XB (incl list setup)')
+    !> Preserve an explicit caller request before the legacy count diagnostic
+    !> below overwrites the public flag.  Ordinary GFN-FF/MTD calls never set
+    !> this request, so their established RMSD/count behavior is unchanged.
+    force_hbond_update = nlist%force_hbond_update
     if (allocated(nlist%q)) then
       nlist%initialized = size(nlist%q) == n
     end if
@@ -849,9 +960,13 @@ contains  !> MODULE PROCEDURES START HERE
       call new(nlist,n,5*nhb1,5*nhb2,3*nxb)
       nlist%hbrefgeo(:,:) = xyz
     end if
-    if (update.or.require_update) then
-      call gfnff_hbset(n,at,xyz,sqrab,topo,nlist,hbthr1,hbthr2)
+    if (update.or.require_update.or.force_hbond_update) then
+      call gfnff_hbset(n,at,xyz,sqrab,topo,nlist,hbthr1,hbthr2, &
+         & force_update=force_hbond_update)
     end if
+    !> The explicit request is one-shot.  Count differences remain governed
+    !> by the release-v2 allocation/RMSD logic and do not leak into MTD calls.
+    nlist%force_hbond_update = .false.
 !      if (pr) call timer%measure(10)
 
 !!!!!!!!!!!!!
@@ -876,10 +991,152 @@ contains  !> MODULE PROCEDURES START HERE
       if (work%prefix_frozen) then
 !> With a frozen prefix, every remaining pair belongs to an active outer atom.
 !> Traverse the original packed rows directly to avoid indirect pair-list loads.
+        if (serial_inner) then
+          gserial = 0.0_wp
+          serial_energy = 0.0_wp
+          do iat = work%frozen_prefix+1,n
+            m = iat*(iat-1)/2
+            do jat = 1,iat-1
+              ij = m+jat
+              r2 = sqrab(ij)
+              if (r2 .gt. repthr) cycle
+              if (topo%bpair(ij) .eq. 1) cycle
+              ati = at(iat)
+              atj = at(jat)
+              rab = srab(ij)
+              t16 = r2**0.75_wp
+              t19 = t16*t16
+              t8 = t16*topo%alphanb(ij)
+              t26 = exp(-t8)*param%repz(ati)*param%repz(atj)*param%repscaln
+              serial_energy = serial_energy+t26/rab
+              t27 = t26*(1.5_wp*t8+1.0_wp)/t19
+              r3 = (xyz(:,iat)-xyz(:,jat))*t27
+              gserial(:,iat) = gserial(:,iat)-r3
+              if (.not.frozen_mask(jat)) gserial(:,jat) = gserial(:,jat)+r3
+            end do
+          end do
+          erep = erep+serial_energy
+          g = g+gserial
+        else
+          !$omp parallel do default(none) schedule(dynamic,8) reduction(+:erep, g) &
+          !$omp shared(n, at, xyz, srab, sqrab, repthr, topo, param, frozen_mask, work) &
+          !$omp private(iat, jat, m, ij, ati, atj, rab, r2, r3, t8, t16, t19, t26, t27)
+          do iat = work%frozen_prefix+1,n
+            m = iat*(iat-1)/2
+            do jat = 1,iat-1
+              ij = m+jat
+              r2 = sqrab(ij)
+              if (r2 .gt. repthr) cycle
+              if (topo%bpair(ij) .eq. 1) cycle
+              ati = at(iat)
+              atj = at(jat)
+              rab = srab(ij)
+              t16 = r2**0.75_wp
+              t19 = t16*t16
+              t8 = t16*topo%alphanb(ij)
+              t26 = exp(-t8)*param%repz(ati)*param%repz(atj)*param%repscaln
+              erep = erep+t26/rab
+              t27 = t26*(1.5_wp*t8+1.0_wp)/t19
+              r3 = (xyz(:,iat)-xyz(:,jat))*t27
+              g(:,iat) = g(:,iat)-r3
+              if (.not.frozen_mask(jat)) g(:,jat) = g(:,jat)+r3
+            end do
+          end do
+          !$omp end parallel do
+        end if
+      else
+        if (serial_inner) then
+          gserial = 0.0_wp
+          serial_energy = 0.0_wp
+          do m = 1,work%n_active_pairs
+            iat = work%active_pair_i(m)
+            jat = work%active_pair_j(m)
+            ij = work%active_pair_idx(m)
+            r2 = sqrab(ij)
+            if (r2 .gt. repthr) cycle
+            if (topo%bpair(ij) .eq. 1) cycle
+            ati = at(iat)
+            atj = at(jat)
+            rab = srab(ij)
+            t16 = r2**0.75_wp
+            t19 = t16*t16
+            t8 = t16*topo%alphanb(ij)
+            t26 = exp(-t8)*param%repz(ati)*param%repz(atj)*param%repscaln
+            serial_energy = serial_energy+t26/rab
+            t27 = t26*(1.5_wp*t8+1.0_wp)/t19
+            r3 = (xyz(:,iat)-xyz(:,jat))*t27
+            if (.not.frozen_mask(iat)) gserial(:,iat) = gserial(:,iat)-r3
+            if (.not.frozen_mask(jat)) gserial(:,jat) = gserial(:,jat)+r3
+          end do
+          erep = erep+serial_energy
+          g = g+gserial
+        else
+          !$omp parallel do default(none) schedule(dynamic,32) reduction(+:erep, g) &
+          !$omp shared(at, xyz, srab, sqrab, repthr, topo, param, frozen_mask, work) &
+          !$omp private(m, iat, jat, ij, ati, atj, rab, r2, r3, t8, t16, t19, t26, t27)
+          do m = 1,work%n_active_pairs
+            iat = work%active_pair_i(m)
+            jat = work%active_pair_j(m)
+            ij = work%active_pair_idx(m)
+            r2 = sqrab(ij)
+            if (r2 .gt. repthr) cycle
+            if (topo%bpair(ij) .eq. 1) cycle
+            ati = at(iat)
+            atj = at(jat)
+            rab = srab(ij)
+            t16 = r2**0.75_wp
+            t19 = t16*t16
+            t8 = t16*topo%alphanb(ij)
+            t26 = exp(-t8)*param%repz(ati)*param%repz(atj)*param%repscaln
+            erep = erep+t26/rab
+            t27 = t26*(1.5_wp*t8+1.0_wp)/t19
+            r3 = (xyz(:,iat)-xyz(:,jat))*t27
+            if (.not.frozen_mask(iat)) g(:,iat) = g(:,iat)-r3
+            if (.not.frozen_mask(jat)) g(:,jat) = g(:,jat)+r3
+          end do
+          !$omp end parallel do
+        end if
+      end if
+    else
+      if (serial_inner) then
+        gserial = 0.0_wp
+        serial_energy = 0.0_wp
+        do iat = 1,n
+          m = iat*(iat-1)/2
+          do jat = 1,iat-1
+            ij = m+jat
+            r2 = sqrab(ij)
+            if (r2 .gt. repthr) cycle
+            if (topo%bpair(ij) .eq. 1) cycle
+            ati = at(iat)
+            atj = at(jat)
+            rab = srab(ij)
+            t16 = r2**0.75_wp
+            t19 = t16*t16
+            t8 = t16*topo%alphanb(ij)
+            t26 = exp(-t8)*param%repz(ati)*param%repz(atj)*param%repscaln
+            serial_energy = serial_energy+t26/rab
+            if (present(frozen_mask)) then
+              if (frozen_mask(iat).and.frozen_mask(jat)) cycle
+            end if
+            t27 = t26*(1.5_wp*t8+1.0_wp)/t19
+            r3 = (xyz(:,iat)-xyz(:,jat))*t27
+            if (present(frozen_mask)) then
+              if (.not.frozen_mask(iat)) gserial(:,iat) = gserial(:,iat)-r3
+              if (.not.frozen_mask(jat)) gserial(:,jat) = gserial(:,jat)+r3
+            else
+              gserial(:,iat) = gserial(:,iat)-r3
+              gserial(:,jat) = gserial(:,jat)+r3
+            end if
+          end do
+        end do
+        erep = erep+serial_energy
+        g = g+gserial
+      else
         !$omp parallel do default(none) schedule(dynamic,8) reduction(+:erep, g) &
-        !$omp shared(n, at, xyz, srab, sqrab, repthr, topo, param, frozen_mask, work) &
+        !$omp shared(n, at, xyz, srab, sqrab, repthr, topo, param, frozen_mask) &
         !$omp private(iat, jat, m, ij, ati, atj, rab, r2, r3, t8, t16, t19, t26, t27)
-        do iat = work%frozen_prefix+1,n
+        do iat = 1,n
           m = iat*(iat-1)/2
           do jat = 1,iat-1
             ij = m+jat
@@ -894,73 +1151,22 @@ contains  !> MODULE PROCEDURES START HERE
             t8 = t16*topo%alphanb(ij)
             t26 = exp(-t8)*param%repz(ati)*param%repz(atj)*param%repscaln
             erep = erep+t26/rab
+            if (present(frozen_mask)) then
+              if (frozen_mask(iat).and.frozen_mask(jat)) cycle
+            end if
             t27 = t26*(1.5_wp*t8+1.0_wp)/t19
             r3 = (xyz(:,iat)-xyz(:,jat))*t27
-            g(:,iat) = g(:,iat)-r3
-            if (.not.frozen_mask(jat)) g(:,jat) = g(:,jat)+r3
+            if (present(frozen_mask)) then
+              if (.not.frozen_mask(iat)) g(:,iat) = g(:,iat)-r3
+              if (.not.frozen_mask(jat)) g(:,jat) = g(:,jat)+r3
+            else
+              g(:,iat) = g(:,iat)-r3
+              g(:,jat) = g(:,jat)+r3
+            end if
           end do
         end do
         !$omp end parallel do
-      else
-        !$omp parallel do default(none) schedule(dynamic,32) reduction(+:erep, g) &
-        !$omp shared(at, xyz, srab, sqrab, repthr, topo, param, frozen_mask, work) &
-        !$omp private(m, iat, jat, ij, ati, atj, rab, r2, r3, t8, t16, t19, t26, t27)
-        do m = 1,work%n_active_pairs
-          iat = work%active_pair_i(m)
-          jat = work%active_pair_j(m)
-          ij = work%active_pair_idx(m)
-          r2 = sqrab(ij)
-          if (r2 .gt. repthr) cycle
-          if (topo%bpair(ij) .eq. 1) cycle
-          ati = at(iat)
-          atj = at(jat)
-          rab = srab(ij)
-          t16 = r2**0.75_wp
-          t19 = t16*t16
-          t8 = t16*topo%alphanb(ij)
-          t26 = exp(-t8)*param%repz(ati)*param%repz(atj)*param%repscaln
-          erep = erep+t26/rab
-          t27 = t26*(1.5_wp*t8+1.0_wp)/t19
-          r3 = (xyz(:,iat)-xyz(:,jat))*t27
-          if (.not.frozen_mask(iat)) g(:,iat) = g(:,iat)-r3
-          if (.not.frozen_mask(jat)) g(:,jat) = g(:,jat)+r3
-        end do
-        !$omp end parallel do
       end if
-    else
-      !$omp parallel do default(none) schedule(dynamic,8) reduction(+:erep, g) &
-      !$omp shared(n, at, xyz, srab, sqrab, repthr, topo, param, frozen_mask) &
-      !$omp private(iat, jat, m, ij, ati, atj, rab, r2, r3, t8, t16, t19, t26, t27)
-      do iat = 1,n
-        m = iat*(iat-1)/2
-        do jat = 1,iat-1
-          ij = m+jat
-          r2 = sqrab(ij)
-          if (r2 .gt. repthr) cycle
-          if (topo%bpair(ij) .eq. 1) cycle
-          ati = at(iat)
-          atj = at(jat)
-          rab = srab(ij)
-          t16 = r2**0.75_wp
-          t19 = t16*t16
-          t8 = t16*topo%alphanb(ij)
-          t26 = exp(-t8)*param%repz(ati)*param%repz(atj)*param%repscaln
-          erep = erep+t26/rab
-          if (present(frozen_mask)) then
-            if (frozen_mask(iat).and.frozen_mask(jat)) cycle
-          end if
-          t27 = t26*(1.5_wp*t8+1.0_wp)/t19
-          r3 = (xyz(:,iat)-xyz(:,jat))*t27
-          if (present(frozen_mask)) then
-            if (.not.frozen_mask(iat)) g(:,iat) = g(:,iat)-r3
-            if (.not.frozen_mask(jat)) g(:,jat) = g(:,jat)+r3
-          else
-            g(:,iat) = g(:,iat)-r3
-            g(:,jat) = g(:,jat)+r3
-          end if
-        end do
-      end do
-      !$omp end parallel do
     end if
 !      if (pr) call timer%measure(2)
 
@@ -971,21 +1177,40 @@ contains  !> MODULE PROCEDURES START HERE
 
     if (version == gffVersion%harmonic2020) then
       ebond = 0
-      !$omp parallel do default(none) reduction(+:ebond, g) &
-      !$omp shared(topo, param, xyz, at) private(i, iat, jat, rab, r2, r3, rn, dum)
-      do i = 1,topo%nbond
-        iat = topo%blist(1,i)
-        jat = topo%blist(2,i)
-        r3 = xyz(:,iat)-xyz(:,jat)
-        rab = sqrt(sum(r3*r3))
-        rn = 0.7*(param%rcov(at(iat))+param%rcov(at(jat)))
-        r2 = rn-rab
-        ebond = ebond+0.1d0*r2**2  ! fixfc = 0.1
-        dum = 0.1d0*2.0d0*r2/rab
-        g(:,jat) = g(:,jat)+dum*r3
-        g(:,iat) = g(:,iat)-dum*r3
-      end do
-      !$omp end parallel do
+      if (serial_inner) then
+        gserial = 0.0_wp
+        serial_energy = 0.0_wp
+        do i = 1,topo%nbond
+          iat = topo%blist(1,i)
+          jat = topo%blist(2,i)
+          r3 = xyz(:,iat)-xyz(:,jat)
+          rab = sqrt(sum(r3*r3))
+          rn = 0.7*(param%rcov(at(iat))+param%rcov(at(jat)))
+          r2 = rn-rab
+          serial_energy = serial_energy+0.1d0*r2**2  ! fixfc = 0.1
+          dum = 0.1d0*2.0d0*r2/rab
+          gserial(:,jat) = gserial(:,jat)+dum*r3
+          gserial(:,iat) = gserial(:,iat)-dum*r3
+        end do
+        ebond = ebond+serial_energy
+        g = g+gserial
+      else
+        !$omp parallel do default(none) reduction(+:ebond, g) &
+        !$omp shared(topo, param, xyz, at) private(i, iat, jat, rab, r2, r3, rn, dum)
+        do i = 1,topo%nbond
+          iat = topo%blist(1,i)
+          jat = topo%blist(2,i)
+          r3 = xyz(:,iat)-xyz(:,jat)
+          rab = sqrt(sum(r3*r3))
+          rn = 0.7*(param%rcov(at(iat))+param%rcov(at(jat)))
+          r2 = rn-rab
+          ebond = ebond+0.1d0*r2**2  ! fixfc = 0.1
+          dum = 0.1d0*2.0d0*r2/rab
+          g(:,jat) = g(:,jat)+dum*r3
+          g(:,iat) = g(:,iat)-dum*r3
+        end do
+        !$omp end parallel do
+      end if
       etot = ebond+erep
       return
     end if
@@ -1011,7 +1236,8 @@ contains  !> MODULE PROCEDURES START HERE
 !!!!!!
 
 !      if (pr) call timer%measure(4,'EEQ energy and q')
-    call goed_gfnff(accuracy .gt. 1,n,at,sqrab,srab,&         ! modified version
+    ! The physical single point may reuse the exact validated frozen-host cache.
+    call goed_gfnff(.true.,n,at,sqrab,srab,&
    &                dfloat(ichrg),eeqtmp,cn,nlist%q,ees,solvation,param,topo,work,io)  ! without dq/dr
 !    if (pr) call timer%measure(4)
 
@@ -1023,10 +1249,12 @@ contains  !> MODULE PROCEDURES START HERE
     if (nd3 .gt. 0) then
       if (present(frozen_mask)) then
         call d3_gradient(topo%dispm,n,at,xyz,nd3,d3list,topo%zetac6, &
-           & param%d3r0,sqrtZr4r2,4.0d0,param%dispscale,cn,dcn,edisp,g,frozen_mask)
+           & param%d3r0,sqrtZr4r2,4.0d0,param%dispscale,cn,dcn,edisp,g, &
+           & work%d3_scratch,frozen_mask)
       else
         call d3_gradient(topo%dispm,n,at,xyz,nd3,d3list,topo%zetac6, &
-           & param%d3r0,sqrtZr4r2,4.0d0,param%dispscale,cn,dcn,edisp,g)
+           & param%d3r0,sqrtZr4r2,4.0d0,param%dispscale,cn,dcn,edisp,g, &
+           & work%d3_scratch)
       end if
     end if
 !      if (pr) call timer%measure(5)
@@ -1040,26 +1268,47 @@ contains  !> MODULE PROCEDURES START HERE
 !> The atom-centred path is intended for large systems with a minority active
 !> region.  Retain the original half-pair loop for small or mostly active cases.
       if (n < 256.or.nactive > n/2) then
-        !$omp parallel do default(none) reduction (+:g) &
-        !$omp shared(nlist,n,sqrab,srab,eeqtmp,xyz,frozen_mask) &
-        !$omp private(i,j,k,ij,r3,r2,rab,gammij,erff,dd)
-        do i = 1,n
-          k = i*(i-1)/2
-          do j = 1,i-1
-            if (frozen_mask(i).and.frozen_mask(j)) cycle
-            ij = k+j
-            r2 = sqrab(ij)
-            rab = srab(ij)
-            gammij = eeqtmp(1,ij)
-            erff = eeqtmp(2,ij)
-            dd = (2.0d0*gammij*exp(-gammij**2*r2) &
-               & /(sqrtpi*r2)-erff/(rab*r2))*nlist%q(i)*nlist%q(j)
-            r3 = (xyz(:,i)-xyz(:,j))*dd
-            if (.not.frozen_mask(i)) g(:,i) = g(:,i)+r3
-            if (.not.frozen_mask(j)) g(:,j) = g(:,j)-r3
+        if (serial_inner) then
+          gserial = 0.0_wp
+          do i = 1,n
+            k = i*(i-1)/2
+            do j = 1,i-1
+              if (frozen_mask(i).and.frozen_mask(j)) cycle
+              ij = k+j
+              r2 = sqrab(ij)
+              rab = srab(ij)
+              gammij = eeqtmp(1,ij)
+              erff = eeqtmp(2,ij)
+              dd = (2.0d0*gammij*exp(-gammij**2*r2) &
+                 & /(sqrtpi*r2)-erff/(rab*r2))*nlist%q(i)*nlist%q(j)
+              r3 = (xyz(:,i)-xyz(:,j))*dd
+              if (.not.frozen_mask(i)) gserial(:,i) = gserial(:,i)+r3
+              if (.not.frozen_mask(j)) gserial(:,j) = gserial(:,j)-r3
+            end do
           end do
-        end do
-        !$omp end parallel do
+          g = g+gserial
+        else
+          !$omp parallel do default(none) reduction (+:g) &
+          !$omp shared(nlist,n,sqrab,srab,eeqtmp,xyz,frozen_mask) &
+          !$omp private(i,j,k,ij,r3,r2,rab,gammij,erff,dd)
+          do i = 1,n
+            k = i*(i-1)/2
+            do j = 1,i-1
+              if (frozen_mask(i).and.frozen_mask(j)) cycle
+              ij = k+j
+              r2 = sqrab(ij)
+              rab = srab(ij)
+              gammij = eeqtmp(1,ij)
+              erff = eeqtmp(2,ij)
+              dd = (2.0d0*gammij*exp(-gammij**2*r2) &
+                 & /(sqrtpi*r2)-erff/(rab*r2))*nlist%q(i)*nlist%q(j)
+              r3 = (xyz(:,i)-xyz(:,j))*dd
+              if (.not.frozen_mask(i)) g(:,i) = g(:,i)+r3
+              if (.not.frozen_mask(j)) g(:,j) = g(:,j)-r3
+            end do
+          end do
+          !$omp end parallel do
+        end if
       else
   !> Evaluate the direct EEQ pair gradient atom-centrically for active atoms.
   !> Each iteration owns one gradient vector, eliminating the full-array OpenMP
@@ -1072,19 +1321,63 @@ contains  !> MODULE PROCEDURES START HERE
             active_atoms(iact) = i
           end if
         end do
-        !$omp parallel do default(none) schedule(dynamic,4) &
-        !$omp shared(nlist,n,sqrab,srab,eeqtmp,xyz,active_atoms,nactive,g) &
-        !$omp private(iact,i,j,k,ij,r3,gactive,r2,rab,gammij,erff,dd)
-        do iact = 1,nactive
-          i = active_atoms(iact)
-          gactive = g(:,i)
-          do j = 1,n
-            if (j == i) cycle
-            if (i > j) then
-              ij = i*(i-1)/2+j
-            else
-              ij = j*(j-1)/2+i
-            end if
+        if (serial_inner) then
+          do iact = 1,nactive
+            i = active_atoms(iact)
+            gactive = g(:,i)
+            do j = 1,n
+              if (j == i) cycle
+              if (i > j) then
+                ij = i*(i-1)/2+j
+              else
+                ij = j*(j-1)/2+i
+              end if
+              r2 = sqrab(ij)
+              rab = srab(ij)
+              gammij = eeqtmp(1,ij)
+              erff = eeqtmp(2,ij)
+              dd = (2.0d0*gammij*exp(-gammij**2*r2) &
+                 & /(sqrtpi*r2)-erff/(rab*r2))*nlist%q(i)*nlist%q(j)
+              r3 = (xyz(:,i)-xyz(:,j))*dd
+              gactive = gactive+r3
+            end do
+            g(:,i) = gactive
+          end do
+        else
+          !$omp parallel do default(none) schedule(dynamic,4) &
+          !$omp shared(nlist,n,sqrab,srab,eeqtmp,xyz,active_atoms,nactive,g) &
+          !$omp private(iact,i,j,k,ij,r3,gactive,r2,rab,gammij,erff,dd)
+          do iact = 1,nactive
+            i = active_atoms(iact)
+            gactive = g(:,i)
+            do j = 1,n
+              if (j == i) cycle
+              if (i > j) then
+                ij = i*(i-1)/2+j
+              else
+                ij = j*(j-1)/2+i
+              end if
+              r2 = sqrab(ij)
+              rab = srab(ij)
+              gammij = eeqtmp(1,ij)
+              erff = eeqtmp(2,ij)
+              dd = (2.0d0*gammij*exp(-gammij**2*r2) &
+                 & /(sqrtpi*r2)-erff/(rab*r2))*nlist%q(i)*nlist%q(j)
+              r3 = (xyz(:,i)-xyz(:,j))*dd
+              gactive = gactive+r3
+            end do
+            g(:,i) = gactive
+          end do
+          !$omp end parallel do
+        end if
+      end if
+    else
+      if (serial_inner) then
+        gserial = 0.0_wp
+        do i = 1,n
+          k = i*(i-1)/2
+          do j = 1,i-1
+            ij = k+j
             r2 = sqrab(ij)
             rab = srab(ij)
             gammij = eeqtmp(1,ij)
@@ -1092,32 +1385,32 @@ contains  !> MODULE PROCEDURES START HERE
             dd = (2.0d0*gammij*exp(-gammij**2*r2) &
                & /(sqrtpi*r2)-erff/(rab*r2))*nlist%q(i)*nlist%q(j)
             r3 = (xyz(:,i)-xyz(:,j))*dd
-            gactive = gactive+r3
+            gserial(:,i) = gserial(:,i)+r3
+            gserial(:,j) = gserial(:,j)-r3
           end do
-          g(:,i) = gactive
+        end do
+        g = g+gserial
+      else
+        !$omp parallel do default(none) reduction (+:g) &
+        !$omp shared(topo,nlist,n,sqrab,srab,eeqtmp,xyz,at) &
+        !$omp private(i,j,k,ij,r3,r2,rab,gammij,erff,dd)
+        do i = 1,n
+          k = i*(i-1)/2
+          do j = 1,i-1
+            ij = k+j
+            r2 = sqrab(ij)
+            rab = srab(ij)
+            gammij = eeqtmp(1,ij)
+            erff = eeqtmp(2,ij)
+            dd = (2.0d0*gammij*exp(-gammij**2*r2) &
+               & /(sqrtpi*r2)-erff/(rab*r2))*nlist%q(i)*nlist%q(j)
+            r3 = (xyz(:,i)-xyz(:,j))*dd
+            g(:,i) = g(:,i)+r3
+            g(:,j) = g(:,j)-r3
+          end do
         end do
         !$omp end parallel do
       end if
-    else
-      !$omp parallel do default(none) reduction (+:g) &
-      !$omp shared(topo,nlist,n,sqrab,srab,eeqtmp,xyz,at) &
-      !$omp private(i,j,k,ij,r3,r2,rab,gammij,erff,dd)
-      do i = 1,n
-        k = i*(i-1)/2
-        do j = 1,i-1
-          ij = k+j
-          r2 = sqrab(ij)
-          rab = srab(ij)
-          gammij = eeqtmp(1,ij)
-          erff = eeqtmp(2,ij)
-          dd = (2.0d0*gammij*exp(-gammij**2*r2) &
-             & /(sqrtpi*r2)-erff/(rab*r2))*nlist%q(i)*nlist%q(j)
-          r3 = (xyz(:,i)-xyz(:,j))*dd
-          g(:,i) = g(:,i)+r3
-          g(:,j) = g(:,j)-r3
-        end do
-      end do
-      !$omp end parallel do
     end if
 
 #ifdef WITH_GBSA
@@ -1150,26 +1443,48 @@ contains  !> MODULE PROCEDURES START HERE
       rab0(:) = topo%vbond(1,:) ! shifts
       call gfnffdrab(n,at,xyz,cn,dcn,topo%nbond,topo%blist,rab0,grab0)
 
-      !$omp parallel do default(none) reduction(+:g, ebond) &
-      !$omp shared(grab0, topo, param, rab0, srab, xyz, at, hb_cn, hb_dcn, n) &
-      !$omp private(i, k, iat, jat, ij, rab, rij, drij, t8, dr, dum, yy, &
-      !$omp& dx, dy, dz, t4, t5, t6, ati, atj)
-      do i = 1,topo%nbond
-        iat = topo%blist(1,i)
-        jat = topo%blist(2,i)
-        ati = at(iat)
-        atj = at(jat)
-        ij = iat*(iat-1)/2+jat
-        rab = srab(ij)
-        rij = rab0(i)
-        drij = grab0(:,:,i)
-        if (topo%nr_hb(i) .ge. 1) then
-          call egbond_hb(i,iat,jat,rab,rij,drij,hb_cn,hb_dcn,n,at,xyz,ebond,g,param,topo)
-        else
-          call egbond(i,iat,jat,rab,rij,drij,n,at,xyz,ebond,g,topo)
-        end if
-      end do
-      !$omp end parallel do
+      if (serial_inner) then
+        gserial = 0.0_wp
+        serial_energy = 0.0_wp
+        do i = 1,topo%nbond
+          iat = topo%blist(1,i)
+          jat = topo%blist(2,i)
+          ati = at(iat)
+          atj = at(jat)
+          ij = iat*(iat-1)/2+jat
+          rab = srab(ij)
+          rij = rab0(i)
+          drij = grab0(:,:,i)
+          if (topo%nr_hb(i) .ge. 1) then
+            call egbond_hb(i,iat,jat,rab,rij,drij,hb_cn,hb_dcn,n,at,xyz,serial_energy,gserial,param,topo)
+          else
+            call egbond(i,iat,jat,rab,rij,drij,n,at,xyz,serial_energy,gserial,topo)
+          end if
+        end do
+        ebond = ebond+serial_energy
+        g = g+gserial
+      else
+        !$omp parallel do default(none) reduction(+:g, ebond) &
+        !$omp shared(grab0, topo, param, rab0, srab, xyz, at, hb_cn, hb_dcn, n) &
+        !$omp private(i, k, iat, jat, ij, rab, rij, drij, t8, dr, dum, yy, &
+        !$omp& dx, dy, dz, t4, t5, t6, ati, atj)
+        do i = 1,topo%nbond
+          iat = topo%blist(1,i)
+          jat = topo%blist(2,i)
+          ati = at(iat)
+          atj = at(jat)
+          ij = iat*(iat-1)/2+jat
+          rab = srab(ij)
+          rij = rab0(i)
+          drij = grab0(:,:,i)
+          if (topo%nr_hb(i) .ge. 1) then
+            call egbond_hb(i,iat,jat,rab,rij,drij,hb_cn,hb_dcn,n,at,xyz,ebond,g,param,topo)
+          else
+            call egbond(i,iat,jat,rab,rij,drij,n,at,xyz,ebond,g,topo)
+          end if
+        end do
+        !$omp end parallel do
+      end if
 
 
 !!!!!!!!!!!!!!!!!!
@@ -1182,57 +1497,110 @@ contains  !> MODULE PROCEDURES START HERE
       else
         nloop = topo%nbond
       end if
-      !$omp parallel do default(none) reduction(+:erep, g) &
-      !$omp shared(topo, param, at, sqrab, srab, xyz, frozen_mask, work, nloop) &
-      !$omp private(m, i, iat, jat, ij, xa, ya, za, dx, dy, dz, r2, rab, ati, atj, &
-      !$omp& alpha, repab, t16, t19, t26, t27)
-      do m = 1,nloop
-        if (work%static_cache_valid) then
-          i = work%dynamic_bond_idx(m)
-        else
-          i = m
-        end if
-        iat = topo%blist(1,i)
-        jat = topo%blist(2,i)
-        ij = iat*(iat-1)/2+jat
-        xa = xyz(1,iat)
-        ya = xyz(2,iat)
-        za = xyz(3,iat)
-        dx = xa-xyz(1,jat)
-        dy = ya-xyz(2,jat)
-        dz = za-xyz(3,jat)
-        r2 = sqrab(ij)
-        rab = srab(ij)
-        ati = at(iat)
-        atj = at(jat)
-        alpha = sqrt(param%repa(ati)*param%repa(atj))
-        repab = param%repz(ati)*param%repz(atj)*param%repscalb
-        t16 = r2**0.75_wp
-        t19 = t16*t16
-        t26 = exp(-alpha*t16)*repab
-        erep = erep+t26/rab
-        t27 = t26*(1.5_wp*alpha*t16+1.0_wp)/t19
-        if (present(frozen_mask)) then
-          if (.not.frozen_mask(iat)) then
+      if (serial_inner) then
+        gserial = 0.0_wp
+        serial_energy = 0.0_wp
+        do m = 1,nloop
+          if (work%static_cache_valid) then
+            i = work%dynamic_bond_idx(m)
+          else
+            i = m
+          end if
+          iat = topo%blist(1,i)
+          jat = topo%blist(2,i)
+          ij = iat*(iat-1)/2+jat
+          xa = xyz(1,iat)
+          ya = xyz(2,iat)
+          za = xyz(3,iat)
+          dx = xa-xyz(1,jat)
+          dy = ya-xyz(2,jat)
+          dz = za-xyz(3,jat)
+          r2 = sqrab(ij)
+          rab = srab(ij)
+          ati = at(iat)
+          atj = at(jat)
+          alpha = sqrt(param%repa(ati)*param%repa(atj))
+          repab = param%repz(ati)*param%repz(atj)*param%repscalb
+          t16 = r2**0.75_wp
+          t19 = t16*t16
+          t26 = exp(-alpha*t16)*repab
+          serial_energy = serial_energy+t26/rab
+          t27 = t26*(1.5_wp*alpha*t16+1.0_wp)/t19
+          if (present(frozen_mask)) then
+            if (.not.frozen_mask(iat)) then
+              gserial(1,iat) = gserial(1,iat)-dx*t27
+              gserial(2,iat) = gserial(2,iat)-dy*t27
+              gserial(3,iat) = gserial(3,iat)-dz*t27
+            end if
+            if (.not.frozen_mask(jat)) then
+              gserial(1,jat) = gserial(1,jat)+dx*t27
+              gserial(2,jat) = gserial(2,jat)+dy*t27
+              gserial(3,jat) = gserial(3,jat)+dz*t27
+            end if
+          else
+            gserial(1,iat) = gserial(1,iat)-dx*t27
+            gserial(2,iat) = gserial(2,iat)-dy*t27
+            gserial(3,iat) = gserial(3,iat)-dz*t27
+            gserial(1,jat) = gserial(1,jat)+dx*t27
+            gserial(2,jat) = gserial(2,jat)+dy*t27
+            gserial(3,jat) = gserial(3,jat)+dz*t27
+          end if
+        end do
+        erep = erep+serial_energy
+        g = g+gserial
+      else
+        !$omp parallel do default(none) reduction(+:erep, g) &
+        !$omp shared(topo, param, at, sqrab, srab, xyz, frozen_mask, work, nloop) &
+        !$omp private(m, i, iat, jat, ij, xa, ya, za, dx, dy, dz, r2, rab, ati, atj, &
+        !$omp& alpha, repab, t16, t19, t26, t27)
+        do m = 1,nloop
+          if (work%static_cache_valid) then
+            i = work%dynamic_bond_idx(m)
+          else
+            i = m
+          end if
+          iat = topo%blist(1,i)
+          jat = topo%blist(2,i)
+          ij = iat*(iat-1)/2+jat
+          xa = xyz(1,iat)
+          ya = xyz(2,iat)
+          za = xyz(3,iat)
+          dx = xa-xyz(1,jat)
+          dy = ya-xyz(2,jat)
+          dz = za-xyz(3,jat)
+          r2 = sqrab(ij)
+          rab = srab(ij)
+          ati = at(iat)
+          atj = at(jat)
+          alpha = sqrt(param%repa(ati)*param%repa(atj))
+          repab = param%repz(ati)*param%repz(atj)*param%repscalb
+          t16 = r2**0.75_wp
+          t19 = t16*t16
+          t26 = exp(-alpha*t16)*repab
+          erep = erep+t26/rab
+          t27 = t26*(1.5_wp*alpha*t16+1.0_wp)/t19
+          if (present(frozen_mask)) then
+            if (.not.frozen_mask(iat)) then
+              g(1,iat) = g(1,iat)-dx*t27
+              g(2,iat) = g(2,iat)-dy*t27
+              g(3,iat) = g(3,iat)-dz*t27
+            end if
+            if (.not.frozen_mask(jat)) then
+              g(1,jat) = g(1,jat)+dx*t27
+              g(2,jat) = g(2,jat)+dy*t27
+              g(3,jat) = g(3,jat)+dz*t27
+            end if
+          else
             g(1,iat) = g(1,iat)-dx*t27
             g(2,iat) = g(2,iat)-dy*t27
             g(3,iat) = g(3,iat)-dz*t27
-          end if
-          if (.not.frozen_mask(jat)) then
             g(1,jat) = g(1,jat)+dx*t27
             g(2,jat) = g(2,jat)+dy*t27
             g(3,jat) = g(3,jat)+dz*t27
           end if
-        else
-          g(1,iat) = g(1,iat)-dx*t27
-          g(2,iat) = g(2,iat)-dy*t27
-          g(3,iat) = g(3,iat)-dz*t27
-          g(1,jat) = g(1,jat)+dx*t27
-          g(2,jat) = g(2,jat)+dy*t27
-          g(3,jat) = g(3,jat)+dz*t27
-        end if
-      end do
-      !$omp end parallel do
+        end do
+        !$omp end parallel do
+      end if
     end if
 !      if (pr) call timer%measure(7)
 
@@ -1248,25 +1616,47 @@ contains  !> MODULE PROCEDURES START HERE
       else
         nloop = topo%nangl
       end if
-      !$omp parallel do default(none) reduction (+:eangl, g) &
-      !$omp shared(n, at, xyz, topo, param, work, nloop) &
-      !$omp private(m, i, j, k, l, etmp, g3tmp)
-      do l = 1,nloop
-        if (work%static_cache_valid) then
-          m = work%dynamic_angle_idx(l)
-        else
-          m = l
-        end if
-        j = topo%alist(1,m)
-        i = topo%alist(2,m)
-        k = topo%alist(3,m)
-        call egbend(m,j,i,k,n,at,xyz,etmp,g3tmp,param,topo)
-        g(1:3,j) = g(1:3,j)+g3tmp(1:3,1)
-        g(1:3,i) = g(1:3,i)+g3tmp(1:3,2)
-        g(1:3,k) = g(1:3,k)+g3tmp(1:3,3)
-        eangl = eangl+etmp
-      end do
-      !$omp end parallel do
+      if (serial_inner) then
+        gserial = 0.0_wp
+        serial_energy = 0.0_wp
+        do l = 1,nloop
+          if (work%static_cache_valid) then
+            m = work%dynamic_angle_idx(l)
+          else
+            m = l
+          end if
+          j = topo%alist(1,m)
+          i = topo%alist(2,m)
+          k = topo%alist(3,m)
+          call egbend(m,j,i,k,n,at,xyz,etmp,g3tmp,param,topo)
+          gserial(1:3,j) = gserial(1:3,j)+g3tmp(1:3,1)
+          gserial(1:3,i) = gserial(1:3,i)+g3tmp(1:3,2)
+          gserial(1:3,k) = gserial(1:3,k)+g3tmp(1:3,3)
+          serial_energy = serial_energy+etmp
+        end do
+        eangl = eangl+serial_energy
+        g = g+gserial
+      else
+        !$omp parallel do default(none) reduction (+:eangl, g) &
+        !$omp shared(n, at, xyz, topo, param, work, nloop) &
+        !$omp private(m, i, j, k, l, etmp, g3tmp)
+        do l = 1,nloop
+          if (work%static_cache_valid) then
+            m = work%dynamic_angle_idx(l)
+          else
+            m = l
+          end if
+          j = topo%alist(1,m)
+          i = topo%alist(2,m)
+          k = topo%alist(3,m)
+          call egbend(m,j,i,k,n,at,xyz,etmp,g3tmp,param,topo)
+          g(1:3,j) = g(1:3,j)+g3tmp(1:3,1)
+          g(1:3,i) = g(1:3,i)+g3tmp(1:3,2)
+          g(1:3,k) = g(1:3,k)+g3tmp(1:3,3)
+          eangl = eangl+etmp
+        end do
+        !$omp end parallel do
+      end if
     end if
 
 !!!!!!!!!!!!!!!!!!
@@ -1280,27 +1670,51 @@ contains  !> MODULE PROCEDURES START HERE
       else
         nloop = topo%ntors
       end if
-      !$omp parallel do default(none) reduction (+:etors, g) &
-      !$omp shared(param, topo, n, at, xyz, work, nloop) &
-      !$omp private(m, i, j, k, l, nd3pos, etmp, g4tmp)
-      do nd3pos = 1,nloop
-        if (work%static_cache_valid) then
-          m = work%dynamic_torsion_idx(nd3pos)
-        else
-          m = nd3pos
-        end if
-        i = topo%tlist(1,m)
-        j = topo%tlist(2,m)
-        k = topo%tlist(3,m)
-        l = topo%tlist(4,m)
-        call egtors(m,i,j,k,l,n,at,xyz,etmp,g4tmp,param,topo)
-        g(1:3,i) = g(1:3,i)+g4tmp(1:3,1)
-        g(1:3,j) = g(1:3,j)+g4tmp(1:3,2)
-        g(1:3,k) = g(1:3,k)+g4tmp(1:3,3)
-        g(1:3,l) = g(1:3,l)+g4tmp(1:3,4)
-        etors = etors+etmp
-      end do
-      !$omp end parallel do
+      if (serial_inner) then
+        gserial = 0.0_wp
+        serial_energy = 0.0_wp
+        do nd3pos = 1,nloop
+          if (work%static_cache_valid) then
+            m = work%dynamic_torsion_idx(nd3pos)
+          else
+            m = nd3pos
+          end if
+          i = topo%tlist(1,m)
+          j = topo%tlist(2,m)
+          k = topo%tlist(3,m)
+          l = topo%tlist(4,m)
+          call egtors(m,i,j,k,l,n,at,xyz,etmp,g4tmp,param,topo)
+          gserial(1:3,i) = gserial(1:3,i)+g4tmp(1:3,1)
+          gserial(1:3,j) = gserial(1:3,j)+g4tmp(1:3,2)
+          gserial(1:3,k) = gserial(1:3,k)+g4tmp(1:3,3)
+          gserial(1:3,l) = gserial(1:3,l)+g4tmp(1:3,4)
+          serial_energy = serial_energy+etmp
+        end do
+        etors = etors+serial_energy
+        g = g+gserial
+      else
+        !$omp parallel do default(none) reduction (+:etors, g) &
+        !$omp shared(param, topo, n, at, xyz, work, nloop) &
+        !$omp private(m, i, j, k, l, nd3pos, etmp, g4tmp)
+        do nd3pos = 1,nloop
+          if (work%static_cache_valid) then
+            m = work%dynamic_torsion_idx(nd3pos)
+          else
+            m = nd3pos
+          end if
+          i = topo%tlist(1,m)
+          j = topo%tlist(2,m)
+          k = topo%tlist(3,m)
+          l = topo%tlist(4,m)
+          call egtors(m,i,j,k,l,n,at,xyz,etmp,g4tmp,param,topo)
+          g(1:3,i) = g(1:3,i)+g4tmp(1:3,1)
+          g(1:3,j) = g(1:3,j)+g4tmp(1:3,2)
+          g(1:3,k) = g(1:3,k)+g4tmp(1:3,3)
+          g(1:3,l) = g(1:3,l)+g4tmp(1:3,4)
+          etors = etors+etmp
+        end do
+        !$omp end parallel do
+      end if
     end if
 !      if (pr) call timer%measure(8)
 
@@ -1326,20 +1740,37 @@ contains  !> MODULE PROCEDURES START HERE
 
 !      if (pr) call timer%measure(9,'bonded ATM')
     if (topo%nbatm .gt. 0) then
-      !$omp parallel do default(none) reduction(+:ebatm, g) &
-      !$omp shared(n, at, xyz, srab, sqrab, topo, param) &
-      !$omp private(i, j, k, l, etmp, g3tmp)
-      do i = 1,topo%nbatm
-        j = topo%b3list(1,i)
-        k = topo%b3list(2,i)
-        l = topo%b3list(3,i)
-        call batmgfnff_eg(n,j,k,l,at,xyz,topo%qa,sqrab,srab,etmp,g3tmp,param)
-        g(1:3,j) = g(1:3,j)+g3tmp(1:3,1)
-        g(1:3,k) = g(1:3,k)+g3tmp(1:3,2)
-        g(1:3,l) = g(1:3,l)+g3tmp(1:3,3)
-        ebatm = ebatm+etmp
-      end do
-      !$omp end parallel do
+      if (serial_inner) then
+        gserial = 0.0_wp
+        serial_energy = 0.0_wp
+        do i = 1,topo%nbatm
+          j = topo%b3list(1,i)
+          k = topo%b3list(2,i)
+          l = topo%b3list(3,i)
+          call batmgfnff_eg(n,j,k,l,at,xyz,topo%qa,sqrab,srab,etmp,g3tmp,param)
+          gserial(1:3,j) = gserial(1:3,j)+g3tmp(1:3,1)
+          gserial(1:3,k) = gserial(1:3,k)+g3tmp(1:3,2)
+          gserial(1:3,l) = gserial(1:3,l)+g3tmp(1:3,3)
+          serial_energy = serial_energy+etmp
+        end do
+        ebatm = ebatm+serial_energy
+        g = g+gserial
+      else
+        !$omp parallel do default(none) reduction(+:ebatm, g) &
+        !$omp shared(n, at, xyz, srab, sqrab, topo, param) &
+        !$omp private(i, j, k, l, etmp, g3tmp)
+        do i = 1,topo%nbatm
+          j = topo%b3list(1,i)
+          k = topo%b3list(2,i)
+          l = topo%b3list(3,i)
+          call batmgfnff_eg(n,j,k,l,at,xyz,topo%qa,sqrab,srab,etmp,g3tmp,param)
+          g(1:3,j) = g(1:3,j)+g3tmp(1:3,1)
+          g(1:3,k) = g(1:3,k)+g3tmp(1:3,2)
+          g(1:3,l) = g(1:3,l)+g3tmp(1:3,3)
+          ebatm = ebatm+etmp
+        end do
+        !$omp end parallel do
+      end if
     end if
 !      if (pr) call timer%measure(9)
 
@@ -1359,51 +1790,89 @@ contains  !> MODULE PROCEDURES START HERE
       ghb_thread = 0.0_wp
       ehb_thread = 0.0_wp
 
-      !$omp parallel default(none) &
-      !$omp shared(topo, nlist, param, n, at, xyz, sqrab, srab, ghb_thread, ehb_thread) &
-      !$omp private(tid, i, j, k, l, etmp, g3tmp)
-      tid = 1
+      if (serial_inner) then
+        tid = 1
+        do i = 1,nlist%nhb1
+          j = nlist%hblist1(1,i)
+          k = nlist%hblist1(2,i)
+          l = nlist%hblist1(3,i)
+          call abhgfnff_eg1(n,j,k,l,at,xyz,topo%qa,sqrab,srab,etmp,g3tmp,param,topo)
+          ghb_thread(1:3,j,tid) = ghb_thread(1:3,j,tid)+g3tmp(1:3,1)
+          ghb_thread(1:3,k,tid) = ghb_thread(1:3,k,tid)+g3tmp(1:3,2)
+          ghb_thread(1:3,l,tid) = ghb_thread(1:3,l,tid)+g3tmp(1:3,3)
+          ehb_thread(tid) = ehb_thread(tid)+etmp
+        end do
+
+        do i = 1,nlist%nhb2
+          j = nlist%hblist2(1,i)
+          k = nlist%hblist2(2,i)
+          l = nlist%hblist2(3,i)
+          !Carbonyl case R-C=O...H_A
+          if (at(k) .eq. 8.and.topo%nb(20,k) .eq. 1.and.at(topo%nb(1,k)) .eq. 6) then
+            call abhgfnff_eg3(n,j,k,l,at,xyz,topo%qa,sqrab,srab, &
+               & etmp,ghb_thread(:,:,tid),param,topo)
+            !Nitro case R-N=O...H_A
+          else if (at(k) .eq. 8.and.topo%nb(20,k) .eq. 1.and.at(topo%nb(1,k)) .eq. 7) then
+            call abhgfnff_eg3(n,j,k,l,at,xyz,topo%qa,sqrab,srab, &
+               & etmp,ghb_thread(:,:,tid),param,topo)
+            !N hetero aromat
+          else if (at(k) .eq. 7.and.topo%nb(20,k) .eq. 2) then
+            call abhgfnff_eg2_rnr(n,j,k,l,at,xyz,topo%qa,sqrab,srab, &
+               & etmp,ghb_thread(:,:,tid),param,topo)
+          else
+            !Default
+            call abhgfnff_eg2new(n,j,k,l,at,xyz,topo%qa,sqrab,srab, &
+               & etmp,ghb_thread(:,:,tid),param,topo)
+          end if
+          ehb_thread(tid) = ehb_thread(tid)+etmp
+        end do
+      else
+        !$omp parallel default(none) &
+        !$omp shared(topo, nlist, param, n, at, xyz, sqrab, srab, ghb_thread, ehb_thread) &
+        !$omp private(tid, i, j, k, l, etmp, g3tmp)
+        tid = 1
 !$    tid = omp_get_thread_num()+1
 
-      !$omp do schedule(static)
-      do i = 1,nlist%nhb1
-        j = nlist%hblist1(1,i)
-        k = nlist%hblist1(2,i)
-        l = nlist%hblist1(3,i)
-        call abhgfnff_eg1(n,j,k,l,at,xyz,topo%qa,sqrab,srab,etmp,g3tmp,param,topo)
-        ghb_thread(1:3,j,tid) = ghb_thread(1:3,j,tid)+g3tmp(1:3,1)
-        ghb_thread(1:3,k,tid) = ghb_thread(1:3,k,tid)+g3tmp(1:3,2)
-        ghb_thread(1:3,l,tid) = ghb_thread(1:3,l,tid)+g3tmp(1:3,3)
-        ehb_thread(tid) = ehb_thread(tid)+etmp
-      end do
-      !$omp end do
+        !$omp do schedule(static)
+        do i = 1,nlist%nhb1
+          j = nlist%hblist1(1,i)
+          k = nlist%hblist1(2,i)
+          l = nlist%hblist1(3,i)
+          call abhgfnff_eg1(n,j,k,l,at,xyz,topo%qa,sqrab,srab,etmp,g3tmp,param,topo)
+          ghb_thread(1:3,j,tid) = ghb_thread(1:3,j,tid)+g3tmp(1:3,1)
+          ghb_thread(1:3,k,tid) = ghb_thread(1:3,k,tid)+g3tmp(1:3,2)
+          ghb_thread(1:3,l,tid) = ghb_thread(1:3,l,tid)+g3tmp(1:3,3)
+          ehb_thread(tid) = ehb_thread(tid)+etmp
+        end do
+        !$omp end do
 
-      !$omp do schedule(static)
-      do i = 1,nlist%nhb2
-        j = nlist%hblist2(1,i)
-        k = nlist%hblist2(2,i)
-        l = nlist%hblist2(3,i)
-        !Carbonyl case R-C=O...H_A
-        if (at(k) .eq. 8.and.topo%nb(20,k) .eq. 1.and.at(topo%nb(1,k)) .eq. 6) then
-          call abhgfnff_eg3(n,j,k,l,at,xyz,topo%qa,sqrab,srab, &
-             & etmp,ghb_thread(:,:,tid),param,topo)
-          !Nitro case R-N=O...H_A
-        else if (at(k) .eq. 8.and.topo%nb(20,k) .eq. 1.and.at(topo%nb(1,k)) .eq. 7) then
-          call abhgfnff_eg3(n,j,k,l,at,xyz,topo%qa,sqrab,srab, &
-             & etmp,ghb_thread(:,:,tid),param,topo)
-          !N hetero aromat
-        else if (at(k) .eq. 7.and.topo%nb(20,k) .eq. 2) then
-          call abhgfnff_eg2_rnr(n,j,k,l,at,xyz,topo%qa,sqrab,srab, &
-             & etmp,ghb_thread(:,:,tid),param,topo)
-        else
-          !Default
-          call abhgfnff_eg2new(n,j,k,l,at,xyz,topo%qa,sqrab,srab, &
-             & etmp,ghb_thread(:,:,tid),param,topo)
-        end if
-        ehb_thread(tid) = ehb_thread(tid)+etmp
-      end do
-      !$omp end do
-      !$omp end parallel
+        !$omp do schedule(static)
+        do i = 1,nlist%nhb2
+          j = nlist%hblist2(1,i)
+          k = nlist%hblist2(2,i)
+          l = nlist%hblist2(3,i)
+          !Carbonyl case R-C=O...H_A
+          if (at(k) .eq. 8.and.topo%nb(20,k) .eq. 1.and.at(topo%nb(1,k)) .eq. 6) then
+            call abhgfnff_eg3(n,j,k,l,at,xyz,topo%qa,sqrab,srab, &
+               & etmp,ghb_thread(:,:,tid),param,topo)
+            !Nitro case R-N=O...H_A
+          else if (at(k) .eq. 8.and.topo%nb(20,k) .eq. 1.and.at(topo%nb(1,k)) .eq. 7) then
+            call abhgfnff_eg3(n,j,k,l,at,xyz,topo%qa,sqrab,srab, &
+               & etmp,ghb_thread(:,:,tid),param,topo)
+            !N hetero aromat
+          else if (at(k) .eq. 7.and.topo%nb(20,k) .eq. 2) then
+            call abhgfnff_eg2_rnr(n,j,k,l,at,xyz,topo%qa,sqrab,srab, &
+               & etmp,ghb_thread(:,:,tid),param,topo)
+          else
+            !Default
+            call abhgfnff_eg2new(n,j,k,l,at,xyz,topo%qa,sqrab,srab, &
+               & etmp,ghb_thread(:,:,tid),param,topo)
+          end if
+          ehb_thread(tid) = ehb_thread(tid)+etmp
+        end do
+        !$omp end do
+        !$omp end parallel
+      end if
 
       do tid = 1,nthreads
         g = g+ghb_thread(:,:,tid)
@@ -1417,20 +1886,37 @@ contains  !> MODULE PROCEDURES START HERE
 !!!!!!!!!!!!!!!!!!
 
     if (nlist%nxb .gt. 0) then
-      !$omp parallel do default(none) reduction(+:exb, g) &
-      !$omp shared(topo, nlist, param, n, at, xyz) &
-      !$omp private(i, j, k, l, etmp, g3tmp)
-      do i = 1,nlist%nxb
-        j = nlist%hblist3(1,i)
-        k = nlist%hblist3(2,i)
-        l = nlist%hblist3(3,i)
-        call rbxgfnff_eg(n,j,k,l,at,xyz,topo%qa,etmp,g3tmp,param)
-        g(1:3,j) = g(1:3,j)+g3tmp(1:3,1)
-        g(1:3,k) = g(1:3,k)+g3tmp(1:3,2)
-        g(1:3,l) = g(1:3,l)+g3tmp(1:3,3)
-        exb = exb+etmp
-      end do
-      !$omp end parallel do
+      if (serial_inner) then
+        gserial = 0.0_wp
+        serial_energy = 0.0_wp
+        do i = 1,nlist%nxb
+          j = nlist%hblist3(1,i)
+          k = nlist%hblist3(2,i)
+          l = nlist%hblist3(3,i)
+          call rbxgfnff_eg(n,j,k,l,at,xyz,topo%qa,etmp,g3tmp,param)
+          gserial(1:3,j) = gserial(1:3,j)+g3tmp(1:3,1)
+          gserial(1:3,k) = gserial(1:3,k)+g3tmp(1:3,2)
+          gserial(1:3,l) = gserial(1:3,l)+g3tmp(1:3,3)
+          serial_energy = serial_energy+etmp
+        end do
+        exb = exb+serial_energy
+        g = g+gserial
+      else
+        !$omp parallel do default(none) reduction(+:exb, g) &
+        !$omp shared(topo, nlist, param, n, at, xyz) &
+        !$omp private(i, j, k, l, etmp, g3tmp)
+        do i = 1,nlist%nxb
+          j = nlist%hblist3(1,i)
+          k = nlist%hblist3(2,i)
+          l = nlist%hblist3(3,i)
+          call rbxgfnff_eg(n,j,k,l,at,xyz,topo%qa,etmp,g3tmp,param)
+          g(1:3,j) = g(1:3,j)+g3tmp(1:3,1)
+          g(1:3,k) = g(1:3,k)+g3tmp(1:3,2)
+          g(1:3,l) = g(1:3,l)+g3tmp(1:3,3)
+          exb = exb+etmp
+        end do
+        !$omp end parallel do
+      end if
     end if
 !     if (pr) call timer%measure(10)
 
@@ -1478,7 +1964,21 @@ contains  !> MODULE PROCEDURES START HERE
       cn = 0
 !> asymtotically for R=inf, Etot is the SIE contaminted EES
 !> which is computed here to get the atomization energy De,n,at(n)
-      call goed_gfnff(.true.,n,at,sqrab,srab,dfloat(ichrg),eeqtmp,cn,qtmp,eesinf,solvation,param,topo,work,io)
+      ! This diagnostic matrix is defined by the supplied infinite-distance
+      ! coordinates and must not reuse the physical-geometry frozen-host cache.
+      call goed_gfnff(.false.,n,at,sqrab,srab,dfloat(ichrg),eeqtmp,cn,qtmp,eesinf,solvation,param,topo,work,io)
+      ! The legacy fit-De diagnostic reuses the physical workspace arrays for
+      ! its infinite-distance inputs and EEQ intermediates.  Treat every cache
+      ! backed by those arrays as invalid before returning: the next ordinary
+      ! call must reconstruct distances, CN data, EEQ pair data, the frozen
+      ! block, and the host inverse from its physical geometry.  This avoids
+      ! additional O(n**2) diagnostic copies while preventing fit-De state from
+      ! being observed by a later cached physical calculation.
+      work%frozen_cache_valid = .false.
+      work%static_cache_valid = .false.
+      work%cn_cache_valid = .false.
+      work%eeq_frozen_block_valid = .false.
+      work%eeq_host_inverse_valid = .false.
       de = -(etot-eesinf)
     end if
 !> write resusts to res type
@@ -2104,13 +2604,13 @@ contains  !> MODULE PROCEDURES START HERE
 !       based on charge densities obtained by a neural network
 !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
 
-  subroutine goed_gfnff(single,n,at,sqrab,r,chrg,eeqtmp,cn,q,es,gbsa,param,topo,work,io)
+  subroutine goed_gfnff(allow_frozen_cache,n,at,sqrab,r,chrg,eeqtmp,cn,q,es,gbsa,param,topo,work,io)
     implicit none
     character(len=*),parameter :: source = 'gfnff_eg_goed'
     type(TGFFData),intent(in) :: param
     type(TGFFTopology),intent(in) :: topo
     type(gfnff_workspace),intent(inout),target :: work
-    logical,intent(in)  :: single     !> real*4 flag for solver
+    logical,intent(in)  :: allow_frozen_cache
     integer,intent(in)  :: n          !> number of atoms
     integer,intent(in)  :: at(n)      !> ordinal numbers
     real(wp),intent(in)  :: sqrab(n*(n+1)/2)   !> squared dist
@@ -2127,20 +2627,19 @@ contains  !> MODULE PROCEDURES START HERE
     integer :: io1,io2,io_block
     real(wp) :: gammij,tsqrt2pi,tmp
     real(wp),pointer :: A(:,:),x(:)
-    real(sp),pointer :: A4(:,:),x4(:)
     integer,pointer :: ipiv(:)
 !>  parameter
     parameter(tsqrt2pi=0.797884560802866_wp)
-    logical :: exitRun,use_block_solver
+    logical :: exitRun,use_block_solver,lazy_block_assembly,serial_inner
 
     io = 0  !> return status
+    serial_inner = .true.
+!$  serial_inner = omp_get_max_threads() == 1
 
 !> # atoms + fragment charge constraints
     m = n+topo%nfrag
     A => work%eeq_a
     x => work%eeq_x
-    A4 => work%eeq_a4
-    x4 => work%eeq_x4
     ipiv => work%eeq_ipiv
 
 !> setup RHS
@@ -2148,53 +2647,107 @@ contains  !> MODULE PROCEDURES START HERE
       x(i) = topo%chieeq(i)+param%cnf(at(i))*sqrt(cn(i))
     end do
 
-    A = 0.0_wp
-    call work%prepare_eeq_frozen_block(n,r,topo)
+    if (allow_frozen_cache) call work%prepare_eeq_frozen_block(n,r,topo)
+
+    nf = 0
+    if (allow_frozen_cache .and. work%eeq_frozen_block_valid) nf = work%frozen_prefix
+    lazy_block_assembly = allow_frozen_cache .and. work%eeq_frozen_block_valid .and. &
+   &                      nf >= 1 .and. nf < n .and. &
+   &                      n-nf+topo%nfrag < nf
+#ifdef WITH_GBSA
+    lazy_block_assembly = lazy_block_assembly .and. .not.allocated(gbsa)
+#endif
+
+    if (lazy_block_assembly) then
+      ! The block solver reads only K and D. Active atomic entries below are
+      ! fully overwritten; only the fragment rows/columns require clearing.
+      if (topo%nfrag > 0) then
+        A(1:n,n+1:m) = 0.0_wp
+        A(n+1:m,1:m) = 0.0_wp
+      end if
+    else
+      ! Retain the complete legacy assembly for every non-block route.
+      A = 0.0_wp
+    end if
 
 !> setup A matrix. For a contiguous frozen prefix, retain the exact
 !> frozen-frozen block and rebuild only rows that contain active atoms.
-    if (work%eeq_frozen_block_valid) then
+    if (allow_frozen_cache .and. work%eeq_frozen_block_valid) then
       nf = work%frozen_prefix
-      A(1:nf,1:nf) = work%eeq_frozen_block(1:nf,1:nf)
-      !$omp parallel default(none) &
-      !$omp shared(topo,n,nf,r,eeqtmp,A) &
-      !$omp private(i,j,k,ij,gammij,tmp)
-      !$omp do schedule(dynamic)
-      do i = nf+1,n
-        A(i,i) = tsqrt2pi/sqrt(topo%alpeeq(i))+topo%gameeq(i)
-        k = i*(i-1)/2
-        do j = 1,i-1
-          ij = k+j
-          gammij = 1.0_wp/sqrt(topo%alpeeq(i)+topo%alpeeq(j))
-          tmp = erf(gammij*r(ij))
-          eeqtmp(1,ij) = gammij
-          eeqtmp(2,ij) = tmp
-          A(j,i) = tmp/r(ij)
-          A(i,j) = A(j,i)
+      if (.not.lazy_block_assembly) then
+        A(1:nf,1:nf) = work%eeq_frozen_block(1:nf,1:nf)
+      end if
+      if (serial_inner) then
+        do i = nf+1,n
+          A(i,i) = tsqrt2pi/sqrt(topo%alpeeq(i))+topo%gameeq(i)
+          k = i*(i-1)/2
+          do j = 1,i-1
+            ij = k+j
+            gammij = 1.0_wp/sqrt(topo%alpeeq(i)+topo%alpeeq(j))
+            tmp = erf(gammij*r(ij))
+            eeqtmp(1,ij) = gammij
+            eeqtmp(2,ij) = tmp
+            A(j,i) = tmp/r(ij)
+            A(i,j) = A(j,i)
+          end do
         end do
-      end do
-      !$omp enddo
-      !$omp end parallel
+      else
+        !$omp parallel default(none) &
+        !$omp shared(topo,n,nf,r,eeqtmp,A) &
+        !$omp private(i,j,k,ij,gammij,tmp)
+        !$omp do schedule(dynamic)
+        do i = nf+1,n
+          A(i,i) = tsqrt2pi/sqrt(topo%alpeeq(i))+topo%gameeq(i)
+          k = i*(i-1)/2
+          do j = 1,i-1
+            ij = k+j
+            gammij = 1.0_wp/sqrt(topo%alpeeq(i)+topo%alpeeq(j))
+            tmp = erf(gammij*r(ij))
+            eeqtmp(1,ij) = gammij
+            eeqtmp(2,ij) = tmp
+            A(j,i) = tmp/r(ij)
+            A(i,j) = A(j,i)
+          end do
+        end do
+        !$omp enddo
+        !$omp end parallel
+      end if
     else
-      !$omp parallel default(none) &
-      !$omp shared(topo,n,r,eeqtmp,A) &
-      !$omp private(i,j,k,ij,gammij,tmp)
-      !$omp do schedule(dynamic)
-      do i = 1,n
-        A(i,i) = tsqrt2pi/sqrt(topo%alpeeq(i))+topo%gameeq(i)
-        k = i*(i-1)/2
-        do j = 1,i-1
-          ij = k+j
-          gammij = 1.0_wp/sqrt(topo%alpeeq(i)+topo%alpeeq(j))
-          tmp = erf(gammij*r(ij))
-          eeqtmp(1,ij) = gammij
-          eeqtmp(2,ij) = tmp
-          A(j,i) = tmp/r(ij)
-          A(i,j) = A(j,i)
+      if (serial_inner) then
+        do i = 1,n
+          A(i,i) = tsqrt2pi/sqrt(topo%alpeeq(i))+topo%gameeq(i)
+          k = i*(i-1)/2
+          do j = 1,i-1
+            ij = k+j
+            gammij = 1.0_wp/sqrt(topo%alpeeq(i)+topo%alpeeq(j))
+            tmp = erf(gammij*r(ij))
+            eeqtmp(1,ij) = gammij
+            eeqtmp(2,ij) = tmp
+            A(j,i) = tmp/r(ij)
+            A(i,j) = A(j,i)
+          end do
         end do
-      end do
-      !$omp enddo
-      !$omp end parallel
+      else
+        !$omp parallel default(none) &
+        !$omp shared(topo,n,r,eeqtmp,A) &
+        !$omp private(i,j,k,ij,gammij,tmp)
+        !$omp do schedule(dynamic)
+        do i = 1,n
+          A(i,i) = tsqrt2pi/sqrt(topo%alpeeq(i))+topo%gameeq(i)
+          k = i*(i-1)/2
+          do j = 1,i-1
+            ij = k+j
+            gammij = 1.0_wp/sqrt(topo%alpeeq(i)+topo%alpeeq(j))
+            tmp = erf(gammij*r(ij))
+            eeqtmp(1,ij) = gammij
+            eeqtmp(2,ij) = tmp
+            A(j,i) = tmp/r(ij)
+            A(i,j) = A(j,i)
+          end do
+        end do
+        !$omp enddo
+        !$omp end parallel
+      end if
     end if
 
 !> fragment charge constraints
@@ -2214,35 +2767,32 @@ contains  !> MODULE PROCEDURES START HERE
     end if
 #endif
 
-    if (single) then
-      A4 = real(A,sp)
-      x4 = real(x,sp)
-      call sytrf_cached_wrap(A4,ipiv,work%eeq_lapack_work4,io1)
-      call sytrs_wrap(A4,x4,ipiv,io2)
-      q(1:n) = real(x4(1:n),wp)
-    else
-      io_block = 0
-      use_block_solver = .true.
+    io_block = 0
+    use_block_solver = allow_frozen_cache
 #ifdef WITH_GBSA
-      use_block_solver = .not.allocated(gbsa)
+    use_block_solver = use_block_solver .and. .not.allocated(gbsa)
 #endif
-      if (use_block_solver) then
-        call work%prepare_eeq_host_inverse(n,topo,io_block)
+    if (use_block_solver) then
+      call work%prepare_eeq_host_inverse(n,topo,io_block)
+    end if
+    use_block_solver = use_block_solver .and. io_block == 0 &
+   &                   .and. work%eeq_host_inverse_valid
+    if (use_block_solver) then
+      call solve_eeq_host_block(n,topo%nfrag,work%frozen_prefix,topo%fraglist, &
+     &                         topo%qfrag,A,x,work,q,io1,io2)
+    else
+      io1 = io_block
+      io2 = 0
+    end if
+    if (.not.use_block_solver .or. io1 /= 0 .or. io2 /= 0) then
+      if (lazy_block_assembly) then
+        ! A lazy successful block solve never reads H. A full-system
+        ! fallback does, so restore the pristine cached host block first.
+        A(1:nf,1:nf) = work%eeq_frozen_block(1:nf,1:nf)
       end if
-      use_block_solver = use_block_solver .and. io_block == 0 &
-     &                   .and. work%eeq_host_inverse_valid
-      if (use_block_solver) then
-        call solve_eeq_host_block(n,topo%nfrag,work%frozen_prefix,topo%fraglist, &
-       &                         topo%qfrag,A,x,work,q,io1,io2)
-      else
-        io1 = io_block
-        io2 = 0
-      end if
-      if (.not.use_block_solver .or. io1 /= 0 .or. io2 /= 0) then
-        call sytrf_cached_wrap(A,ipiv,work%eeq_lapack_work,io1)
-        call sytrs_wrap(A,x,ipiv,io2)
-        q(1:n) = x(1:n)
-      end if
+      call sytrf_cached_wrap(A,ipiv,work%eeq_lapack_work,io1)
+      call sytrs_wrap(A,x,ipiv,io2)
+      q(1:n) = x(1:n)
     end if
 
     exitRun = (io1 /= 0).or.(io2 /= 0)
@@ -2292,12 +2842,12 @@ contains  !> MODULE PROCEDURES START HERE
 
     ! K couples the frozen host block to active atomic charges and all
     ! fragment-charge multipliers. The fragment columns are fixed 0/1 entries.
-    work%eeq_block_k = 0.0_wp
     do j = 1,na
       do i = 1,nf
         work%eeq_block_k(i,j) = A(i,nf+j)
       end do
     end do
+    if (nfrag > 0) work%eeq_block_k(:,na+1:p) = 0.0_wp
     do i = 1,nf
       k = fraglist(i)
       if (k >= 1 .and. k <= nfrag) work%eeq_block_k(i,na+k) = 1.0_wp
@@ -2305,19 +2855,24 @@ contains  !> MODULE PROCEDURES START HERE
 
     ! Y = H^{-1} K and y0 = H^{-1} b_H, using the cached exact inverse of
     ! the invariant frozen-host EEQ block H.
-    work%eeq_block_y = 0.0_wp
+    ! GEMM's default beta=0 fully overwrites Y.
     call gemm(work%eeq_host_inverse,work%eeq_block_k,work%eeq_block_y)
     work%eeq_host_rhs = x(1:nf)
     work%eeq_host_solution = 0.0_wp
     call gemv(work%eeq_host_inverse,work%eeq_host_rhs,work%eeq_host_solution)
 
     ! Dynamic Schur complement S = D - K^T H^{-1} K.
-    work%eeq_block_s = 0.0_wp
     do j = 1,na
       do i = 1,na
         work%eeq_block_s(i,j) = A(nf+i,nf+j)
       end do
     end do
+    if (nfrag > 0) then
+      ! The active block is fully overwritten; initialize only constraint
+      ! rows and columns before inserting their exact 0/1 entries.
+      work%eeq_block_s(1:na,na+1:p) = 0.0_wp
+      work%eeq_block_s(na+1:p,1:p) = 0.0_wp
+    end if
     do ia = 1,na
       k = fraglist(nf+ia)
       if (k >= 1 .and. k <= nfrag) then

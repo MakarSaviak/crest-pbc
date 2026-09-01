@@ -32,6 +32,7 @@ subroutine crest_refine(env,input,output)
   use strucrd
   use cregen_interface
   use parallel_interface
+  use omp_lib,only:omp_get_wtime
   implicit none
   type(systemdata),intent(inout) :: env
   character(len=*),intent(in) :: input
@@ -49,7 +50,9 @@ subroutine crest_refine(env,input,output)
   real(wp),allocatable :: xyz(:,:,:)
   integer,allocatable  :: at(:)
   integer :: nrefine,refine_stage
+  real(wp) :: refine_total_clock,refine_stage_clock
 !===========================================================!
+  refine_total_clock = omp_get_wtime()
 !>--- setup
   if (present(output)) then
     outname = output !> new file
@@ -59,19 +62,26 @@ subroutine crest_refine(env,input,output)
  
 !>--- presorting step, if necessary
   if(env%refine_presort)then
+    refine_stage_clock = omp_get_wtime()
     call newcregen(env,0,input)
     call rename('crest_ensemble.xyz',input)
+    write(stdout,'(1x,a,f12.3,a)') 'Refinement presort wall time: ', &
+    & omp_get_wtime()-refine_stage_clock,' sec'
   endif
 
 !>--- read in
+  refine_stage_clock = omp_get_wtime()
   call rdensemble(input,nat,nall,at,xyz,eread)
   allocate (etmp(nall),source=0.0_wp)
 !>>>>>>>>>>>>>>>>>>>>>>>>>>>><<<<<<<<<<<<<<<<<<<<<<<<<<<<<!
 !>--- Important: crest_sploop requires coordinates in Bohrs
     xyz = xyz / bohr
 !>>>>>>>>>>>>>>>>>>>>>>>>>>>><<<<<<<<<<<<<<<<<<<<<<<<<<<<<!
+  write(stdout,'(1x,a,f12.3,a)') 'Refinement input read/canonicalize wall time: ', &
+  & omp_get_wtime()-refine_stage_clock,' sec'
 
 !===========================================================!
+  refine_stage_clock = omp_get_wtime()
   DO_REFINE: if (allocated(env%refine_queue)) then
 !===========================================================!
 
@@ -97,6 +107,10 @@ subroutine crest_refine(env,input,output)
       case (refine%geoopt)
         write (stdout,'("> Geometry optimization of ",i0," structures")') nall
         call crest_oloop(env,nat,nall,at,xyz,eread,.false.)
+        if (env%iostatus_meta /= status_normal) then
+          env%calc%refine_stage = 0
+          return
+        end if
 
       case(refine%confsolv)
         call new_ompautoset(env,'subprocess',1,t1,t2)
@@ -115,16 +129,23 @@ subroutine crest_refine(env,input,output)
 !===========================================================!
   end if DO_REFINE
 !===========================================================!
+  write(stdout,'(1x,a,f12.3,a)') 'Refinement calculation wall time: ', &
+  & omp_get_wtime()-refine_stage_clock,' sec'
 
 !>>>>>>>>>>>>>>>>>>>>>>>>>>>><<<<<<<<<<<<<<<<<<<<<<<<<<<<<!
 !>--- Important: ensemble file must be written in AA
   xyz = xyz / angstrom
 !>>>>>>>>>>>>>>>>>>>>>>>>>>>><<<<<<<<<<<<<<<<<<<<<<<<<<<<<!
 !>--- write output ensemble
+  refine_stage_clock = omp_get_wtime()
   call wrensemble(outname,nat,nall,at,xyz,eread)
+  write(stdout,'(1x,a,f12.3,a)') 'Refinement output canonicalize/write wall time: ', &
+  & omp_get_wtime()-refine_stage_clock,' sec'
 
 !===========================================================!
   deallocate (etmp,eread,xyz,at)
+  write(stdout,'(1x,a,f12.3,a)') 'Refinement complete wall time: ', &
+  & omp_get_wtime()-refine_total_clock,' sec'
   return
 end subroutine crest_refine
 !========================================================================================!

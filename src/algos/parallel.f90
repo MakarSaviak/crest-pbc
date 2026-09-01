@@ -49,12 +49,14 @@ module parallel_interface
   end interface
 
   interface
-    subroutine crest_oloop(env,nat,nall,at,xyz,eread,dump,customcalc)
+    subroutine crest_oloop(env,nat,nall,at,xyz,eread,dump,customcalc, &
+    & poststage_buffer,poststage_written)
       use crest_parameters,only:wp,stdout,sep
       use crest_calculator
       use omp_lib
       use crest_data
       use strucrd
+      use crest_poststage_ensemble,only:poststage_ensemble
       use optimize_module
       use iomod,only:makedir,directory_exist,remove
       use crest_restartlog,only:trackrestart,restart_write_dummy
@@ -66,7 +68,24 @@ module parallel_interface
       integer,intent(in) :: nat,nall
       logical,intent(in) :: dump
       type(calcdata),intent(in),target,optional :: customcalc
+      type(poststage_ensemble),intent(inout),optional :: poststage_buffer
+      logical,intent(out),optional :: poststage_written
     end subroutine crest_oloop
+  end interface
+
+  interface
+    subroutine crest_search_multimd2(env,mols,mddats,nsim,poststage_out)
+      use crest_data,only:systemdata
+      use strucrd,only:coord
+      use dynamics_module,only:mddata
+      use crest_poststage_ensemble,only:poststage_ensemble
+      implicit none
+      type(systemdata),intent(inout) :: env
+      integer,intent(in) :: nsim
+      type(coord),intent(in) :: mols(nsim)
+      type(mddata),intent(inout) :: mddats(nsim)
+      type(poststage_ensemble),intent(inout),optional :: poststage_out
+    end subroutine crest_search_multimd2
   end interface
 end module parallel_interface
 
@@ -235,7 +254,8 @@ end subroutine crest_sploop
 !> Routines for concurrent geometry optimization
 !========================================================================================!
 !========================================================================================!
-subroutine crest_oloop(env,nat,nall,at,xyz,eread,dump,customcalc)
+subroutine crest_oloop(env,nat,nall,at,xyz,eread,dump,customcalc, &
+& poststage_buffer,poststage_written)
 !*******************************************************************************
 !* subroutine crest_oloop
 !* This subroutine performs concurrent geometry optimizations
@@ -245,14 +265,22 @@ subroutine crest_oloop(env,nat,nall,at,xyz,eread,dump,customcalc)
 !*              WARNING: the ensemble file will NOT be in the same order
 !*              as the input xyz array. However, the overwritten xyz will be! 
 !* customcalc - customized (optional) calculation level data
+!* poststage_buffer - when present with dump=.true., write the exact canonical
+!*              XYZ produced by an empty crest_refine pass and retain its
+!*              reparsed Angstrom data in task-completion order
+!* poststage_written - true only after that canonical file and buffer complete
 !*
 !* IMPORTANT: xyz should be in Bohr(!) for this routine
 !******************************************************************************
-  use crest_parameters,only:wp,stdout,sep
+  use crest_parameters,only:wp,stdout,sep,bohr
+  use iso_fortran_env,only:int64
+  use iso_c_binding,only:c_int
   use crest_calculator
   use omp_lib
   use crest_data
   use strucrd
+  use crest_poststage_ensemble,only:poststage_ensemble,poststage_comment_length, &
+  & round_fixed_decimal_10,write_canonical_ensemble_fast
   use optimize_module
   use iomod,only:makedir,directory_exist,remove
   use crest_restartlog,only:trackrestart,restart_write_dummy
@@ -264,21 +292,78 @@ subroutine crest_oloop(env,nat,nall,at,xyz,eread,dump,customcalc)
   integer,intent(in) :: nat,nall
   logical,intent(in) :: dump
   type(calcdata),intent(in),target,optional :: customcalc
+  type(poststage_ensemble),intent(inout),optional :: poststage_buffer
+  logical,intent(out),optional :: poststage_written
 
   type(coord),allocatable :: mols(:)
   type(coord),allocatable :: molsnew(:)
-  integer :: i,j,k,l,io,ich,ich2,c,z,job_id,zcopy
-  logical :: pr,wr,ex
+  type(coord) :: canonical_mol
+  integer :: i,j,k,l,io,ich,ich2,c,z,job_id,zcopy,ninitialized,ngfnff
+  integer :: ndump,canonical_status,canonical_iostat
+  integer :: canonical_workers,canonical_team
+  integer(int64) :: canonical_fallbacks,canonical_frame_fallbacks
+  integer(int64) :: canonical_artifact_bytes
+  logical :: pr,wr,ex,canonical_output
   type(calcdata),allocatable :: calculations(:)
   real(wp) :: energy,gnorm
   real(wp),allocatable :: grads(:,:,:)
+  real(wp),allocatable :: canonical_xyz(:,:,:),canonical_eread(:)
+  integer,allocatable :: canonical_frame_status(:)
+  character(len=poststage_comment_length),allocatable :: canonical_comments(:)
+  real(wp) :: poststage_clock
+  real(wp) :: canonical_write_seconds
   integer :: thread_id,vz,job
   character(len=80) :: atmp
+  character(len=1024) :: canonical_message
   real(wp) :: percent,runtime
   type(calcdata),pointer :: mycalc
+  type(calcdata),target :: local_template
   type(timer) :: profiler
   integer :: T,Tn  !> threads and threads per core
   logical :: nested
+  logical :: optimizer_affinity,affinity_tasks_started
+  integer :: affinity_rank,affinity_team_size
+  integer :: affinity_bind_errors,affinity_restore_errors
+  integer :: affinity_first_bind_error,affinity_first_restore_error
+  integer(c_int) :: affinity_cstat,affinity_finish_status,affinity_gate_enabled
+  integer(c_int) :: affinity_standalone_allowed
+
+  interface
+    integer(c_int) function c_optimizer_affinity_resolve(outer_threads,inner_threads, &
+    & standalone_allowed,enabled_out) &
+    & bind(C,name='crest_optimizer_affinity_resolve')
+      import :: c_int
+      integer(c_int),value :: outer_threads,inner_threads,standalone_allowed
+      integer(c_int),intent(out) :: enabled_out
+    end function c_optimizer_affinity_resolve
+
+    integer(c_int) function c_optimizer_affinity_prepare(expected_threads) &
+    & bind(C,name='crest_optimizer_affinity_prepare')
+      import :: c_int
+      integer(c_int),value :: expected_threads
+    end function c_optimizer_affinity_prepare
+
+    integer(c_int) function c_optimizer_affinity_bind(rank,team_size) &
+    & bind(C,name='crest_optimizer_affinity_bind')
+      import :: c_int
+      integer(c_int),value :: rank,team_size
+    end function c_optimizer_affinity_bind
+
+    integer(c_int) function c_optimizer_affinity_restore(rank,team_size) &
+    & bind(C,name='crest_optimizer_affinity_restore')
+      import :: c_int
+      integer(c_int),value :: rank,team_size
+    end function c_optimizer_affinity_restore
+
+    integer(c_int) function c_optimizer_affinity_finish() &
+    & bind(C,name='crest_optimizer_affinity_finish')
+      import :: c_int
+    end function c_optimizer_affinity_finish
+  end interface
+
+  canonical_output = present(poststage_buffer).and.dump
+  if (present(poststage_written)) poststage_written = .false.
+  if (present(poststage_buffer)) call poststage_buffer%clear()
 
 !>--- decide wether to skip this call
   if (trackrestart(env)) then
@@ -288,10 +373,13 @@ subroutine crest_oloop(env,nat,nall,at,xyz,eread,dump,customcalc)
 
 !>--- check which calc to use
   if(present(customcalc))then
-    mycalc => customcalc
+    local_template = customcalc
   else
-    mycalc => env%calc
+    local_template = env%calc
   endif
+  !> Always seed a call-local template. Neither env%calc nor an INTENT(IN)
+  !> custom calculator is mutated by canonical topology preparation.
+  mycalc => local_template
 
 !>--- check if we have any calculation settings allocated
   if (mycalc%ncalculations < 1) then
@@ -299,16 +387,70 @@ subroutine crest_oloop(env,nat,nall,at,xyz,eread,dump,customcalc)
     return
   end if
 
-!>--- prepare calculation objects for parallelization (one per thread)
+!>--- establish the outer worker count before preparing the shared topology
   call new_ompautoset(env,'auto_nested',nall,T,Tn)
   nested = env%omp_allow_nested
+  affinity_gate_enabled = 0_c_int
+  affinity_standalone_allowed = 0_c_int
+  if (env%crestver == crest_screen) affinity_standalone_allowed = 1_c_int
+  affinity_cstat = c_optimizer_affinity_resolve(int(T,c_int),int(Tn,c_int), &
+  & affinity_standalone_allowed,affinity_gate_enabled)
+  if (affinity_cstat /= 0_c_int) then
+    write (stdout,'(1x,a,i0)') 'Optimizer affinity opt-in/state is invalid; errno=', &
+    & int(affinity_cstat)
+    env%iostatus_meta = status_config
+    return
+  end if
+  optimizer_affinity = affinity_gate_enabled == 1_c_int
+
+!>--- initialize from ensemble frame 1 before cloning the worker calculators
+!  The historical worker-local setup ran inside the outer OpenMP region and
+!  therefore generated every topology with one active thread.  Preserve those
+!  exact parameters while doing the work only once: temporarily serialize the
+!  canonical setup, then restore the selected outer worker count before copies
+!  or optimization work are created.
+  canonical_mol%nat = nat
+  allocate (canonical_mol%at(nat),canonical_mol%xyz(3,nat))
+  canonical_mol%at = at
+  canonical_mol%xyz = xyz(:,:,1)
+  call omp_set_num_threads(1)
+  call prepare_gfnff_topology(canonical_mol,mycalc,io,ninitialized,ngfnff)
+  call omp_set_num_threads(T)
+  call canonical_mol%deallocate()
+  if (io /= 0) then
+    write (stdout,'(1x,a,i0)') 'Canonical GFN-FF topology initialization failed; iostat=',io
+    env%iostatus_meta = status_failed
+    return
+  end if
+  if (ngfnff > 0) then
+    if (ninitialized > 0) then
+      write (stdout,'(1x,a)') 'Canonical GFN-FF topology ready before worker cloning (initialized).'
+    else
+      write (stdout,'(1x,a)') 'Canonical GFN-FF topology ready before worker cloning (retained).'
+    end if
+  end if
+
+!>--- arm placement only after explicit screen opt-in or a validated process batch
+  if (optimizer_affinity) then
+    if (omp_get_proc_bind() /= omp_proc_bind_false .or. omp_get_num_places() /= 0) then
+      write (stdout,'(1x,a)') 'Optimizer affinity requires an unbound process parent.'
+      env%iostatus_meta = status_config
+      return
+    end if
+    affinity_cstat = c_optimizer_affinity_prepare(int(T,c_int))
+    if (affinity_cstat /= 0_c_int) then
+      write (stdout,'(1x,a,i0)') 'Optimizer affinity preparation failed; errno=', &
+      & int(affinity_cstat)
+      env%iostatus_meta = status_config
+      return
+    end if
+  end if
 
 !>--- prepare objects for parallelization
   allocate (calculations(T),source=mycalc)
   allocate (mols(T),molsnew(T))
   do i = 1,T
     do j = 1,mycalc%ncalculations
-      calculations(i)%calcs(j) = mycalc%calcs(j)
       !>--- directories and io preparation
       ex = directory_exist(mycalc%calcs(j)%calcspace)
       if (.not.ex) then
@@ -332,8 +474,57 @@ subroutine crest_oloop(env,nat,nall,at,xyz,eread,dump,customcalc)
   pr = .false. !> stdout printout
   wr = .false. !> write crestopt.log
   if (dump) then
-    open (newunit=ich,file=ensemblefile)
-    open (newunit=ich2,file=ensembleelog)
+    if (canonical_output) then
+      ich = -1
+      open (newunit=ich2,file=ensembleelog,iostat=io)
+      if (io /= 0) then
+        write (stdout,'(1x,a,i0)') &
+        & 'Canonical optimizer energy-log open failed; iostat=',io
+        env%iostatus_meta = status_failed
+        call remove(ensemblefile)
+        call remove(ensembleelog)
+        deallocate (calculations)
+        if (allocated(mols)) deallocate (mols)
+        if (allocated(molsnew)) deallocate (molsnew)
+        if (optimizer_affinity) then
+          affinity_finish_status = c_optimizer_affinity_finish()
+          if (affinity_finish_status /= 0_c_int) write (stdout,'(1x,a,i0)') &
+          & 'Optimizer affinity finish after canonical setup failure returned errno=', &
+          & int(affinity_finish_status)
+        end if
+        return
+      end if
+    else
+      open (newunit=ich,file=ensemblefile)
+      open (newunit=ich2,file=ensembleelog)
+    end if
+  end if
+  if (canonical_output) then
+    allocate (canonical_xyz(3,nat,nall),canonical_eread(nall), &
+    & canonical_comments(nall),canonical_frame_status(nall),stat=io)
+    if (io /= 0) then
+      write (stdout,'(1x,a,i0)') &
+      & 'Canonical optimizer buffer allocation failed; stat=',io
+      env%iostatus_meta = status_failed
+      close (ich2,iostat=canonical_status)
+      call remove(ensemblefile)
+      call remove(ensembleelog)
+      if (allocated(canonical_xyz)) deallocate (canonical_xyz)
+      if (allocated(canonical_eread)) deallocate (canonical_eread)
+      if (allocated(canonical_comments)) deallocate (canonical_comments)
+      if (allocated(canonical_frame_status)) deallocate (canonical_frame_status)
+      deallocate (calculations)
+      if (allocated(mols)) deallocate (mols)
+      if (allocated(molsnew)) deallocate (molsnew)
+      if (optimizer_affinity) then
+        affinity_finish_status = c_optimizer_affinity_finish()
+        if (affinity_finish_status /= 0_c_int) write (stdout,'(1x,a,i0)') &
+        & 'Optimizer affinity finish after canonical setup failure returned errno=', &
+        & int(affinity_finish_status)
+      end if
+      return
+    end if
+    canonical_frame_status = 0
   end if
   call profiler%init(1)
   call profiler%start(1)
@@ -344,20 +535,49 @@ subroutine crest_oloop(env,nat,nall,at,xyz,eread,dump,customcalc)
 !>--- shared variables
   allocate (grads(3,nat,T),source=0.0_wp)
   c = 0  !> counter of successfull optimizations
+  ndump = 0 !> successful structures written, in task-completion order
   k = 0  !> counter of total optimization (fail+success)
   z = 0  !> counter to perform optimization in right order (1...nall)
   eread(:) = 0.0_wp
   grads(:,:,:) = 0.0_wp
+  affinity_bind_errors = 0
+  affinity_restore_errors = 0
+  affinity_first_bind_error = 0
+  affinity_first_restore_error = 0
+  affinity_finish_status = 0_c_int
+  affinity_tasks_started = .false.
+  canonical_iostat = 0
 !>--- loop over ensemble
   !$omp parallel &
   !$omp shared(env,calculations,nat,nall,at,xyz,eread,grads,c,k,z,pr,wr,dump) &
-  !$omp shared(ich,ich2,mols,molsnew, nested,Tn)
+  !$omp shared(ich,ich2,mols,molsnew,nested,Tn,optimizer_affinity) &
+  !$omp shared(canonical_output,canonical_xyz,canonical_eread,canonical_comments) &
+  !$omp shared(ndump,canonical_iostat) &
+  !$omp shared(affinity_bind_errors,affinity_restore_errors) &
+  !$omp shared(affinity_first_bind_error,affinity_first_restore_error,affinity_tasks_started) &
+  !$omp private(affinity_rank,affinity_team_size,affinity_cstat)
+  affinity_rank = omp_get_thread_num()
+  affinity_team_size = omp_get_num_threads()
+  if (optimizer_affinity) then
+    affinity_cstat = c_optimizer_affinity_bind(int(affinity_rank,c_int), &
+    & int(affinity_team_size,c_int))
+    if (affinity_cstat /= 0_c_int) then
+      !$omp critical(crest_optimizer_affinity_status)
+      affinity_bind_errors = affinity_bind_errors+1
+      if (affinity_first_bind_error == 0) affinity_first_bind_error = int(affinity_cstat)
+      !$omp end critical(crest_optimizer_affinity_status)
+    end if
+    !$omp barrier
+  end if
   !$omp single
+  if (.not.optimizer_affinity .or. affinity_bind_errors == 0) then
+  affinity_tasks_started = .true.
   do i = 1,nall
 
     call initsignal()
     vz = i
-    !$omp task firstprivate( vz ) private(j,job,energy,io,atmp,gnorm,thread_id,zcopy)
+    !$omp task firstprivate( vz ) &
+    !$omp private(j,job,energy,io,atmp,gnorm,thread_id,zcopy)
     call initsignal()
 
     !>--- OpenMP nested region threads
@@ -379,6 +599,10 @@ subroutine crest_oloop(env,nat,nall,at,xyz,eread,dump,customcalc)
     !$omp end critical
 
     !>-- geometry optimization
+    !> Each worker calculator persists across ensemble members.  Rebuild only
+    !> its geometry-dependent GFN-FF HB/XB list at this input boundary; retain
+    !> canonical topology, exact EEQ, frozen-host caches, and all workspaces.
+    call request_gfnff_hbond_update(calculations(job))
     call optimize_geometry(mols(job),molsnew(job),calculations(job),energy,grads(:,:,job),pr,wr,io)
 
     !$omp critical
@@ -389,7 +613,17 @@ subroutine crest_oloop(env,nat,nall,at,xyz,eread,dump,customcalc)
         gnorm = norm2(grads(:,:,job))
         write (atmp,'(1x,"Etot=",f16.10,1x,"g norm=",f12.8)') energy,gnorm
         molsnew(job)%comment = trim(atmp)
-        call molsnew(job)%append(ich)
+        if (canonical_output) then
+          ndump = ndump+1
+          canonical_xyz(:,:,ndump) = molsnew(job)%xyz
+          canonical_comments(ndump) = trim(atmp)
+          !> Preserve coord%append's multiply/divide side effect on the array
+          !> returned to the optimization caller, without serial formatting.
+          molsnew(job)%xyz = molsnew(job)%xyz*bohr
+          molsnew(job)%xyz = molsnew(job)%xyz/bohr
+        else
+          call molsnew(job)%append(ich)
+        end if
         call calc_eprint(calculations(job),energy,calculations(job)%etmp,gnorm,ich2)
       end if
       eread(zcopy) = energy
@@ -409,8 +643,66 @@ subroutine crest_oloop(env,nat,nall,at,xyz,eread,dump,customcalc)
     !$omp end task
   end do
   !$omp taskwait
+  end if
   !$omp end single
+  if (optimizer_affinity) then
+    affinity_cstat = c_optimizer_affinity_restore(int(affinity_rank,c_int), &
+    & int(affinity_team_size,c_int))
+    if (affinity_cstat /= 0_c_int) then
+      !$omp critical(crest_optimizer_affinity_status)
+      affinity_restore_errors = affinity_restore_errors+1
+      if (affinity_first_restore_error == 0) affinity_first_restore_error = int(affinity_cstat)
+      !$omp end critical(crest_optimizer_affinity_status)
+    end if
+  end if
   !$omp end parallel
+
+  if (optimizer_affinity) then
+    affinity_finish_status = c_optimizer_affinity_finish()
+    if (affinity_bind_errors /= 0 .or. affinity_restore_errors /= 0 .or. &
+    & affinity_finish_status /= 0_c_int) then
+      if (affinity_bind_errors /= 0) then
+        write (stdout,'(1x,a,i0,a,i0)') 'Optimizer affinity bind failed on ', &
+        & affinity_bind_errors,' workers; first errno=',affinity_first_bind_error
+      end if
+      if (affinity_restore_errors /= 0) then
+        write (stdout,'(1x,a,i0,a,i0)') 'Optimizer affinity restore failed on ', &
+        & affinity_restore_errors,' workers; first errno=',affinity_first_restore_error
+      end if
+      if (affinity_finish_status /= 0_c_int) write (stdout,'(1x,a,i0)') &
+      & 'Optimizer affinity finish failed; errno=',int(affinity_finish_status)
+      if (affinity_tasks_started .and. affinity_bind_errors /= 0) then
+        write (stdout,'(1x,a)') 'Optimizer affinity invariant violated: tasks were started.'
+        env%iostatus_meta = status_failed
+      else if (affinity_restore_errors /= 0 .or. affinity_finish_status /= 0_c_int) then
+        env%iostatus_meta = status_failed
+      else
+        env%iostatus_meta = status_config
+      end if
+      if (dump) then
+        if (canonical_output) then
+          close (ich2,iostat=canonical_status)
+        else
+          close (ich)
+          close (ich2)
+        end if
+        call remove(ensemblefile)
+        call remove(ensembleelog)
+      end if
+      call profiler%stop(1)
+      call profiler%clear()
+      deallocate (grads,calculations)
+      if (allocated(mols)) deallocate (mols)
+      if (allocated(molsnew)) deallocate (molsnew)
+      if (allocated(canonical_xyz)) deallocate (canonical_xyz)
+      if (allocated(canonical_eread)) deallocate (canonical_eread)
+      if (allocated(canonical_comments)) deallocate (canonical_comments)
+      if (allocated(canonical_frame_status)) deallocate (canonical_frame_status)
+      return
+    end if
+    write (stdout,'(1x,a,i0,a)') 'Optimizer affinity completed: ',T, &
+    & ' workers bound and restored.'
+  end if
 
 !>--- finalize progress printout
   call crest_oloop_pr_progress(env,nall,-1)
@@ -430,11 +722,166 @@ subroutine crest_oloop(env,nat,nall,at,xyz,eread,dump,customcalc)
   write (stdout,'(a,a,a)') '> Corresponding to approximately ',trim(adjustl(atmp)), &
   &                       ' per processed structure'
 
-!>--- close files (if they are open)
-  if (dump) then
-    close (ich)
-    close (ich2)
+  if (canonical_output.and.ndump > 0) then
+    canonical_message = ''
+    canonical_artifact_bytes = 0_int64
+    canonical_write_seconds = 0.0_wp
+    canonical_workers = max(1,min(16,ndump,omp_get_max_threads()))
+    canonical_team = 1
+    canonical_fallbacks = 0_int64
+    poststage_clock = omp_get_wtime()
+!$omp parallel default(none) num_threads(canonical_workers) &
+!$omp shared(ndump,nat,at,canonical_xyz,canonical_eread,canonical_comments) &
+!$omp shared(canonical_frame_status,canonical_team) private(i,canonical_frame_fallbacks) &
+!$omp reduction(+:canonical_fallbacks)
+!$omp single
+    canonical_team = omp_get_num_threads()
+!$omp end single
+!$omp do schedule(static)
+    do i = 1,ndump
+      call canonicalize_empty_refine(nat,canonical_xyz(:,:,i), &
+      & canonical_comments(i),canonical_eread(i),canonical_frame_status(i), &
+      & canonical_frame_fallbacks)
+      canonical_fallbacks = canonical_fallbacks+canonical_frame_fallbacks
+    end do
+!$omp end do
+!$omp end parallel
+    canonical_iostat = 0
+    do i = 1,ndump
+      if (canonical_frame_status(i) /= 0) then
+        canonical_iostat = canonical_frame_status(i)
+        exit
+      end if
+    end do
+    write (stdout,'(1x,a,f12.3,a)') &
+    & 'Poststage empty-refinement parallel canonicalization wall time: ', &
+    & omp_get_wtime()-poststage_clock,' sec'
+    write (stdout,'(1x,a,i0,a,i0)') &
+    & 'Poststage empty-refinement canonicalization workers requested/actual: ', &
+    & canonical_workers,' / ',canonical_team
+    write (stdout,'(1x,a,i0)') &
+    & 'Poststage fixed-decimal near-boundary fallbacks: ',canonical_fallbacks
+
+    if (canonical_iostat == 0) then
+      poststage_clock = omp_get_wtime()
+      call write_canonical_ensemble_fast(ensemblefile,at,canonical_xyz(:,:,1:ndump), &
+      & canonical_comments(1:ndump),canonical_artifact_bytes,canonical_write_seconds, &
+      & canonical_status,canonical_message)
+      canonical_iostat = canonical_status
+      write (stdout,'(1x,a,f12.3,a)') &
+      & 'Poststage buffered C ordered artifact write wall time: ', &
+      & omp_get_wtime()-poststage_clock,' sec'
+      write (stdout,'(1x,a,i0,a,f12.3,a)') &
+      & 'Poststage buffered C ordered artifact bytes: ',canonical_artifact_bytes, &
+      & '; writer-internal time: ',canonical_write_seconds,' sec'
+    end if
+
+    if (canonical_iostat /= 0) then
+      write (stdout,'(1x,a,i0)') &
+      & 'Canonical empty-refinement serialization failed; iostat=',canonical_iostat
+      if (len_trim(canonical_message) > 0) write(stdout,'(1x,a)') trim(canonical_message)
+      env%iostatus_meta = status_failed
+      close (ich2,iostat=canonical_status)
+      call remove(ensemblefile)
+      call remove(ensembleelog)
+      call profiler%clear()
+      deallocate (grads,calculations)
+      if (allocated(mols)) deallocate (mols)
+      if (allocated(molsnew)) deallocate (molsnew)
+      if (allocated(canonical_xyz)) deallocate (canonical_xyz)
+      if (allocated(canonical_eread)) deallocate (canonical_eread)
+      if (allocated(canonical_comments)) deallocate (canonical_comments)
+      if (allocated(canonical_frame_status)) deallocate (canonical_frame_status)
+      return
+    end if
   end if
+
+!>--- close files (if they are open)
+  canonical_status = 0
+  if (dump) then
+    if (canonical_output) then
+      close (ich2,iostat=io)
+      if (io /= 0 .and. canonical_status == 0) canonical_status = io
+    else
+      close (ich)
+      close (ich2)
+    end if
+  end if
+
+  if (canonical_output.and.canonical_status /= 0) then
+    write (stdout,'(1x,a,i0)') &
+    & 'Canonical empty-refinement artifact close failed; iostat=',canonical_status
+    env%iostatus_meta = status_failed
+    call poststage_buffer%clear()
+    call remove(ensemblefile)
+    call remove(ensembleelog)
+    if (allocated(canonical_xyz)) deallocate (canonical_xyz)
+    if (allocated(canonical_eread)) deallocate (canonical_eread)
+    if (allocated(canonical_comments)) deallocate (canonical_comments)
+    if (allocated(canonical_frame_status)) deallocate (canonical_frame_status)
+    deallocate (grads)
+    call profiler%clear()
+    deallocate (calculations)
+    if (allocated(mols)) deallocate (mols)
+    if (allocated(molsnew)) deallocate (molsnew)
+    return
+  end if
+
+  if (canonical_output.and.ndump > 0) then
+    poststage_buffer%nat = nat
+    poststage_buffer%nall = ndump
+    allocate (poststage_buffer%at(nat),stat=io)
+    if (io /= 0) then
+      call poststage_buffer%clear()
+      env%iostatus_meta = status_failed
+      call remove(ensemblefile)
+      call remove(ensembleelog)
+      if (allocated(canonical_xyz)) deallocate (canonical_xyz)
+      if (allocated(canonical_eread)) deallocate (canonical_eread)
+      if (allocated(canonical_comments)) deallocate (canonical_comments)
+      if (allocated(canonical_frame_status)) deallocate (canonical_frame_status)
+      deallocate (grads)
+      call profiler%clear()
+      deallocate (calculations)
+      if (allocated(mols)) deallocate (mols)
+      if (allocated(molsnew)) deallocate (molsnew)
+      return
+    end if
+    poststage_buffer%at = at
+    if (ndump == nall) then
+      call move_alloc(canonical_xyz,poststage_buffer%xyz)
+      call move_alloc(canonical_eread,poststage_buffer%eread)
+      call move_alloc(canonical_comments,poststage_buffer%comments)
+    else
+      allocate (poststage_buffer%xyz(3,nat,ndump), &
+      & poststage_buffer%eread(ndump),poststage_buffer%comments(ndump),stat=io)
+      if (io /= 0) then
+        call poststage_buffer%clear()
+        env%iostatus_meta = status_failed
+        call remove(ensemblefile)
+        call remove(ensembleelog)
+        if (allocated(canonical_xyz)) deallocate (canonical_xyz)
+        if (allocated(canonical_eread)) deallocate (canonical_eread)
+        if (allocated(canonical_comments)) deallocate (canonical_comments)
+        if (allocated(canonical_frame_status)) deallocate (canonical_frame_status)
+        deallocate (grads)
+        call profiler%clear()
+        deallocate (calculations)
+        if (allocated(mols)) deallocate (mols)
+        if (allocated(molsnew)) deallocate (molsnew)
+        return
+      end if
+      poststage_buffer%xyz = canonical_xyz(:,:,1:ndump)
+      poststage_buffer%eread = canonical_eread(1:ndump)
+      poststage_buffer%comments = canonical_comments(1:ndump)
+    end if
+    if (present(poststage_written)) poststage_written = .true.
+  end if
+
+  if (allocated(canonical_xyz)) deallocate (canonical_xyz)
+  if (allocated(canonical_eread)) deallocate (canonical_eread)
+  if (allocated(canonical_comments)) deallocate (canonical_comments)
+  if (allocated(canonical_frame_status)) deallocate (canonical_frame_status)
 
   deallocate (grads)
   call profiler%clear()
@@ -442,6 +889,63 @@ subroutine crest_oloop(env,nat,nall,at,xyz,eread,dump,customcalc)
   if (allocated(mols)) deallocate (mols)
   if (allocated(molsnew)) deallocate (molsnew)
   return
+contains
+
+  subroutine canonicalize_empty_refine(nat,xyz_canonical, &
+  & comment_canonical,energy_canonical,status,fallbacks)
+!********************************************************************************
+!* Reproduce the fixed-decimal values produced by coord%append followed by an
+!* empty crest_refine pass. Ordinary values use a numerical quantization kernel;
+!* only near-halfway values enter the formatted-I/O compatibility fallback.
+!********************************************************************************
+    integer,intent(in) :: nat
+    real(wp),intent(inout) :: xyz_canonical(3,nat)
+    real(wp),intent(out) :: energy_canonical
+    character(len=poststage_comment_length),intent(inout) :: comment_canonical
+    integer,intent(out) :: status
+    integer(int64),intent(out) :: fallbacks
+    integer :: j,k,io
+    real(wp) :: first_rounded,second_input,rounded
+    real(wp) :: energy_first
+    character(len=poststage_comment_length) :: optimizer_comment
+    logical :: used_fallback,first_fallback
+
+    status = 0
+    fallbacks = 0_int64
+    energy_canonical = 0.0_wp
+
+    optimizer_comment = comment_canonical
+    energy_first = grepenergy(optimizer_comment)
+    write (comment_canonical,'(2x,f18.8)',iostat=io) energy_first
+    if (io /= 0) then
+      status = io
+      return
+    end if
+    energy_canonical = grepenergy(comment_canonical)
+
+    do j = 1,nat
+      do k = 1,3
+        call round_fixed_decimal_10(xyz_canonical(k,j)*bohr,first_rounded,io, &
+        & first_fallback)
+        if (io /= 0) then
+          status = io
+          return
+        end if
+        ! Preserve the two distinct legacy assignment/unit-conversion stages.
+        ! Algebraically this is close to first_rounded, but the separate
+        ! operations can matter at an F20.10 half-way boundary.
+        second_input = (first_rounded/bohr)*bohr
+        call round_fixed_decimal_10(second_input,rounded,io,used_fallback)
+        if (io /= 0) then
+          status = io
+          return
+        end if
+        xyz_canonical(k,j) = rounded
+        if (first_fallback) fallbacks = fallbacks+1_int64
+        if (used_fallback) fallbacks = fallbacks+1_int64
+      end do
+    end do
+  end subroutine canonicalize_empty_refine
 end subroutine crest_oloop
 
 !========================================================================================!
@@ -514,31 +1018,37 @@ subroutine crest_search_multimd(env,mol,mddats,nsim)
 !* this runs #nsim MDs on the same structure (mol)
 !*****************************************************
   use crest_parameters,only:wp,stdout,sep
+  use iso_fortran_env,only:int64
   use crest_data
   use crest_calculator
   use strucrd
   use dynamics_module
-  use iomod,only:makedir,directory_exist,remove
+  use iomod,only:makedir,directory_exist,remove,collect_stream_files_exact
   use omp_lib
   use crest_restartlog,only:trackrestart,restart_write_dummy
+  use parallel_interface,only:crest_search_multimd2
   implicit none
   type(systemdata),intent(inout) :: env
   type(mddata) :: mddats(nsim)
   integer :: nsim
   type(coord) :: mol
-  type(coord),allocatable :: moltmps(:)
-  integer :: i,j,io,ich
+  type(coord),allocatable :: moltmps(:),process_mols(:)
+  integer :: i,j,io,ich,collector_status,path_length
   logical :: pr,ex,nested,use_tmd_threads
-  logical :: all_gfnff,has_active_calc,gfnff_thread_cap
+  logical :: all_gfnff,has_active_calc
   integer :: T,Tn,Trestore,Tnrestore,thread_save
   real(wp) :: percent
+  real(wp) :: collector_seconds
+  integer(int64) :: collector_bytes
   character(len=80) :: atmp
+  character(len=1024) :: collector_message
+  character(len=:),allocatable :: trajectory_paths(:)
   character(len=*),parameter :: mdir = 'MDFILES'
 
   type(calcdata),allocatable :: calculations(:)
   integer :: vz,job,thread_id
   real(wp) :: etmp
-  real(wp),allocatable :: grdtmp(:,:)
+  real(wp),allocatable :: grdtmp(:,:,:)
   type(timer) :: profiler
 !===========================================================!
 !>--- decide wether to skip this call
@@ -556,6 +1066,15 @@ subroutine crest_search_multimd(env,mol,mddats,nsim)
     return
   end if
 
+  ! All multi-trajectory same-input MTD work is delegated to the modern
+  ! process-isolated scheduler used by crest_search_multimd2.  Keep only the
+  ! single-trajectory direct path below.
+  if (nsim > 1) then
+    allocate(process_mols(nsim),source=mol)
+    call crest_search_multimd2(env,process_mols,mddats,nsim)
+    return
+  end if
+
 !>--- prepare calculation containers for parallelization (one per thread)
   use_tmd_threads = env%threadsmdsetmanual.and.env%ThreadsMD > 0
   thread_save = env%Threads
@@ -570,42 +1089,47 @@ subroutine crest_search_multimd(env,mol,mddats,nsim)
     end if
   end do
   all_gfnff = all_gfnff.and.has_active_calc
-  gfnff_thread_cap = all_gfnff.and.nsim > 0.and.env%Threads > nsim
-  if (gfnff_thread_cap) env%Threads = nsim
   call new_ompautoset(env,'auto_nested',nsim,T,Tn)
   nested = env%omp_allow_nested
   if (all_gfnff) then
-    Tn = 1
+    if (.not.nested) Tn = 1
     write (stdout,'(1x,a,i0,a,i0)') &
-    & 'GFN-FF MTD scheduling: parallel trajectories=',T,', cores per trajectory=',1
+    & 'GFN-FF MTD scheduling: parallel trajectories=',T,', cores per trajectory=',Tn
   end if
 
-  allocate (calculations(T),source=env%calc)
-  allocate (moltmps(T),source=mol)
-  allocate (grdtmp(3,mol%nat),source=0.0_wp)
-  if (all_gfnff) call ompmklset(1)
-  do i = 1,T
-    moltmps(i)%nat = mol%nat
-    moltmps(i)%at = mol%at
-    moltmps(i)%xyz = mol%xyz
+  allocate (grdtmp(3,mol%nat,T),source=0.0_wp)
+  if (all_gfnff) then
+    !> Create only the outer containers here.  Each bound outer worker performs
+    !> the deep copies below, so its GFN-FF topology and workspace pages are
+    !> first-touched in that worker's NUMA locality.
+    allocate (calculations(T))
+    allocate (moltmps(T))
     do j = 1,env%calc%ncalculations
-      calculations(i)%calcs(j) = env%calc%calcs(j)
-      !>--- directories and io preparation
       ex = directory_exist(env%calc%calcs(j)%calcspace)
-      if (.not.ex) then
-        io = makedir(trim(env%calc%calcs(j)%calcspace))
-      end if
-      write (atmp,'(a,"_",i0)') sep,i
-      calculations(i)%calcs(j)%calcspace = env%calc%calcs(j)%calcspace//trim(atmp)
-      if(allocated(calculations(i)%calcs(j)%calcfile)) deallocate(calculations(i)%calcs(j)%calcfile)
-      if(allocated(calculations(i)%calcs(j)%systemcall)) deallocate(calculations(i)%calcs(j)%systemcall)
-      call calculations(i)%calcs(j)%printid(i,j)
+      if (.not.ex) io = makedir(trim(env%calc%calcs(j)%calcspace))
     end do
-    calculations(i)%pr_energies = .false.
-    !>--- initialize the calculations
-    call engrad(moltmps(i),calculations(i),etmp,grdtmp,io)
-  end do
-  if (all_gfnff) call ompmklset(T)
+  else
+    !> Preserve the existing setup path for mixed/external calculators.
+    allocate (calculations(T),source=env%calc)
+    allocate (moltmps(T),source=mol)
+    do i = 1,T
+      moltmps(i)%nat = mol%nat
+      moltmps(i)%at = mol%at
+      moltmps(i)%xyz = mol%xyz
+      do j = 1,env%calc%ncalculations
+        calculations(i)%calcs(j) = env%calc%calcs(j)
+        ex = directory_exist(env%calc%calcs(j)%calcspace)
+        if (.not.ex) io = makedir(trim(env%calc%calcs(j)%calcspace))
+        write (atmp,'(a,"_",i0)') sep,i
+        calculations(i)%calcs(j)%calcspace = env%calc%calcs(j)%calcspace//trim(atmp)
+        if (allocated(calculations(i)%calcs(j)%calcfile)) deallocate(calculations(i)%calcs(j)%calcfile)
+        if (allocated(calculations(i)%calcs(j)%systemcall)) deallocate(calculations(i)%calcs(j)%systemcall)
+        call calculations(i)%calcs(j)%printid(i,j)
+      end do
+      calculations(i)%pr_energies = .false.
+      call engrad(moltmps(i),calculations(i),etmp,grdtmp(:,:,i),io)
+    end do
+  end if
 
   !>--- other settings
   pr = .false.
@@ -613,17 +1137,35 @@ subroutine crest_search_multimd(env,mol,mddats,nsim)
 
   !>--- run the MDs
   !$omp parallel &
-  !$omp shared(env,calculations,mddats,mol,pr,percent,ich, nsim, moltmps, nested,Tn) &
+  !$omp shared(env,calculations,mddats,mol,pr,percent,ich,nsim,moltmps,nested,Tn,grdtmp,all_gfnff) &
   !!$omp single
-  !$omp private(vz,i,job,thread_id,io,ex)
+  !$omp private(vz,i,j,job,thread_id,io,ex,atmp,etmp)
+  thread_id = omp_get_thread_num()
+  job = thread_id+1
+  if (all_gfnff) then
+    calculations(job) = env%calc
+    moltmps(job) = mol
+    do j = 1,env%calc%ncalculations
+      write (atmp,'(a,"_",i0)') sep,job
+      calculations(job)%calcs(j)%calcspace = env%calc%calcs(j)%calcspace//trim(atmp)
+      if (allocated(calculations(job)%calcs(j)%calcfile)) deallocate(calculations(job)%calcs(j)%calcfile)
+      if (allocated(calculations(job)%calcs(j)%systemcall)) deallocate(calculations(job)%calcs(j)%systemcall)
+      call calculations(job)%calcs(j)%printid(job,j)
+    end do
+    calculations(job)%pr_energies = .false.
+
+    !> Preserve the existing one-initialization-evaluation-per-worker behavior.
+    !> GFN-FF setup remains single-threaded inside each independent outer worker.
+    call ompmklset(1)
+    call engrad(moltmps(job),calculations(job),etmp,grdtmp(:,:,job),io)
+  end if
+  if (nested) call ompmklset(Tn)
+
   !$omp do
   do i = 1,nsim
 
     call initsignal()
     vz = i
-
-    !>--- OpenMP nested region threads
-    if (nested) call ompmklset(Tn)
 
     !!$omp task firstprivate( vz ) private( job,thread_id,io,ex )
     call initsignal()
@@ -640,6 +1182,10 @@ subroutine crest_search_multimd(env,mol,mddats,nsim)
 
     !>--- the acutal MD call with timing
     call profiler%start(vz)
+    !> Each worker calculator persists across independent MTD trajectories.
+    !> Rebuild only its geometry-dependent GFN-FF HB/XB list at this boundary;
+    !> retain topology, exact EEQ/frozen-host caches, D3, and all workspaces.
+    call request_gfnff_hbond_update(calculations(job))
     call dynamics(moltmps(job),mddats(vz),calculations(job),pr,io)
     mddats(vz)%termination_status = io
     call profiler%stop(vz)
@@ -651,45 +1197,52 @@ subroutine crest_search_multimd(env,mol,mddats,nsim)
   !!$omp taskwait
   !$omp end parallel
 
-  !>--- collect trajectories into one
-  call collect(nsim,mddats)
+  !>--- collect trajectories into one exact byte stream.  Construct the source
+  !> list explicitly in numeric mddats order; the shared collector uses one
+  !> writer and does not parallelize or reformat scientific trajectory data.
+  collector_status = 0
+  collector_message = ''
+  collector_seconds = 0.0_wp
+  collector_bytes = 0_int64
+  path_length = 1
+  do i = 1,nsim
+    if (.not.allocated(mddats(i)%trajectoryfile)) then
+      collector_status = 1
+      write (collector_message,'(a,i0)') &
+      & 'trajectory path is not allocated at numeric index ',i
+      exit
+    end if
+    path_length = max(path_length,len(mddats(i)%trajectoryfile))
+  end do
+  if (collector_status == 0) then
+    allocate (character(len=path_length) :: trajectory_paths(nsim), &
+    &         stat=collector_status,errmsg=collector_message)
+  end if
+  if (collector_status == 0) then
+    do i = 1,nsim
+      trajectory_paths(i) = mddats(i)%trajectoryfile
+    end do
+    call collect_stream_files_exact(trajectory_paths,'crest_dynamics.trj', &
+    & collector_bytes,collector_seconds,collector_status,collector_message)
+  end if
+  write (stdout,'(1x,a,f12.3,a)') &
+  & 'Trajectory collector wall time: ',collector_seconds,' sec'
+  write (stdout,'(1x,a,i0)') 'Trajectory collector bytes: ',collector_bytes
+  if (collector_status /= 0) then
+    write (stdout,'(1x,a,i0,2a)') 'Trajectory collector failed; iostat=', &
+    & collector_status,': ',trim(collector_message)
+    env%iostatus_meta = status_failed
+  end if
+  if (allocated(trajectory_paths)) deallocate (trajectory_paths)
 
   call profiler%clear()
   deallocate (calculations)
   if (allocated(moltmps)) deallocate (moltmps)
-  if (use_tmd_threads.or.gfnff_thread_cap) then
+  if (use_tmd_threads.or.all_gfnff) then
     env%Threads = thread_save
     call new_ompautoset(env,'max',0,Trestore,Tnrestore)
   end if
   return
-contains
-  subroutine collect(n,mddats)
-    implicit none
-    integer :: n
-    type(mddata) :: mddats(n)
-    logical :: ex
-    integer :: i,io,ich,ich2
-    character(len=:),allocatable :: atmp
-    character(len=256) :: btmp
-    open (newunit=ich,file='crest_dynamics.trj')
-    do i = 1,n
-      atmp = mddats(i)%trajectoryfile
-      inquire (file=atmp,exist=ex)
-      if (ex) then
-        open (newunit=ich2,file=atmp)
-        io = 0
-        do while (io == 0)
-          read (ich2,'(a)',iostat=io) btmp
-          if (io == 0) then
-            write (ich,'(a)') trim(btmp)
-          end if
-        end do
-        close (ich2)
-      end if
-    end do
-    close (ich)
-    return
-  end subroutine collect
 end subroutine crest_search_multimd
 
 !========================================================================================!
@@ -867,39 +1420,50 @@ subroutine crest_search_multimd_init2_mapped(env,mddats,nsim,bias_indices,input_
 end subroutine crest_search_multimd_init2_mapped
 
 !========================================================================================!
-subroutine crest_search_multimd2(env,mols,mddats,nsim)
+subroutine crest_search_multimd2(env,mols,mddats,nsim,poststage_out)
 !*******************************************************************
 !* subroutine crest_search_multimd2
 !* this runs #nsim MDs on #nsim selected different structures (mols)
 !*******************************************************************
   use crest_parameters,only:wp,stdout,sep
+  use iso_fortran_env,only:int64
   use crest_data
   use crest_calculator
   use strucrd
   use dynamics_module
   use shake_module
-  use iomod,only:makedir,directory_exist,remove
+  use iomod,only:makedir,directory_exist,remove,collect_stream_files_exact
   use omp_lib
   use crest_restartlog,only:trackrestart,restart_write_dummy
+  use mtd_process_scheduler,only:resolve_mtd_process_isolation,run_mtd_process_batch
+  use crest_poststage_ensemble,only:poststage_ensemble
   implicit none
   !> INPUT
   type(systemdata),intent(inout) :: env
-  type(mddata) :: mddats(nsim)
-  integer :: nsim
-  type(coord) :: mols(nsim)
+  type(mddata),intent(inout) :: mddats(nsim)
+  integer,intent(in) :: nsim
+  type(coord),intent(in) :: mols(nsim)
+  type(poststage_ensemble),intent(inout),optional :: poststage_out
   type(coord),allocatable :: moltmps(:)
-  integer :: i,j,io,ich
-  logical :: pr,ex,nested,use_tmd_threads
-  logical :: all_gfnff,has_active_calc,gfnff_thread_cap
+  integer :: i,j,io,ich,collector_status,path_length
+  logical :: pr,ex,nested,use_tmd_threads,process_isolated
+  logical :: all_gfnff,has_active_calc
   integer :: T,Tn,Trestore,Tnrestore,thread_save
   real(wp) :: percent
+  real(wp) :: collector_seconds
+  integer(int64) :: collector_bytes
   character(len=80) :: atmp
+  character(len=1024) :: collector_message
+  character(len=1024) :: process_message
+  character(len=:),allocatable :: trajectory_paths(:)
   character(len=*),parameter :: mdir = 'MDFILES'
 
   type(calcdata),allocatable :: calculations(:)
   integer :: vz,job,thread_id
+  integer :: process_status
   type(timer) :: profiler
 !===========================================================!
+  if (present(poststage_out)) call poststage_out%clear()
 !>--- decide wether to skip this call
   if (trackrestart(env)) then
     call restart_write_dummy('crest_dynamics.trj')
@@ -929,34 +1493,77 @@ subroutine crest_search_multimd2(env,mols,mddats,nsim)
     end if
   end do
   all_gfnff = all_gfnff.and.has_active_calc
-  gfnff_thread_cap = all_gfnff.and.nsim > 0.and.env%Threads > nsim
-  if (gfnff_thread_cap) env%Threads = nsim
   call new_ompautoset(env,'auto_nested',nsim,T,Tn)
   nested = env%omp_allow_nested
   if (all_gfnff) then
-    Tn = 1
+    if (.not.nested) Tn = 1
     write (stdout,'(1x,a,i0,a,i0)') &
-    & 'GFN-FF MTD scheduling: parallel trajectories=',T,', cores per trajectory=',1
+    & 'GFN-FF MTD scheduling: parallel trajectories=',T,', cores per trajectory=',Tn
   end if
 
-  allocate (calculations(T),source=env%calc)
-  allocate (moltmps(T),source=mols(1))
-  do i = 1,T
-    do j = 1,env%calc%ncalculations
-      calculations(i)%calcs(j) = env%calc%calcs(j)
-      !>--- directories and io preparation
-      ex = directory_exist(env%calc%calcs(j)%calcspace)
-      if (.not.ex) then
-        io = makedir(trim(env%calc%calcs(j)%calcspace))
+  !> The process scheduler is the fail-closed default for every multi-MTD
+  !> batch in this routine.  All molecule/MTD preparation
+  !> has already happened in the parent, and collection below remains unchanged.
+  call resolve_mtd_process_isolation(process_isolated,process_status,process_message)
+  if (process_status /= status_normal) then
+    write(stdout,'(1x,a)') 'Process-isolated MTD option failed closed: '//trim(process_message)
+    env%iostatus_meta = process_status
+    if (use_tmd_threads.or.all_gfnff) then
+      env%Threads = thread_save
+      call new_ompautoset(env,'max',0,Trestore,Tnrestore)
+    end if
+    return
+  end if
+  if (process_isolated .and. nsim > 1) then
+    if (present(poststage_out)) then
+      call run_mtd_process_batch(env,mols,mddats,nsim,T,Tn,process_status, &
+      & process_message,poststage_out)
+    else
+      call run_mtd_process_batch(env,mols,mddats,nsim,T,Tn,process_status,process_message)
+    end if
+    if (process_status /= status_normal) then
+      write(stdout,'(1x,a)') 'Process-isolated MTD failed closed: '//trim(process_message)
+      env%iostatus_meta = process_status
+      if (use_tmd_threads.or.all_gfnff) then
+        env%Threads = thread_save
+        call new_ompautoset(env,'max',0,Trestore,Tnrestore)
       end if
-      write (atmp,'(a,"_",i0)') sep,i
-      calculations(i)%calcs(j)%calcspace = env%calc%calcs(j)%calcspace//trim(atmp)
-      if(allocated(calculations(i)%calcs(j)%calcfile)) deallocate(calculations(i)%calcs(j)%calcfile)
-      if(allocated(calculations(i)%calcs(j)%systemcall)) deallocate(calculations(i)%calcs(j)%systemcall)
-      call calculations(i)%calcs(j)%printid(i,j)
+      return
+    end if
+    goto 800
+  end if
+  !> Native/threaded MTD retains the historical file handoff.  The optional
+  !> carrier was cleared on entry, so its caller will deterministically fall
+  !> back to crest_dynamics.trj after this branch completes.
+
+  if (all_gfnff) then
+    !> Leave each derived-type element unallocated until its bound outer worker
+    !> deep-copies it below.  This first-touches private topology/workspace pages
+    !> in the same NUMA locality that will run the trajectory.
+    allocate (calculations(T))
+    allocate (moltmps(T))
+    do j = 1,env%calc%ncalculations
+      ex = directory_exist(env%calc%calcs(j)%calcspace)
+      if (.not.ex) io = makedir(trim(env%calc%calcs(j)%calcspace))
     end do
-    calculations(i)%pr_energies = .false.
-  end do
+  else
+    !> Preserve the existing setup path for mixed/external calculators.
+    allocate (calculations(T),source=env%calc)
+    allocate (moltmps(T),source=mols(1))
+    do i = 1,T
+      do j = 1,env%calc%ncalculations
+        calculations(i)%calcs(j) = env%calc%calcs(j)
+        ex = directory_exist(env%calc%calcs(j)%calcspace)
+        if (.not.ex) io = makedir(trim(env%calc%calcs(j)%calcspace))
+        write (atmp,'(a,"_",i0)') sep,i
+        calculations(i)%calcs(j)%calcspace = env%calc%calcs(j)%calcspace//trim(atmp)
+        if (allocated(calculations(i)%calcs(j)%calcfile)) deallocate(calculations(i)%calcs(j)%calcfile)
+        if (allocated(calculations(i)%calcs(j)%systemcall)) deallocate(calculations(i)%calcs(j)%systemcall)
+        call calculations(i)%calcs(j)%printid(i,j)
+      end do
+      calculations(i)%pr_energies = .false.
+    end do
+  end if
 
 !>--- other settings
   pr = .false.
@@ -964,15 +1571,29 @@ subroutine crest_search_multimd2(env,mols,mddats,nsim)
 
 !>--- run the MDs
   !$omp parallel &
-  !$omp shared(env,calculations,mddats,mols,pr,percent,ich, moltmps,profiler, nested,Tn)
+  !$omp shared(env,calculations,mddats,mols,pr,percent,ich,moltmps,profiler,nested,Tn,all_gfnff) &
+  !$omp private(i,j,vz,job,thread_id,io,ex,atmp)
+  thread_id = omp_get_thread_num()
+  job = thread_id+1
+  if (all_gfnff) then
+    calculations(job) = env%calc
+    moltmps(job) = mols(1)
+    do j = 1,env%calc%ncalculations
+      write (atmp,'(a,"_",i0)') sep,job
+      calculations(job)%calcs(j)%calcspace = env%calc%calcs(j)%calcspace//trim(atmp)
+      if (allocated(calculations(job)%calcs(j)%calcfile)) deallocate(calculations(job)%calcs(j)%calcfile)
+      if (allocated(calculations(job)%calcs(j)%systemcall)) deallocate(calculations(job)%calcs(j)%systemcall)
+      call calculations(job)%calcs(j)%printid(job,j)
+    end do
+    calculations(job)%pr_energies = .false.
+  end if
+  if (nested) call ompmklset(Tn)
+  !$omp barrier
   !$omp single
   do i = 1,nsim
 
     call initsignal()
     vz = i
-
-    !>--- OpenMP nested region threads
-    if (nested) call ompmklset(Tn)
 
     !$omp task firstprivate( vz ) private( job,thread_id,io,ex )
     call initsignal()
@@ -989,6 +1610,11 @@ subroutine crest_search_multimd2(env,mols,mddats,nsim)
 
     !>--- the acutal MD call with timing
     call profiler%start(vz)
+    !> Each worker calculator persists across independent multi-input MTD
+    !> trajectories. Rebuild only its geometry-dependent GFN-FF HB/XB list at
+    !> this boundary; retain topology, exact EEQ/frozen-host caches, D3, and all
+    !> workspaces.
+    call request_gfnff_hbond_update(calculations(job))
     call dynamics(moltmps(job),mddats(vz),calculations(job),pr,io)
     mddats(vz)%termination_status = io
     call profiler%stop(vz)
@@ -1001,45 +1627,54 @@ subroutine crest_search_multimd2(env,mols,mddats,nsim)
   !$omp end single
   !$omp end parallel
 
-!>--- collect trajectories into one
-  call collect(nsim,mddats)
+!>--- collect trajectories into one exact byte stream.  Construct the source
+!> list explicitly in numeric mddats order; the shared collector uses one
+!> writer and does not parallelize or reformat scientific trajectory data.
+800 continue
+  collector_status = 0
+  collector_message = ''
+  collector_seconds = 0.0_wp
+  collector_bytes = 0_int64
+  path_length = 1
+  do i = 1,nsim
+    if (.not.allocated(mddats(i)%trajectoryfile)) then
+      collector_status = 1
+      write (collector_message,'(a,i0)') &
+      & 'trajectory path is not allocated at numeric index ',i
+      exit
+    end if
+    path_length = max(path_length,len(mddats(i)%trajectoryfile))
+  end do
+  if (collector_status == 0) then
+    allocate (character(len=path_length) :: trajectory_paths(nsim), &
+    &         stat=collector_status,errmsg=collector_message)
+  end if
+  if (collector_status == 0) then
+    do i = 1,nsim
+      trajectory_paths(i) = mddats(i)%trajectoryfile
+    end do
+    call collect_stream_files_exact(trajectory_paths,'crest_dynamics.trj', &
+    & collector_bytes,collector_seconds,collector_status,collector_message)
+  end if
+  write (stdout,'(1x,a,f12.3,a)') &
+  & 'Trajectory collector wall time: ',collector_seconds,' sec'
+  write (stdout,'(1x,a,i0)') 'Trajectory collector bytes: ',collector_bytes
+  if (collector_status /= 0) then
+    write (stdout,'(1x,a,i0,2a)') 'Trajectory collector failed; iostat=', &
+    & collector_status,': ',trim(collector_message)
+    env%iostatus_meta = status_failed
+    if (present(poststage_out)) call poststage_out%clear()
+  end if
+  if (allocated(trajectory_paths)) deallocate (trajectory_paths)
 
   call profiler%clear()
-  deallocate (calculations)
+  if (allocated(calculations)) deallocate (calculations)
   if (allocated(moltmps)) deallocate (moltmps)
-  if (use_tmd_threads.or.gfnff_thread_cap) then
+  if (use_tmd_threads.or.all_gfnff) then
     env%Threads = thread_save
     call new_ompautoset(env,'max',0,Trestore,Tnrestore)
   end if
   return
-contains
-  subroutine collect(n,mddats)
-    implicit none
-    integer :: n
-    type(mddata) :: mddats(n)
-    logical :: ex
-    integer :: i,io,ich,ich2
-    character(len=:),allocatable :: atmp
-    character(len=256) :: btmp
-    open (newunit=ich,file='crest_dynamics.trj')
-    do i = 1,n
-      atmp = mddats(i)%trajectoryfile
-      inquire (file=atmp,exist=ex)
-      if (ex) then
-        open (newunit=ich2,file=atmp)
-        io = 0
-        do while (io == 0)
-          read (ich2,'(a)',iostat=io) btmp
-          if (io == 0) then
-            write (ich,'(a)') trim(btmp)
-          end if
-        end do
-        close (ich2)
-      end if
-    end do
-    close (ich)
-    return
-  end subroutine collect
 end subroutine crest_search_multimd2
 
 !========================================================================================!

@@ -188,18 +188,20 @@ contains !> MODULE PROCEDURES START HERE
           flen = max(flen,len_trim(kv%value_ca(i)))
         end do
         if (allocated(job%gff_fragments)) deallocate(job%gff_fragments)
-        allocate(character(len=flen) :: job%gff_fragments(nfrag))
+        allocate(job%gff_fragments(nfrag))
         do i = 1,nfrag
-          job%gff_fragments(i) = trim(kv%value_ca(i))
+          allocate(character(len=flen) :: job%gff_fragments(i)%value)
+          job%gff_fragments(i)%value(:) = trim(kv%value_ca(i))
         end do
       case (valuetypes%raw_array)
         do i = 1,nfrag
           flen = max(flen,len_trim(kv%value_rawa(i)))
         end do
         if (allocated(job%gff_fragments)) deallocate(job%gff_fragments)
-        allocate(character(len=flen) :: job%gff_fragments(nfrag))
+        allocate(job%gff_fragments(nfrag))
         do i = 1,nfrag
-          job%gff_fragments(i) = trim(kv%value_rawa(i))
+          allocate(character(len=flen) :: job%gff_fragments(i)%value)
+          job%gff_fragments(i)%value(:) = trim(kv%value_rawa(i))
         end do
       case default
         error stop '**ERROR** fragments must be a TOML string array'

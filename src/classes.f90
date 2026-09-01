@@ -442,6 +442,7 @@ module crest_data
     real(wp) :: potscal = 1.0_wp
     real(wp) :: potpad  = 0.0_wp
     character(len=:),allocatable :: potatlist
+    integer :: nci_next_iteration_trajectories = 6 !> standard NCI MTD count after iteration 1 (4 or 6)
 
     !>--- Nanoreactor data
     real(wp) :: rdens     !reactor density

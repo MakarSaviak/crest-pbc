@@ -34,7 +34,11 @@ subroutine crest_search_imtdgc(env,tim)
   use iomod
   use utilities
   use cregen_interface
-  use nci_input_ensemble,only:load_nci_input_ensemble,write_nci_input_starts,write_nci_mtd_jobs
+  use crest_multilevel_interface,only:crest_multilevel_oloop
+  use parallel_interface,only:crest_search_multimd2
+  use crest_poststage_ensemble,only:poststage_ensemble
+  use nci_input_ensemble,only:load_nci_input_ensemble,replace_and_validate_nci_wall, &
+  & write_nci_input_starts,write_nci_mtd_jobs
   use external_rerank_restart,only:external_rerank_state,external_rerank_checkpoint_exists, &
   & read_external_rerank_checkpoint,restore_external_rerank_state, &
   & write_external_rerank_checkpoint,validate_external_rerank_seed, &
@@ -68,6 +72,7 @@ subroutine crest_search_imtdgc(env,tim)
   logical :: multilevel(6)
   logical :: start,lower
   type(external_rerank_state) :: erstate
+  type(poststage_ensemble) :: mtd_poststage
   logical :: special_external_restart
 !===========================================================!
 !>--- printout header
@@ -94,6 +99,8 @@ subroutine crest_search_imtdgc(env,tim)
   ninputs=1
   if (env%NCI) then
     call load_nci_input_ensemble(env,mol,nci_input_mols,ninputs)
+    if (.not.allocated(nci_input_mols)) allocate(nci_input_mols(1),source=mol)
+    call replace_and_validate_nci_wall(env,nci_input_mols)
     if (ninputs>1) call write_nci_input_starts(nci_input_mols)
   end if
 
@@ -148,6 +155,8 @@ subroutine crest_search_imtdgc(env,tim)
 !>--- Meta-dynamics loop
   mtdloop: do i = 1,env%Maxrestart
 
+    call mtd_poststage%clear()
+
     if(special_external_restart.and.i<=erstate%completed_mtd) cycle mtdloop
 
     write(stdout,*)
@@ -185,7 +194,8 @@ subroutine crest_search_imtdgc(env,tim)
       write(stdout,'(1x,a,i0,a,i0,a,i0,a)') 'NCI first MTD batch: ',ninputs, &
         ' inputs x ',nbias,' biases = ',nsim,' trajectories'
       call tim%start(2,'Metadynamics (MTD)')
-      call crest_search_multimd2(env,mtd_mols,mddats,nsim)
+      call crest_search_multimd2(env,mtd_mols,mddats,nsim, &
+      & poststage_out=mtd_poststage)
       call tim%stop(2)
       call write_nci_mtd_jobs(mddats)
       deallocate(mtd_mols,bias_indices,input_indices)
@@ -198,6 +208,10 @@ subroutine crest_search_imtdgc(env,tim)
       call crest_search_multimd(env,mol,mddats,nsim)
       call tim%stop(2)
     end if
+    if (env%iostatus_meta /= 0) then
+      if (allocated(mddats)) deallocate(mddats)
+      return
+    end if
 !>--- a file called crest_dynamics.trj should have been written
     ensnam = 'crest_dynamics.trj'
 !>--- deallocate for next iteration
@@ -207,7 +221,11 @@ subroutine crest_search_imtdgc(env,tim)
 !>--- Reoptimization of trajectories
     call tim%start(3,'Geometry optimization')
     call optlev_to_multilev(env%optlev,multilevel)
-    call crest_multilevel_oloop(env,ensnam,multilevel)
+    if (mtd_poststage%valid()) then
+      call crest_multilevel_oloop(env,ensnam,multilevel,input_buffer=mtd_poststage)
+    else
+      call crest_multilevel_oloop(env,ensnam,multilevel)
+    end if
     call tim%stop(3)
     if(env%iostatus_meta .ne. 0 ) return
 
@@ -225,10 +243,26 @@ subroutine crest_search_imtdgc(env,tim)
       start = .false.
 !>-- obtain a first lowest energy as reference
       env%eprivious = env%elowest
-!>-- remove the two extreme-value MTDs
+!>-- select the MTD bias count for the next iteration
       if (.not. env%readbias .and.  env%runver .ne. 33 .and. &
       &   env%runver .ne. 787878 ) then
-        env%nmetadyn = env%nmetadyn - 2
+        if (env%NCI) then
+          if (env%nmetadyn /= 6) then
+            error stop '**ERROR** standard NCI first iteration did not contain 6 MTD biases'
+          end if
+          select case (env%nci_next_iteration_trajectories)
+          case (4)
+            env%nmetadyn = 4
+            write(stdout,'(1x,a)') 'NCI next-iteration trajectories: 4 (reduced from 6).'
+          case (6)
+            write(stdout,'(1x,a)') 'NCI next-iteration trajectories: 6 (full standard bias set).'
+          case default
+            error stop '**ERROR** nci_next_iteration_trajectories must be 4 or 6'
+          end select
+        else
+          !> Legacy behavior for non-NCI conformer searches.
+          env%nmetadyn = env%nmetadyn - 2
+        end if
       end if
 !>-- the cleanup 
       call clean_V2i
@@ -358,6 +392,7 @@ subroutine crest_multilevel_wrap(env,ensnam,level)
   use crest_data
   use crest_calculator
   use strucrd
+  use crest_multilevel_interface,only:crest_multilevel_oloop
   implicit none
   type(systemdata) :: env
   character(len=*),intent(in) :: ensnam
@@ -379,7 +414,7 @@ subroutine crest_multilevel_wrap(env,ensnam,level)
 end subroutine crest_multilevel_wrap
 
 !========================================================================================!
-subroutine crest_multilevel_oloop(env,ensnam,multilevel_in)
+subroutine crest_multilevel_oloop(env,ensnam,multilevel_in,input_buffer)
 !*******************************************************
 !* multilevel optimization loop.
 !* construct consecutive optimizations starting with
@@ -393,10 +428,14 @@ subroutine crest_multilevel_oloop(env,ensnam,multilevel_in)
   use utilities
   use crest_restartlog
   use parallel_interface
+  use crest_poststage_ensemble,only:poststage_ensemble
+  use crest_poststage_sort,only:sort_and_check_poststage
+  use omp_lib,only:omp_get_wtime
   implicit none
-  type(systemdata) :: env 
+  type(systemdata),intent(inout) :: env 
   character(len=*),intent(in) :: ensnam
   logical,intent(in) :: multilevel_in(6)
+  type(poststage_ensemble),intent(inout),optional :: input_buffer
   integer :: nat,nall
   real(wp),allocatable :: eread(:)
   real(wp),allocatable :: xyz(:,:,:)
@@ -409,6 +448,10 @@ subroutine crest_multilevel_oloop(env,ensnam,multilevel_in)
   integer :: microbackup
   integer :: optlevelbackup
   logical :: multilevel(6)
+  type(constraint),allocatable :: auto_nci_walls(:)
+  type(poststage_ensemble) :: optimized_poststage,sorted_poststage
+  real(wp) :: poststage_clock
+  logical :: poststage_written,empty_refine_eligible
 
   interface 
     subroutine crest_refine(env,input,output)
@@ -420,12 +463,30 @@ subroutine crest_multilevel_oloop(env,ensnam,multilevel_in)
     end subroutine crest_refine
   end interface
 
-!>--- save backup thresholds
+!>--- save backup thresholds before any path can branch to the common cleanup
   ewinbackup     = env%ewin
   rthrbackup     = env%rthr
   optlevelbackup = env%calc%optlev
   hlowbackup     = env%calc%hlow_opt
   microbackup    = env%calc%micro_opt
+
+!>--- NCI container walls are an MTD-only potential.  Remove only walls
+!>    generated by the NCI setup and restore them at the single exit below.
+  call env%calc%detach_auto_nci_walls(auto_nci_walls)
+  if (env%NCI.and..not.env%legacy) then
+    if (size(auto_nci_walls) /= 1) then
+      write(stdout,'(1x,a,i0)') &
+      & '**ERROR** expected one automatic NCI wall before optimization; found ', &
+      & size(auto_nci_walls)
+      env%iostatus_meta = status_failed
+      goto 900
+    end if
+  end if
+  if (size(auto_nci_walls) > 0) then
+    write(stdout,'(1x,a,i0,a,i0)') 'Optimization NCI walls removed: ', &
+    & size(auto_nci_walls),'; remaining calculator constraints: ', &
+    & env%calc%nconstraints
+  end if
 
 !>--- set multilevels, or enforce just one
   multilevel(:) = .false.
@@ -446,17 +507,38 @@ subroutine crest_multilevel_oloop(env,ensnam,multilevel_in)
   write(stdout,'(1x,a)') '======================================'
   endif
   
-!>--- read ensemble
-  call rdensembleparam(ensnam,nat,nall)
-  if (nall .lt. 1) then
-    write(stdout,*) '**ERROR** empty ensemble file ',trim(ensnam)
-    env%iostatus_meta = status_failed
-    return
-  endif
-  allocate (xyz(3,nat,nall),at(nat),eread(nall))
-  call rdensemble(ensnam,nat,nall,at,xyz,eread)
+!>--- read ensemble or consume the exact concurrently parsed worker buffer
+  poststage_clock = omp_get_wtime()
+  if (present(input_buffer)) then
+    if (.not.input_buffer%valid()) then
+      write(stdout,*) '**ERROR** invalid in-memory poststage ensemble for ',trim(ensnam)
+      env%iostatus_meta = status_failed
+      goto 900
+    end if
+    nat = input_buffer%nat
+    nall = input_buffer%nall
+    call move_alloc(input_buffer%at,at)
+    call move_alloc(input_buffer%xyz,xyz)
+    call move_alloc(input_buffer%eread,eread)
+    call input_buffer%clear()
+    write(stdout,'(1x,a,i0,a)') 'Poststage in-memory input accepted: ',nall,' structures'
+  else
+    call rdensembleparam(ensnam,nat,nall)
+    if (nall .lt. 1) then
+      write(stdout,*) '**ERROR** empty ensemble file ',trim(ensnam)
+      env%iostatus_meta = status_failed
+      goto 900
+    endif
+    allocate (xyz(3,nat,nall),at(nat),eread(nall))
+    call rdensemble(ensnam,nat,nall,at,xyz,eread)
+  end if
+  write(stdout,'(1x,a,f12.3,a)') 'Poststage initial ensemble ingest wall time: ', &
+  & omp_get_wtime()-poststage_clock,' sec'
 !>--- track ensemble for restart
+  poststage_clock = omp_get_wtime()
   call trackensemble(ensnam,nat,nall,at,xyz,eread)
+  write(stdout,'(1x,a,f12.3,a)') 'Poststage initial restart snapshot wall time: ', &
+  & omp_get_wtime()-poststage_clock,' sec'
 !>>>>>>>>>>>>>>>>>>>>>>>>>>>><<<<<<<<<<<<<<<<<<<<<<<<<<<<<!
 !>--- Important: crest_oloop requires coordinates in Bohrs
   xyz = xyz / bohr
@@ -474,38 +556,105 @@ subroutine crest_multilevel_oloop(env,ensnam,multilevel_in)
      !>--- set optimization parameters
        call set_multilevel_options(env,i,.true.)
      !>--- run parallel optimizations
-       call crest_oloop(env,nat,nall,at,xyz,eread,dump)
+       call optimized_poststage%clear()
+       poststage_written = .false.
+       empty_refine_eligible = .not.env%refine_presort.and. &
+       & .not.allocated(env%refine_queue)
+       if (empty_refine_eligible) then
+         call crest_oloop(env,nat,nall,at,xyz,eread,dump, &
+         & poststage_buffer=optimized_poststage, &
+         & poststage_written=poststage_written)
+       else
+         call crest_oloop(env,nat,nall,at,xyz,eread,dump)
+       end if
+       if (env%iostatus_meta /= status_normal) then
+         deallocate(eread,at,xyz)
+         env%ewin           = ewinbackup
+         env%rthr           = rthrbackup
+         env%calc%optlev    = optlevelbackup
+         env%calc%hlow_opt  = hlowbackup
+         env%calc%micro_opt = microbackup
+         goto 900
+       end if
        deallocate(eread,at,xyz)
      !>--- rename ensemble and sort
        call checkname_xyz(crefile,inpnam,outnam)
        call rename(ensemblefile,trim(inpnam))
      !>--- check for empty ensemble content
-       call rdensembleparam(trim(inpnam),nat,nall)
+       if (poststage_written) then
+         if (.not.optimized_poststage%valid()) then
+           write(stdout,*) '**ERROR** invalid canonical optimizer poststage buffer'
+           env%iostatus_meta = status_failed
+           goto 900
+         end if
+         nat = optimized_poststage%nat
+         nall = optimized_poststage%nall
+       else
+         poststage_written = .false.
+         call optimized_poststage%clear()
+         call rdensembleparam(trim(inpnam),nat,nall)
+       end if
        if (nall .lt. 1) then
          write(stdout,*) '**ERROR** empty ensemble file',trim(inpnam)
          env%iostatus_meta = status_failed
-         return
+         goto 900
        endif
 
        write(stdout,*)
      !==========================================================!
      !>-- dedicated ensemble refinement step (overwrites inpnam)
-      call  crest_refine(env,trim(inpnam))
+      poststage_clock = omp_get_wtime()
+      if (.not.poststage_written) call crest_refine(env,trim(inpnam))
+      write(stdout,'(1x,a,f12.3,a)') 'Poststage refinement wall time: ', &
+      & omp_get_wtime()-poststage_clock,' sec'
+      if (env%iostatus_meta /= status_normal) then
+        env%ewin           = ewinbackup
+        env%rthr           = rthrbackup
+        env%calc%optlev    = optlevelbackup
+        env%calc%hlow_opt  = hlowbackup
+        env%calc%micro_opt = microbackup
+        goto 900
+      end if
      !==========================================================!
 
-     !>--- CREGEN sorting
-       call sort_and_check(env,trim(inpnam))
+     !>--- CREGEN sorting.  The empty-refinement fast path consumes the exact
+     !>    canonical optimizer representation directly and returns the exact
+     !>    canonical CREGEN writer representation.  All other modes retain the
+     !>    legacy file-based path.
+       if (poststage_written) then
+         call sorted_poststage%clear()
+         call sort_and_check_poststage(env,trim(inpnam),optimized_poststage, &
+         & sorted_poststage)
+       else
+         call sort_and_check(env,trim(inpnam))
+       end if
+       call optimized_poststage%clear()
+       if (env%iostatus_meta /= status_normal) goto 900
        call checkname_xyz(crefile,inpnam,outnam)
-     !>--- check for empty ensemble content (again)
-       call rdensembleparam(trim(inpnam),nat,nall)
-       if (nall .lt. 1) then
-         write(stdout,*) '**ERROR** empty ensemble file',trim(inpnam)
-         env%iostatus_meta = status_failed
-         return
-       endif
-     !>--- read new ensemble for next iteration
-       allocate (xyz(3,nat,nall),at(nat),eread(nall))
-       call rdensemble(trim(inpnam),nat,nall,at,xyz,eread)
+       if (poststage_written) then
+         if (.not.sorted_poststage%valid()) then
+           write(stdout,*) '**ERROR** invalid canonical CREGEN poststage buffer'
+           env%iostatus_meta = status_failed
+           goto 900
+         end if
+         nat = sorted_poststage%nat
+         nall = sorted_poststage%nall
+         call move_alloc(sorted_poststage%at,at)
+         call move_alloc(sorted_poststage%xyz,xyz)
+         call move_alloc(sorted_poststage%eread,eread)
+         call sorted_poststage%clear()
+       else
+       !>--- check for empty ensemble content (again)
+         call rdensembleparam(trim(inpnam),nat,nall)
+         if (nall .lt. 1) then
+           write(stdout,*) '**ERROR** empty ensemble file',trim(inpnam)
+           env%iostatus_meta = status_failed
+           goto 900
+         endif
+       !>--- read new ensemble for next iteration
+         allocate (xyz(3,nat,nall),at(nat),eread(nall))
+         call rdensemble(trim(inpnam),nat,nall,at,xyz,eread)
+       end if
      !>>>>>>>>>>>>>>>>>>>>>>>>>>>><<<<<<<<<<<<<<<<<<<<<<<<<<<<<!
      !>--- Important: crest_oloop requires coordinates in Bohrs
        xyz = xyz / bohr
@@ -519,9 +668,26 @@ subroutine crest_multilevel_oloop(env,ensnam,multilevel_in)
     endif
   enddo
 
+900 continue
+  call optimized_poststage%clear()
+  call sorted_poststage%clear()
   if(allocated(eread)) deallocate(eread)
   if(allocated(at))  deallocate(at)
   if(allocated(xyz)) deallocate(xyz)
+  env%ewin           = ewinbackup
+  env%rthr           = rthrbackup
+  env%calc%optlev    = optlevelbackup
+  env%calc%hlow_opt  = hlowbackup
+  env%calc%micro_opt = microbackup
+  if (allocated(auto_nci_walls)) then
+    call env%calc%attach_auto_nci_walls(auto_nci_walls)
+    if (size(auto_nci_walls) > 0) then
+      write(stdout,'(1x,a,i0,a,i0)') 'Optimization NCI walls restored: ', &
+      & size(auto_nci_walls),'; total calculator constraints: ', &
+      & env%calc%nconstraints
+    end if
+    deallocate(auto_nci_walls)
+  end if
   return
 contains
   subroutine set_multilevel_options(env,i,pr)
@@ -582,6 +748,7 @@ subroutine crest_rotamermds(env,ensnam)
   use strucrd
   use dynamics_module
   use shake_module
+  use parallel_interface,only:crest_search_multimd2
   implicit none
   type(systemdata),intent(inout) :: env
   character(len=*),intent(in) :: ensnam
@@ -671,6 +838,7 @@ subroutine crest_newcross3(env)
   use crest_data
   use iomod
   use utilities
+  use crest_multilevel_interface,only:crest_multilevel_oloop
   implicit none
   type(systemdata) :: env  
   real(wp) :: ewinbackup
@@ -724,5 +892,3 @@ subroutine crest_newcross3(env)
     enddo
   end do
 end subroutine crest_newcross3
-
-

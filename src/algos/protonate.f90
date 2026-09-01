@@ -214,6 +214,10 @@ subroutine crest_new_protonate(env,tim)
     call print_opt_data(tmpcalc_ff,stdout)
     write (stdout,'(a,i0,a)') '> ',npnew,' structures to optimize ...'
     call crest_oloop(env,natp,npnew,atp,xyzp(:,:,1:npnew),ep(1:npnew),.false.,tmpcalc_ff)
+    if (env%iostatus_meta /= status_normal) then
+      call tim%stop(15)
+      return
+    end if
     call tim%stop(15)
 
     deallocate (tmpcalc_ff)
@@ -265,6 +269,10 @@ subroutine crest_new_protonate(env,tim)
     call tim%start(16,'Ensemble optimization (frozen)')
     write (stdout,'(a,i0,a)') '> ',npnew,' structures to optimize ...'
     call crest_oloop(env,natp,npnew,atp,xyzp(:,:,1:npnew),ep(1:npnew),.false.,tmpcalc)
+    if (env%iostatus_meta /= status_normal) then
+      call tim%stop(16)
+      return
+    end if
     call tim%stop(16)
 
     pstep = pstep+1
@@ -304,6 +312,10 @@ subroutine crest_new_protonate(env,tim)
     call print_opt_data(env%calc,stdout)
     write (stdout,'(a,i0,a)') '> ',npnew,' structures to optimize ...'
     call crest_oloop(env,natp,npnew,atp,xyzp(:,:,1:npnew),ep,.false.,tmpcalc)
+    if (env%iostatus_meta /= status_normal) then
+      call tim%stop(20)
+      return
+    end if
     call tim%stop(20)
 
     pstep = pstep+1
@@ -314,6 +326,10 @@ subroutine crest_new_protonate(env,tim)
 
     call tim%start(17,'Ensemble refinement')
     call crest_refine(env,trim(atmp),trim(atmp))
+    if (env%iostatus_meta /= status_normal) then
+      call tim%stop(17)
+      return
+    end if
     call tim%stop(17)
 
 !>--- sorting
@@ -698,6 +714,10 @@ subroutine crest_new_deprotonate(env,tim)
     call print_opt_data(tmpcalc_ff,stdout)
     write (stdout,'(a,i0,a)') '> ',npnew,' structures to optimize ...'
     call crest_oloop(env,natp,npnew,atp,xyzp(:,:,1:npnew),ep(1:npnew),.false.,tmpcalc_ff)
+    if (env%iostatus_meta /= status_normal) then
+      call tim%stop(15)
+      return
+    end if
     call tim%stop(15)
 
     deallocate (tmpcalc_ff)
@@ -749,6 +769,10 @@ subroutine crest_new_deprotonate(env,tim)
     call tim%start(16,'Ensemble optimization (frozen)')
     write (stdout,'(a,i0,a)') '> ',npnew,' structures to optimize ...'
     call crest_oloop(env,natp,npnew,atp,xyzp(:,:,1:npnew),ep(1:npnew),.false.,tmpcalc)
+    if (env%iostatus_meta /= status_normal) then
+      call tim%stop(16)
+      return
+    end if
     call tim%stop(16)
 
     pstep = pstep+1
@@ -787,6 +811,10 @@ subroutine crest_new_deprotonate(env,tim)
     call print_opt_data(env%calc,stdout)
     write (stdout,'(a,i0,a)') '> ',npnew,' structures to optimize ...'
     call crest_oloop(env,natp,npnew,atp,xyzp(:,:,1:npnew),ep(1:npnew),.false.,tmpcalc)
+    if (env%iostatus_meta /= status_normal) then
+      call tim%stop(20)
+      return
+    end if
     call tim%stop(20)
 
     pstep = pstep+1
@@ -797,6 +825,10 @@ subroutine crest_new_deprotonate(env,tim)
 
     call tim%start(17,'Ensemble refinement')
     call crest_refine(env,trim(atmp),trim(atmp))
+    if (env%iostatus_meta /= status_normal) then
+      call tim%stop(17)
+      return
+    end if
     call tim%stop(17)
 
 !>--- sorting
@@ -1181,6 +1213,10 @@ subroutine crest_new_tautomerize(env,tim)
     call print_opt_data(tmpcalc_ff,stdout)
     write (stdout,'(a,i0,a)') '> ',npnew,' structures to optimize ...'
     call crest_oloop(env,natp,npnew,atp,xyzp(:,:,1:npnew),ep(1:npnew),.false.,tmpcalc_ff)
+    if (env%iostatus_meta /= status_normal) then
+      call tim%stop(15)
+      return
+    end if
     call tim%stop(15)
 
     deallocate (tmpcalc_ff)
@@ -1235,6 +1271,10 @@ subroutine crest_new_tautomerize(env,tim)
     call tim%start(16,'Ensemble optimization (frozen)')
     write (stdout,'(a,i0,a)') '> ',npnew,' structures to optimize ...'
     call crest_oloop(env,natp,npnew,atp,xyzp(:,:,1:npnew),ep(1:npnew),.false.,tmpcalc)
+    if (env%iostatus_meta /= status_normal) then
+      call tim%stop(16)
+      return
+    end if
     call tim%stop(16)
 
     pstep = pstep+1
@@ -1274,6 +1314,10 @@ subroutine crest_new_tautomerize(env,tim)
     call print_opt_data(env%calc,stdout)
     write (stdout,'(a,i0,a)') '> ',npnew,' structures to optimize ...'
     call crest_oloop(env,natp,npnew,atp,xyzp(:,:,1:npnew),ep,.false.,tmpcalc)
+    if (env%iostatus_meta /= status_normal) then
+      call tim%stop(20)
+      return
+    end if
     call tim%stop(20)
 
     pstep = pstep+1
@@ -1284,6 +1328,10 @@ subroutine crest_new_tautomerize(env,tim)
 
     call tim%start(17,'Ensemble refinement')
     call crest_refine(env,trim(atmp),trim(atmp))
+    if (env%iostatus_meta /= status_normal) then
+      call tim%stop(17)
+      return
+    end if
     call tim%stop(17)
 
 !>--- sorting
@@ -1396,4 +1444,3 @@ end subroutine tautomer_candidates
 !========================================================================================!
 !>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>><<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<!
 !========================================================================================!
-

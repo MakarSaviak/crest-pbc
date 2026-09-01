@@ -111,6 +111,7 @@ module iomod
   public :: checkprog
   public :: checkprog_silent
   public :: absolute_path,absolute_filepath
+  public :: collect_stream_files_exact
   private :: getpath
 
 !========================================================================================!
@@ -207,6 +208,249 @@ contains !> MODULE PROCEDURES START HERE
       close (ich)
     end if
   end subroutine copy
+
+!-------------------------------------------------------------------------
+! Concatenate files byte-for-byte through one bounded stream writer.
+!
+! The source array order is the output order.  Every source is preflighted
+! before the destination is replaced.  Any error is returned to the caller;
+! a partial destination is closed and removed.
+!-------------------------------------------------------------------------
+  subroutine collect_stream_files_exact(source_paths,destination,bytes_copied, &
+  &                                     wall_seconds,iostat,iomsg)
+    implicit none
+    character(len=*),intent(in) :: source_paths(:)
+    character(len=*),intent(in) :: destination
+    integer(int64),intent(out) :: bytes_copied
+    real(wp),intent(out) :: wall_seconds
+    integer,intent(out) :: iostat
+    character(len=*),intent(out) :: iomsg
+
+    integer,parameter :: buffer_capacity = 8*1024*1024
+    integer :: i,input_unit,output_unit,cleanup_unit,local_status,nchunk
+    integer(int64) :: clock_finish,clock_max,clock_rate,clock_start
+    integer(int64) :: expected_bytes,file_bytes,offset
+    integer(int64),allocatable :: source_sizes(:)
+    integer(int8),allocatable :: buffer(:)
+    logical :: exists,input_open,output_created,output_open
+    character(len=1024) :: local_message
+
+    bytes_copied = 0_int64
+    wall_seconds = 0.0_wp
+    iostat = 0
+    iomsg = ''
+    input_unit = -1
+    output_unit = -1
+    input_open = .false.
+    output_created = .false.
+    output_open = .false.
+    expected_bytes = 0_int64
+
+    if (size(source_paths) < 1) then
+      iostat = 1
+      iomsg = 'trajectory collector received no source paths'
+      return
+    end if
+    if (len_trim(destination) < 1) then
+      iostat = 1
+      iomsg = 'trajectory collector received an empty destination path'
+      return
+    end if
+
+    local_message = ''
+    allocate (source_sizes(size(source_paths)),stat=local_status,errmsg=local_message)
+    if (local_status /= 0) then
+      iostat = local_status
+      iomsg = 'trajectory-size allocation failed: '//trim(local_message)
+      return
+    end if
+
+    !> Preflight every source in caller-provided numeric order before opening
+    !> the destination with status='replace'.
+    do i = 1,size(source_paths)
+      if (len_trim(source_paths(i)) < 1) then
+        iostat = 1
+        write (iomsg,'(a,i0)') 'empty trajectory path at numeric index ',i
+        goto 900
+      end if
+      if (trim(source_paths(i)) == trim(destination)) then
+        iostat = 1
+        write (iomsg,'(a,i0)') &
+        & 'trajectory destination aliases source at numeric index ',i
+        goto 900
+      end if
+
+      local_message = ''
+      inquire (file=trim(source_paths(i)),exist=exists,size=file_bytes, &
+      &        iostat=local_status,iomsg=local_message)
+      if (local_status /= 0) then
+        iostat = local_status
+        iomsg = 'trajectory preflight failed for '//trim(source_paths(i))// &
+        &       ': '//trim(local_message)
+        goto 900
+      end if
+      if (.not.exists) then
+        iostat = 1
+        iomsg = 'missing trajectory: '//trim(source_paths(i))
+        goto 900
+      end if
+      if (file_bytes < 0_int64) then
+        iostat = 1
+        iomsg = 'negative trajectory size: '//trim(source_paths(i))
+        goto 900
+      end if
+      if (file_bytes > huge(expected_bytes)-expected_bytes) then
+        iostat = 1
+        iomsg = 'trajectory byte-count overflow at '//trim(source_paths(i))
+        goto 900
+      end if
+      source_sizes(i) = file_bytes
+      expected_bytes = expected_bytes+file_bytes
+    end do
+
+    local_message = ''
+    allocate (buffer(buffer_capacity),stat=local_status,errmsg=local_message)
+    if (local_status /= 0) then
+      iostat = local_status
+      iomsg = 'trajectory buffer allocation failed: '//trim(local_message)
+      goto 900
+    end if
+
+    call system_clock(clock_start,clock_rate,clock_max)
+    if (clock_rate <= 0_int64) then
+      iostat = 1
+      iomsg = 'SYSTEM_CLOCK has a nonpositive rate'
+      goto 900
+    end if
+
+    local_message = ''
+    open (newunit=output_unit,file=trim(destination),status='replace', &
+    &     action='write',access='stream',form='unformatted', &
+    &     iostat=local_status,iomsg=local_message)
+    if (local_status /= 0) then
+      iostat = local_status
+      iomsg = 'cannot open trajectory destination '//trim(destination)// &
+      &       ': '//trim(local_message)
+      goto 910
+    end if
+    output_open = .true.
+    output_created = .true.
+
+    do i = 1,size(source_paths)
+      !> Detect a source-size change after preflight rather than silently
+      !> copying a different byte range.
+      local_message = ''
+      inquire (file=trim(source_paths(i)),exist=exists,size=file_bytes, &
+      &        iostat=local_status,iomsg=local_message)
+      if (local_status /= 0) then
+        iostat = local_status
+        iomsg = 'trajectory recheck failed for '//trim(source_paths(i))// &
+        &       ': '//trim(local_message)
+        goto 910
+      end if
+      if (.not.exists.or.file_bytes /= source_sizes(i)) then
+        iostat = 1
+        iomsg = 'trajectory changed after preflight: '//trim(source_paths(i))
+        goto 910
+      end if
+
+      local_message = ''
+      open (newunit=input_unit,file=trim(source_paths(i)),status='old', &
+      &     action='read',access='stream',form='unformatted', &
+      &     iostat=local_status,iomsg=local_message)
+      if (local_status /= 0) then
+        iostat = local_status
+        iomsg = 'cannot open trajectory '//trim(source_paths(i))// &
+        &       ': '//trim(local_message)
+        goto 910
+      end if
+      input_open = .true.
+
+      offset = 1_int64
+      do while (offset <= source_sizes(i))
+        nchunk = int(min(int(buffer_capacity,int64), &
+        &            source_sizes(i)-offset+1_int64))
+        local_message = ''
+        read (input_unit,pos=offset,iostat=local_status,iomsg=local_message) &
+        & buffer(1:nchunk)
+        if (local_status /= 0) then
+          iostat = local_status
+          iomsg = 'stream read failed for '//trim(source_paths(i))// &
+          &       ': '//trim(local_message)
+          goto 910
+        end if
+        local_message = ''
+        write (output_unit,iostat=local_status,iomsg=local_message) &
+        & buffer(1:nchunk)
+        if (local_status /= 0) then
+          iostat = local_status
+          iomsg = 'stream write failed for '//trim(destination)// &
+          &       ': '//trim(local_message)
+          goto 910
+        end if
+        offset = offset+int(nchunk,int64)
+        bytes_copied = bytes_copied+int(nchunk,int64)
+      end do
+
+      local_message = ''
+      close (input_unit,iostat=local_status,iomsg=local_message)
+      if (local_status /= 0) then
+        iostat = local_status
+        iomsg = 'trajectory close failed for '//trim(source_paths(i))// &
+        &       ': '//trim(local_message)
+        goto 910
+      end if
+      input_open = .false.
+    end do
+
+    local_message = ''
+    close (output_unit,iostat=local_status,iomsg=local_message)
+    if (local_status /= 0) then
+      iostat = local_status
+      iomsg = 'trajectory destination close failed for '//trim(destination)// &
+      &       ': '//trim(local_message)
+      goto 910
+    end if
+    output_open = .false.
+
+    if (bytes_copied /= expected_bytes) then
+      iostat = 1
+      iomsg = 'trajectory collector byte-count mismatch'
+      goto 910
+    end if
+
+910 continue
+    if (input_open) then
+      close (input_unit,iostat=local_status)
+      input_open = .false.
+    end if
+    if (output_open) then
+      close (output_unit,iostat=local_status)
+      output_open = .false.
+    end if
+
+    call system_clock(clock_finish)
+    if (clock_finish >= clock_start) then
+      wall_seconds = real(clock_finish-clock_start,wp)/real(clock_rate,wp)
+    else if (clock_max > 0_int64) then
+      wall_seconds = real((clock_max-clock_start)+1_int64+clock_finish,wp)/ &
+      &              real(clock_rate,wp)
+    end if
+
+    if (iostat /= 0.and.output_created) then
+      inquire (file=trim(destination),exist=exists)
+      if (exists) then
+        open (newunit=cleanup_unit,file=trim(destination),status='old', &
+        &     action='readwrite',access='stream',form='unformatted', &
+        &     iostat=local_status,iomsg=local_message)
+        if (local_status == 0) close (cleanup_unit,status='delete',iostat=local_status)
+      end if
+    end if
+
+900 continue
+    if (allocated(buffer)) deallocate (buffer)
+    if (allocated(source_sizes)) deallocate (source_sizes)
+  end subroutine collect_stream_files_exact
 
 !-------------------------------------------------------------------------
 ! copy a file from path "from" to a specified sub-directory "to"
@@ -1188,4 +1432,3 @@ contains !> MODULE PROCEDURES START HERE
 !========================================================================================!
 !========================================================================================!
 end module iomod
-

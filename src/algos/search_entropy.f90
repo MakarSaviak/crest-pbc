@@ -32,6 +32,8 @@ subroutine crest_search_entropy(env,tim)
   use iomod
   use utilities
   use cregen_interface
+  use crest_multilevel_interface,only:crest_multilevel_oloop
+  use parallel_interface,only:crest_search_multimd2
   implicit none
   type(systemdata),intent(inout) :: env
   type(timer),intent(inout)      :: tim
@@ -293,6 +295,7 @@ subroutine crest_smtd_mds(env,ensnam)
   use iomod
   use utilities
   use dynamics_module
+  use parallel_interface,only:crest_search_multimd2
   implicit none
   type(systemdata),intent(inout) :: env
   character(len=*),intent(in) :: ensnam
@@ -374,7 +377,7 @@ subroutine crest_smtd_mds(env,ensnam)
 
 !===================================================================!
 !>--- and finally, run the sMTDs on the different starting structures
-  call crest_search_multimd2(env,mols,mddats,nsim)
+  call crest_search_multimd2(env,mols(1:nsim),mddats,nsim)
 !>--- output will be collected in crest_dynamics.trj
 !>--- but the entropy routines look for the crest_rotamers_ files
   call checkname_xyz(crefile,atmp,btmp)
@@ -493,4 +496,3 @@ subroutine crest_init_multimd_smtd(env,mddats,nsim,biasfile)
   deallocate (eread,at,xyz)
   return
 end subroutine crest_init_multimd_smtd
-

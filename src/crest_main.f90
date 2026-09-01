@@ -25,21 +25,27 @@ program CREST
   use crest_parameters !> Datatypes and constants
   use crest_data !> module for the main data storage (imports systemdata and timer)
   use crest_restartlog 
+  use mtd_process_scheduler,only:mtd_process_worker_dispatch
     USE, INTRINSIC :: IEEE_EXCEPTIONS
   implicit none
   type(systemdata) :: env  !> MAIN STORAGE OF SYSTEM DATA
   type(timer)   :: tim     !> timer object
 
-  integer :: i,j,l,args,io
+  integer :: i,j,l,args,io,worker_status
   character(len=:),allocatable :: arg(:)
   character(len=:),allocatable :: infile
   character(len=512) :: thisdir
   character(len=1024) :: cmd
   real(wp) :: dumfloat,dumfloat2,d3,d4,d5,d6,d7,d8
-  logical :: ex,ex1,ex2
+  logical :: ex,ex1,ex2,worker_handled
 
   intrinsic :: iargc,getarg
     LOGICAL :: overflow, division_by_zero, invalid_operation
+
+  ! Internal process-MTD workers bypass normal flag parsing and never reread the
+  ! original coordinate/TOML inputs.  All state comes from the parent's capsule.
+  call mtd_process_worker_dispatch(worker_handled,worker_status)
+  if (worker_handled) call creststop(worker_status)
 
   call initsignal() !SIGTERM catcher
 

@@ -22,6 +22,7 @@
 !====================================================!
 
 module constraints
+  use, intrinsic :: ieee_arithmetic,only:ieee_is_finite
   use crest_parameters
   use strucrd
   use wall_setup
@@ -63,6 +64,8 @@ module constraints
   type :: constraint
     !> quick select
     logical :: active = .true.
+    !> provenance for the automatically generated NCI container wall
+    logical :: auto_nci_wall = .false.
 
     !> required
     integer :: type = 0  !> type of the constraint
@@ -73,7 +76,7 @@ module constraints
 
     !> special directives
     logical :: frozenatms = .false.
-    logical,pointer :: freezeptr(:)
+    logical,pointer :: freezeptr(:) => null()
 
     !> other
     real(wp) :: wscal = 1.0_wp
@@ -97,6 +100,7 @@ module constraints
     procedure :: bondrangeconstraint => create_bondrange_constraint
     procedure :: addfreeze => constraint_freezeassoc
     procedure :: complete => complete_defaults
+    procedure :: is_exact_auto_nci_wall => constraint_is_exact_auto_nci_wall
   end type constraint
 
   !=====================================================!
@@ -125,6 +129,39 @@ module constraints
 !========================================================================================!
 contains  !>--- Module routines start here
 !========================================================================================!
+!========================================================================================!
+
+  logical function constraint_is_exact_auto_nci_wall(self,nat) result(exact)
+    class(constraint),intent(in) :: self
+    integer,intent(in) :: nat
+    integer :: i
+
+    exact=.false.
+    if (nat<1) return
+    if (.not.self%active) return
+    if (.not.self%auto_nci_wall) return
+    if (self%type/=wall_fermi) return
+    if (self%subtype/=pharmonic) return
+    if (self%n/=nat) return
+    if (.not.ieee_is_finite(self%wscal)) return
+    if (self%wscal/=1.0_wp) return
+    if (.not.allocated(self%atms)) return
+    if (size(self%atms)/=nat) return
+    do i=1,nat
+      if (self%atms(i)/=i) return
+    end do
+    if (.not.allocated(self%ref)) return
+    if (size(self%ref)/=3) return
+    if (.not.all(ieee_is_finite(self%ref))) return
+    if (any(self%ref<=0.0_wp)) return
+    if (.not.allocated(self%fc)) return
+    if (size(self%fc)/=2) return
+    if (.not.all(ieee_is_finite(self%fc))) return
+    if (self%fc(1)/=Tdefault) return
+    if (self%fc(2)/=betadefault) return
+    exact=.true.
+  end function constraint_is_exact_auto_nci_wall
+
 !========================================================================================!
 
   subroutine complete_defaults(self,mol)
@@ -465,6 +502,8 @@ contains  !>--- Module routines start here
     self%subtype = pharmonic
     self%n = 0
     self%frozenatms = .false.
+    self%auto_nci_wall = .false.
+    nullify(self%freezeptr)
     self%wscal = 1.0_wp
     return
   end subroutine constraint_deallocate

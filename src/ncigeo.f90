@@ -59,6 +59,7 @@ subroutine wallpot(env)
       atms(:) = .true. !> all atoms
     endif
     call constr%ellipsoid(mol%nat,atms,rabc,kdefault,betadefault,.true.)
+    constr%auto_nci_wall = env%NCI
     deallocate (atms)
     call constr%print(stdout)
     call env%calc%add(constr)
