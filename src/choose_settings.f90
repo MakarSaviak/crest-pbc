@@ -226,15 +226,20 @@ subroutine defaultGF(env)
         kstart = 0.00125d0 ! start value k
         alpinc = (3./2.) ! increment
         kinc = (3./2.)   ! increment
-!---------- "-nci"
-      case (4) 
-        na = 3
-        nk = 2
+!---------- "-nci" (LEDE-CREST-inspired weak-bias experiment)
+      case (4)
+        na = 2
+        nk = 3
         nmtdyn = na*nk
-        alp = 1.0d0 ! start value alpha
-        kstart = 0.001d0 ! start value k
-        alpinc = 2.0 ! increment
-        kinc = 2.0     ! increment
+        ! alpha grid: 3.1 and 1.3 bohr^-2
+        alp = 3.1d0
+        alpinc = 3.1d0/1.3d0
+        ! Absolute kpush grid after the normal rednat scaling below:
+        ! 0.0500, 0.027386..., 0.0150 Eh (for mtd_kscal = 1).
+        ! The four corner combinations reproduce the LEDE-CREST values;
+        ! the geometric midpoint retains the validated six-bias NCI layout.
+        kstart = 0.050d0/real(env%rednat,wp)
+        kinc = sqrt(0.050d0/0.015d0)
 !---------- "-singlerun"
       case (45) 
         na = 1
@@ -526,5 +531,4 @@ subroutine env_to_mddat(env)
   env%mddat%requested = .true.
 
 end subroutine env_to_mddat
-
 
