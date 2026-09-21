@@ -164,6 +164,16 @@ contains !> MODULE PROCEDURES START HERE
         write (stdout,fmturk) '[['//blk%header//']]-block',blk%kv_list(i)%key
       end if
     end do
+    if (allocated(job%gff_fragment_charges)) then
+      if (job%id /= jobtype%gfnff) &
+      & error stop '**ERROR** fragment_charges is supported only for GFN-FF'
+      if (.not.allocated(job%gff_fragments)) &
+      & error stop '**ERROR** fragment_charges requires fragments'
+      if (size(job%gff_fragment_charges) /= size(job%gff_fragments)) &
+      & error stop '**ERROR** fragment_charges must contain one charge per fragment'
+      if (sum(job%gff_fragment_charges) /= job%chrg) &
+      & error stop '**ERROR** fragment_charges must sum to the calculation charge'
+    end if
     return
   end subroutine parse_leveldata
   subroutine parse_setting_auto(env,job,kv,rd)
@@ -206,6 +216,14 @@ contains !> MODULE PROCEDURES START HERE
       case default
         error stop '**ERROR** fragments must be a TOML string array'
       end select
+
+    case ('fragment_charges')
+      if (kv%id /= valuetypes%int_array) &
+      & error stop '**ERROR** fragment_charges must be a TOML integer array'
+      if (kv%na < 1) error stop '**ERROR** fragment_charges array must not be empty'
+      if (allocated(job%gff_fragment_charges)) deallocate(job%gff_fragment_charges)
+      allocate(job%gff_fragment_charges(kv%na))
+      job%gff_fragment_charges = kv%value_ia
 
 !>--- floats
     case ('etemp')

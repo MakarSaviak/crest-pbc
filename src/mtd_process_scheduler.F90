@@ -796,7 +796,8 @@ contains
       message = 'post-trial GFN-FF state has no initialized neighbour list'
       return
     end if
-    if (allocated(source_calc%calcs(1)%gff_fragments)) then
+    if (allocated(source_calc%calcs(1)%gff_fragments) .or. &
+    & allocated(source_calc%calcs(1)%gff_fragment_charges)) then
       call gfnff_fragment_ids(source_calc%calcs(1),mols(1),expected_fragments,fragment_io,message)
       if (fragment_io /= 0) then
         message = 'post-trial GFN-FF fragment selections are invalid: '//trim(message)
@@ -808,9 +809,46 @@ contains
         message = 'post-trial GFN-FF fragment map differs from parsed fragment selections'
         return
       end if
+      if (allocated(source_calc%calcs(1)%gff_fragment_charges)) then
+        if (.not.allocated(source_calc%calcs(1)%ff_dat%user_fragcharges)) then
+          message = 'post-trial GFN-FF fragment charges are absent from runtime state'
+          return
+        end if
+        if (size(source_calc%calcs(1)%ff_dat%user_fragcharges) /= &
+        & size(source_calc%calcs(1)%gff_fragment_charges) .or. &
+        & any(source_calc%calcs(1)%ff_dat%user_fragcharges /= &
+        & source_calc%calcs(1)%gff_fragment_charges)) then
+          message = 'post-trial GFN-FF runtime fragment charges differ from requested charges'
+          return
+        end if
+        if (source_calc%calcs(1)%ff_dat%topo%nfrag /= &
+        & size(source_calc%calcs(1)%gff_fragment_charges)) then
+          message = 'post-trial GFN-FF topology fragment count differs from requested charges'
+          return
+        end if
+        if (.not.allocated(source_calc%calcs(1)%ff_dat%topo%qfrag)) then
+          message = 'post-trial GFN-FF topology fragment charges are unallocated'
+          return
+        end if
+        if (size(source_calc%calcs(1)%ff_dat%topo%qfrag) < &
+        & size(source_calc%calcs(1)%gff_fragment_charges)) then
+          message = 'post-trial GFN-FF topology fragment-charge vector is too short'
+          return
+        end if
+        if (any(source_calc%calcs(1)%ff_dat%topo%qfrag(1: &
+        & size(source_calc%calcs(1)%gff_fragment_charges)) /= &
+        & real(source_calc%calcs(1)%gff_fragment_charges,wp))) then
+          message = 'post-trial GFN-FF topology fragment charges differ from requested charges'
+          return
+        end if
+      else if (allocated(source_calc%calcs(1)%ff_dat%user_fragcharges)) then
+        message = 'post-trial GFN-FF state has fragment charges without configured charges'
+        return
+      end if
       deallocate(expected_fragments)
-    else if (allocated(source_calc%calcs(1)%ff_dat%user_fraglist)) then
-      message = 'post-trial GFN-FF state has a fragment map without configured fragment selections'
+    else if (allocated(source_calc%calcs(1)%ff_dat%user_fraglist) .or. &
+    & allocated(source_calc%calcs(1)%ff_dat%user_fragcharges)) then
+      message = 'post-trial GFN-FF state has fragment data without configured fragments'
       return
     end if
     if (allocated(source_calc%freezelist)) then
@@ -1361,6 +1399,9 @@ contains
         end if
       end do
     end if
+    same = same_int_alloc_1d(calc_a%calcs(1)%gff_fragment_charges, &
+    & calc_b%calcs(1)%gff_fragment_charges)
+    if (.not.same) return
     same = allocated(calc_a%calcs(1)%ff_dat) .and. &
     & allocated(calc_b%calcs(1)%ff_dat)
     if (.not.same) return
@@ -1370,6 +1411,7 @@ contains
       & (a%make_chrg .eqv. b%make_chrg) .and. a%version == b%version .and. &
       & (a%update .eqv. b%update) .and. (a%write_topo .eqv. b%write_topo) .and. &
       & same_int_alloc_1d(a%user_fraglist,b%user_fraglist) .and. &
+      & same_int_alloc_1d(a%user_fragcharges,b%user_fragcharges) .and. &
       & same_logical_alloc_1d(a%frozen_mask,b%frozen_mask)
     end associate
     if (.not.same) return
@@ -1812,7 +1854,8 @@ contains
       message = 'process MTD freeze count is nonzero without a freeze mask'
       return
     end if
-    if (allocated(env%calc%calcs(1)%gff_fragments)) then
+    if (allocated(env%calc%calcs(1)%gff_fragments) .or. &
+    & allocated(env%calc%calcs(1)%gff_fragment_charges)) then
       call gfnff_fragment_ids(env%calc%calcs(1),mols(1),fragment_ids,fragment_io,message)
       if (fragment_io /= 0) then
         message = 'process MTD GFN-FF fragment selections are invalid: '//trim(message)

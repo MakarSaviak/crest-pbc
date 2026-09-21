@@ -35,7 +35,7 @@ contains   !> MODULE PROCEDURES START HERE
 !========================================================================================!
 
   subroutine gfnff_setup(nat,at,xyz,ichrg,pr,restart,write_topo, &
-  &                      gen,param,topo,accuracy,version,io,verbose,iunit,fraglist)
+  &                      gen,param,topo,accuracy,version,io,verbose,iunit,fraglist,fragcharges)
     use gfnff_restart
     use gfnff_param,only:ini,gfnff_set_param
     implicit none
@@ -58,6 +58,7 @@ contains   !> MODULE PROCEDURES START HERE
     logical,intent(in),optional :: verbose !> extended prinout
     integer,intent(in),optional :: iunit
     integer,intent(in),optional :: fraglist(nat)
+    integer,intent(in),optional :: fragcharges(:)
 
 !> Stack
     integer :: newichrg,myunit
@@ -73,8 +74,17 @@ contains   !> MODULE PROCEDURES START HERE
 
     newichrg = ichrg
     if (present(fraglist)) then
-      call gfnff_input(nat,at,xyz,newichrg,topo,fraglist)
+      if (present(fragcharges)) then
+        call gfnff_input(nat,at,xyz,newichrg,topo,fraglist,fragcharges)
+      else
+        call gfnff_input(nat,at,xyz,newichrg,topo,fraglist)
+      end if
     else
+      if (present(fragcharges)) then
+        io = 1
+        write (myunit,'("**ERROR** Fragment charges require an explicit fragment list. ",a)') source
+        return
+      end if
       call gfnff_input(nat,at,xyz,newichrg,topo)
     end if
 
@@ -85,6 +95,40 @@ contains   !> MODULE PROCEDURES START HERE
       if (ex) then
         call read_restart_gff(topo%filename,nat,version,success,.true.,topo)
         if (success) then
+          if (present(fraglist)) then
+            if (.not.allocated(topo%fraglist)) then
+              io = 1
+              write (myunit,'("**ERROR** Restart topology has no fragment map. ",a)') source
+              return
+            end if
+            if (size(topo%fraglist) /= nat .or. any(topo%fraglist /= fraglist)) then
+              io = 1
+              write (myunit,'("**ERROR** Restart topology fragment map differs from requested fragments. ",a)') source
+              return
+            end if
+          end if
+          if (present(fragcharges)) then
+            if (topo%nfrag /= size(fragcharges)) then
+              io = 1
+              write (myunit,'("**ERROR** Restart topology fragment count differs from requested charges. ",a)') source
+              return
+            end if
+            if (.not.allocated(topo%qfrag)) then
+              io = 1
+              write (myunit,'("**ERROR** Restart topology has no fragment charges. ",a)') source
+              return
+            end if
+            if (size(topo%qfrag) < size(fragcharges)) then
+              io = 1
+              write (myunit,'("**ERROR** Restart topology fragment-charge vector is too short. ",a)') source
+              return
+            end if
+            if (any(topo%qfrag(1:size(fragcharges)) /= real(fragcharges,wp))) then
+              io = 1
+              write (myunit,'("**ERROR** Restart topology fragment charges differ from requested charges. ",a)') source
+              return
+            end if
+          end if
           if(pr) write (myunit,'(/,"> GFN-FF topology read successfully from file ",a," !")') &
           & topo%filename  
           return
@@ -112,7 +156,7 @@ contains   !> MODULE PROCEDURES START HERE
   end subroutine gfnff_setup
 !========================================================================================!
 
-  subroutine gfnff_input(nat,at,xyz,ichrg,topo,fraglist)
+  subroutine gfnff_input(nat,at,xyz,ichrg,topo,fraglist,fragcharges)
     use gfnff_param
     implicit none
     ! Dummy
@@ -122,6 +166,7 @@ contains   !> MODULE PROCEDURES START HERE
     integer,intent(inout)  :: ichrg
     type(TGFFTopology),intent(inout) :: topo
     integer,intent(in),optional :: fraglist(nat)
+    integer,intent(in),optional :: fragcharges(:)
     ! Stack
     integer           :: i,j,k
     integer           :: ni
@@ -174,6 +219,15 @@ contains   !> MODULE PROCEDURES START HERE
         topo%fraglist = fraglist
         topo%nfrag = maxval(fraglist)
         if (topo%nfrag > nat) error stop 'GFN-FF fragment ID exceeds atom count'
+      end if
+      if (present(fragcharges)) then
+        if (.not.present(fraglist)) error stop 'GFN-FF fragment charges require fragment IDs'
+        if (size(fragcharges) /= topo%nfrag) &
+        & error stop 'GFN-FF fragment charge count differs from fragment count'
+        if (sum(fragcharges) /= ichrg) &
+        & error stop 'GFN-FF fragment charges do not sum to total charge'
+        topo%qfrag = 0.0_wp
+        topo%qfrag(1:topo%nfrag) = real(fragcharges,wp)
       end if
 !    end if
 

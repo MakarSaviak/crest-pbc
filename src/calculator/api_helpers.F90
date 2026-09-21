@@ -313,9 +313,9 @@ contains    !> MODULE PROCEDURES START HERE
   subroutine gfnff_fragment_ids(calc,mol,frag_ids,iostat_out,message)
 !*******************************************************************************
 !* Resolve configured GFN-FF fragment selections with the same CREST atom-list
-!* semantics used by normal GFN-FF initialization.  Keeping this operation in
-!* one helper prevents a process-MTD validator from inventing a second parser
-!* or a different fallback rule for atoms not covered by a user selection.
+!* semantics used by normal GFN-FF initialization. Explicit fragment charges
+!* make the mapping strict: every atom must belong to exactly one listed
+!* fragment, so charge-to-fragment ordering is unambiguous.
 !*******************************************************************************
     type(calculation_settings),intent(in) :: calc
     type(coord),intent(in) :: mol
@@ -323,14 +323,33 @@ contains    !> MODULE PROCEDURES START HERE
     integer,intent(out) :: iostat_out
     character(len=*),intent(out) :: message
     integer :: f
+    logical :: strict_charges
     logical,allocatable :: selected(:)
 
     iostat_out = 0
     message = ''
+    strict_charges = allocated(calc%gff_fragment_charges)
     if (mol%nat < 1) then
       iostat_out = 1
       message = 'GFN-FF fragment mapping received a nonpositive atom count'
       return
+    end if
+    if (strict_charges) then
+      if (.not.allocated(calc%gff_fragments)) then
+        iostat_out = 2
+        message = 'GFN-FF fragment charges require explicit fragment selections'
+        return
+      end if
+      if (size(calc%gff_fragment_charges) /= size(calc%gff_fragments)) then
+        iostat_out = 2
+        message = 'GFN-FF fragment charge count differs from fragment selection count'
+        return
+      end if
+      if (sum(calc%gff_fragment_charges) /= calc%chrg) then
+        iostat_out = 2
+        message = 'GFN-FF fragment charges do not sum to the total calculation charge'
+        return
+      end if
     end if
     if (.not.allocated(calc%gff_fragments)) return
     if (size(calc%gff_fragments) < 1) then
@@ -353,10 +372,33 @@ contains    !> MODULE PROCEDURES START HERE
         return
       end if
       call get_atlist(mol%nat,selected,trim(calc%gff_fragments(f)%value),mol%at)
+      if (strict_charges) then
+        if (.not.any(selected)) then
+          iostat_out = 5
+          message = 'charged GFN-FF fragment selection contains no atoms'
+          deallocate(selected,frag_ids)
+          return
+        end if
+        if (any(selected .and. frag_ids /= 0)) then
+          iostat_out = 6
+          message = 'charged GFN-FF fragment selections overlap'
+          deallocate(selected,frag_ids)
+          return
+        end if
+      end if
       where(selected) frag_ids = f
       deallocate(selected)
     end do
-    if (any(frag_ids == 0)) frag_ids = frag_ids+1
+    if (strict_charges) then
+      if (any(frag_ids == 0)) then
+        iostat_out = 7
+        message = 'charged GFN-FF fragments must cover every atom exactly once'
+        deallocate(frag_ids)
+        return
+      end if
+    else
+      if (any(frag_ids == 0)) frag_ids = frag_ids+1
+    end if
   end subroutine gfnff_fragment_ids
 
   subroutine gfnff_init(calc,mol,loadnew)
@@ -400,12 +442,17 @@ contains    !> MODULE PROCEDURES START HERE
     ! The calculator object persists for the lifetime of an OpenMP worker, so
     ! reparsing these atom lists on every energy/gradient call is redundant.
     if (calc%apiclean) loadnew = .true.
-    if (loadnew .and. allocated(calc%gff_fragments)) then
-      call gfnff_fragment_ids(calc,mol,frag_ids,frag_io,fragment_message)
-      if (frag_io /= 0) error stop '**ERROR** '//trim(fragment_message)
+    if (loadnew) then
       if (allocated(calc%ff_dat%user_fraglist)) deallocate(calc%ff_dat%user_fraglist)
-      calc%ff_dat%user_fraglist = frag_ids
-      deallocate(frag_ids)
+      if (allocated(calc%ff_dat%user_fragcharges)) deallocate(calc%ff_dat%user_fragcharges)
+      if (allocated(calc%gff_fragments) .or. allocated(calc%gff_fragment_charges)) then
+        call gfnff_fragment_ids(calc,mol,frag_ids,frag_io,fragment_message)
+        if (frag_io /= 0) error stop '**ERROR** '//trim(fragment_message)
+        calc%ff_dat%user_fraglist = frag_ids
+        if (allocated(calc%gff_fragment_charges)) &
+        & calc%ff_dat%user_fragcharges = calc%gff_fragment_charges
+        deallocate(frag_ids)
+      end if
     end if
 #endif
   end subroutine gfnff_init

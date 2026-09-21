@@ -48,6 +48,7 @@ module gfnff_interface
     character(len=:),allocatable :: refgeo
     character(len=:),allocatable :: refcharges
     integer,allocatable :: user_fraglist(:) !> host-defined per-atom fragment IDs
+    integer,allocatable :: user_fragcharges(:) !> host-defined formal charge for each explicit fragment
     !> Optional host-supplied mask. When present, GFN-FF may omit only direct
     !> gradient work on atoms whose coordinates CREST will hold fixed. Energies,
     !> charges, CNs, D3, and all active-atom gradients remain fully evaluated.
@@ -291,11 +292,20 @@ contains  !> MODULE PROCEDURES START HERE
 
     call newD3Model(dat%topo%dispm,nat,at)
 
+    if (allocated(dat%user_fragcharges) .and. .not.allocated(dat%user_fraglist)) &
+    & error stop 'GFN-FF user fragment charges require a fragment list'
     if (allocated(dat%user_fraglist)) then
       if (size(dat%user_fraglist) /= nat) error stop 'GFN-FF user fragment list has wrong atom count'
-      call gfnff_setup(nat,at,xyz,dat%ichrg,pr,restart,dat%write_topo, &
-      &        dat%gen,dat%param,dat%topo,dat%accuracy,dat%version,io, &
-      &        verbose=verbose,iunit=myunit,fraglist=dat%user_fraglist)
+      if (allocated(dat%user_fragcharges)) then
+        call gfnff_setup(nat,at,xyz,dat%ichrg,pr,restart,dat%write_topo, &
+        &        dat%gen,dat%param,dat%topo,dat%accuracy,dat%version,io, &
+        &        verbose=verbose,iunit=myunit,fraglist=dat%user_fraglist, &
+        &        fragcharges=dat%user_fragcharges)
+      else
+        call gfnff_setup(nat,at,xyz,dat%ichrg,pr,restart,dat%write_topo, &
+        &        dat%gen,dat%param,dat%topo,dat%accuracy,dat%version,io, &
+        &        verbose=verbose,iunit=myunit,fraglist=dat%user_fraglist)
+      end if
     else
       call gfnff_setup(nat,at,xyz,dat%ichrg,pr,restart,dat%write_topo, &
       &        dat%gen,dat%param,dat%topo,dat%accuracy,dat%version,io, &
@@ -361,6 +371,7 @@ contains  !> MODULE PROCEDURES START HERE
     self%write_topo = .true.
     if (allocated(self%solvent)) deallocate (self%solvent)
     if (allocated(self%user_fraglist)) deallocate (self%user_fraglist)
+    if (allocated(self%user_fragcharges)) deallocate (self%user_fragcharges)
     if (allocated(self%frozen_mask)) deallocate (self%frozen_mask)
     if (allocated(self%gen)) deallocate (self%gen)
     if (allocated(self%param)) deallocate (self%param)

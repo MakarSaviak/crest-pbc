@@ -18,10 +18,10 @@ module mtd_process_capsule
   implicit none
   private
 
-  integer(int32),parameter,public :: mtd_capsule_version = 5_int32
+  integer(int32),parameter,public :: mtd_capsule_version = 6_int32
   integer(int64),parameter :: max_capsule_elements = 10000000_int64
-  character(len=32),parameter :: capsule_magic = 'CREST_MTD_PROCESS_CAPSULE_V5    '
-  character(len=32),parameter :: capsule_trailer = 'END_CREST_MTD_CAPSULE_V5       '
+  character(len=32),parameter :: capsule_magic = 'CREST_MTD_PROCESS_CAPSULE_V6    '
+  character(len=32),parameter :: capsule_trailer = 'END_CREST_MTD_CAPSULE_V6       '
 
   type,public :: mtd_capsule_meta
     integer :: worker_index = 0
@@ -580,6 +580,29 @@ contains
           end do
         end do
       end if
+      if (allocated(level%gff_fragment_charges)) then
+        if (.not.allocated(level%gff_fragments)) then
+          io = 84
+          message = 'capsule GFN-FF fragment charges require fragment selections'
+          return
+        end if
+        if (size(level%gff_fragment_charges) < 1 .or. &
+        & size(level%gff_fragment_charges) /= size(level%gff_fragments)) then
+          io = 84
+          message = 'capsule GFN-FF fragment charge count is inconsistent'
+          return
+        end if
+        if (.not.all_int_array32(level%gff_fragment_charges)) then
+          io = 84
+          message = 'capsule GFN-FF fragment charge exceeds int32 encoding'
+          return
+        end if
+        if (sum(level%gff_fragment_charges) /= level%chrg) then
+          io = 84
+          message = 'capsule GFN-FF fragment charges do not sum to total charge'
+          return
+        end if
+      end if
     end associate
   end subroutine validate_capsule_source_state
 
@@ -790,7 +813,8 @@ contains
     & same_alloc_string(a%calcs(1)%refcharges,b%calcs(1)%refcharges) .and. &
     & same_alloc_string(a%calcs(1)%solvmodel,b%calcs(1)%solvmodel) .and. &
     & same_alloc_string(a%calcs(1)%solvent,b%calcs(1)%solvent) .and. &
-    & same_fragment_string_array(a%calcs(1)%gff_fragments,b%calcs(1)%gff_fragments)
+    & same_fragment_string_array(a%calcs(1)%gff_fragments,b%calcs(1)%gff_fragments) .and. &
+    & same_int_1d(a%calcs(1)%gff_fragment_charges,b%calcs(1)%gff_fragment_charges)
     if (allocated(a%calcs(1)%ff_dat) .or. allocated(b%calcs(1)%ff_dat) .or. &
     & allocated(a%etmp) .or. allocated(b%etmp) .or. &
     & allocated(a%grdtmp) .or. allocated(b%grdtmp) .or. &
@@ -1387,6 +1411,7 @@ contains
     if (io == 0) call write_alloc_string(unit,level%solvmodel,io,message)
     if (io == 0) call write_alloc_string(unit,level%solvent,io,message)
     if (io == 0) call write_fragment_string_array(unit,level%gff_fragments,io,message)
+    if (io == 0) call write_int_1d(unit,level%gff_fragment_charges,io,message)
     end associate
   end subroutine write_restricted_calc
 
@@ -1419,6 +1444,7 @@ contains
     if (io == 0) call read_alloc_string(unit,level%solvmodel,io,message)
     if (io == 0) call read_alloc_string(unit,level%solvent,io,message)
     if (io == 0) call read_fragment_string_array(unit,level%gff_fragments,io,message)
+    if (io == 0) call read_int_1d(unit,level%gff_fragment_charges,io,message)
     if (io /= 0) return
     if (level_id /= jobtype%gfnff .or. .not.level%active) then
       io = 46
@@ -1468,6 +1494,8 @@ contains
     calc%calcs(1)%numgrad = .false.
     if (allocated(level%gff_fragments)) &
     & call move_alloc(level%gff_fragments,calc%calcs(1)%gff_fragments)
+    if (allocated(level%gff_fragment_charges)) &
+    & call move_alloc(level%gff_fragment_charges,calc%calcs(1)%gff_fragment_charges)
     calc%pr_energies = .false.
   end subroutine read_restricted_calc
 

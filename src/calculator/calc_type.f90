@@ -170,6 +170,7 @@ module calc_type
 !>--- GFN-FF data
     type(gfnff_data),allocatable :: ff_dat
     type(alloc_string),allocatable :: gff_fragments(:)
+    integer,allocatable :: gff_fragment_charges(:) !> formal charge assigned to each explicit GFN-FF fragment
 
 !>--- libpvol data
     integer  :: pvmodel = 1            !> libpvol model type (0=XHCFF, 1=PV)
@@ -1138,6 +1139,7 @@ contains  !>--- Module routines start here
     if (allocated(self%g0calc)) deallocate (self%g0calc)
     if (allocated(self%ff_dat)) deallocate (self%ff_dat)
     if (allocated(self%gff_fragments)) deallocate (self%gff_fragments)
+    if (allocated(self%gff_fragment_charges)) deallocate (self%gff_fragment_charges)
     if (allocated(self%libpvol)) deallocate (self%libpvol)
 
     self%id = 0
