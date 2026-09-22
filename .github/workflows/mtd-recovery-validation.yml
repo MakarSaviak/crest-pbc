@@ -1,0 +1,71 @@
+name: MTD recovery validation
+
+on:
+  push:
+    branches:
+      - fix/mtd-numerical-recovery-frozen-host
+  workflow_dispatch:
+
+jobs:
+  focused-validation:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout exact source
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Setup GCC Fortran 14
+        uses: fortran-lang/setup-fortran@v1
+        with:
+          compiler: gcc
+          version: '14'
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libopenblas-dev
+          python -m pip install --upgrade pip
+          python -m pip install 'meson!=1.8.0' cmake ninja pkgconfig numpy ase matplotlib
+
+      - name: Work around pre-existing lwONIOM CMake include-dir bug
+        run: mkdir -p subprojects/lwoniom/include
+
+      - name: Configure
+        run: |
+          cmake -B _build -GNinja \
+            -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+            -DWITH_TESTS=ON
+
+      - name: Build
+        run: ninja -C _build
+
+      - name: Focused CREST regression tests
+        working-directory: _build
+        env:
+          OMP_NUM_THREADS: 1
+          OPENBLAS_NUM_THREADS: 1
+        run: |
+          ctest --output-on-failure -R '^crest/(gfnff|optimization|mtd-capsule-v5)$'
+
+      - name: Short GFN-FF test executable run
+        working-directory: _build
+        env:
+          OMP_NUM_THREADS: 1
+          OPENBLAS_NUM_THREADS: 1
+        run: ./test/crest-tester gfnff
+
+      - name: Package exact tested source
+        run: |
+          git archive --format=zip \
+            --prefix=crest-3.0.2-mtd-recovery/ \
+            --output=crest-3.0.2-mtd-recovery-source.zip HEAD
+          sha256sum crest-3.0.2-mtd-recovery-source.zip > crest-3.0.2-mtd-recovery-source.zip.sha256
+
+      - name: Upload tested source archive
+        uses: actions/upload-artifact@v4
+        with:
+          name: crest-3.0.2-mtd-recovery-tested-source
+          path: |
+            crest-3.0.2-mtd-recovery-source.zip
+            crest-3.0.2-mtd-recovery-source.zip.sha256
