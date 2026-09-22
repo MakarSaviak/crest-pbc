@@ -19,7 +19,7 @@ module mtd_process_scheduler
   use strucrd,only:coord,i2e
   use crest_poststage_ensemble,only:poststage_ensemble, &
   & read_canonical_trajectory_slice
-  use dynamics_module,only:mddata,dynamics,type_mtd,cv_rmsd
+  use dynamics_module,only:mddata,dynamics,type_mtd,cv_rmsd,md_engrad_max_attempts
   use iomod,only:makedir,directory_exist
   use omp_lib,only:omp_set_dynamic,omp_set_max_active_levels,omp_set_num_threads, &
   & omp_get_dynamic,omp_get_max_threads,omp_get_max_active_levels, &
@@ -489,15 +489,32 @@ contains
       result_file = trim(workdir)//'/result.bin'
       call read_worker_result(result_file,i,mddats(i)%termination_status,worker_wall, &
       & worker_engrad_calls,io,iomessage)
-      if (io /= 0 .or. mddats(i)%termination_status /= 0) then
+      if (io /= 0) then
         status = status_failed
-        message = 'invalid dynamics result for MTD worker '//integer_string(i)//': '//trim(iomessage)
+        message = 'unreadable dynamics result for MTD worker '//integer_string(i)//': '//trim(iomessage)
         return
       end if
-      if (worker_engrad_calls /= int(mddats(i)%length_steps,int64)) then
+      if (mddats(i)%termination_status < 0 .or. mddats(i)%termination_status > 2) then
         status = status_failed
-        message = 'unexpected energy/gradient call count for MTD worker '//integer_string(i)
+        message = 'invalid dynamics termination code for MTD worker '//integer_string(i)
         return
+      end if
+      if (worker_engrad_calls > int(mddats(i)%length_steps,int64)* &
+      & int(md_engrad_max_attempts,int64)) then
+        status = status_failed
+        message = 'excessive energy/gradient retry count for MTD worker '//integer_string(i)
+        return
+      end if
+      if (mddats(i)%termination_status == 0 .and. &
+      & worker_engrad_calls < int(mddats(i)%length_steps,int64)) then
+        status = status_failed
+        message = 'too few energy/gradient calls for completed MTD worker '//integer_string(i)
+        return
+      end if
+      if (mddats(i)%termination_status /= 0) then
+        write(stdout,'(1x,a,i0,a,i0,a)') 'WARNING: MTD worker ',i, &
+        & ' returned dynamics term=',mddats(i)%termination_status, &
+        & '; retaining its finite trajectory while the batch continues.'
       end if
       if (worker_engrad_calls > huge(batch_engrad_calls)-batch_engrad_calls) then
         status = status_failed
@@ -511,6 +528,7 @@ contains
         message = 'fatal-output audit failed for MTD worker '//integer_string(i)//': '//trim(iomessage)
         return
       end if
+      call report_worker_recovery_notices(workdir,i)
       topology = trim(workdir)//'/gfnff_topo'
       call compare_binary_files_exact(topology_master,topology,identical,io,iomessage)
       if (io /= 0 .or. .not.identical) then
@@ -524,11 +542,30 @@ contains
         message = 'invalid trajectory dimensions for MTD worker '//integer_string(i)
         return
       end if
-      expected_frames = (mddats(i)%length_steps-1)/mddats(i)%sdump
-      if (expected_frames < 1 .or. &
-      & int(expected_frames,int64) > huge(total_frames64)-total_frames64) then
+      if (mddats(i)%termination_status == 0) then
+        expected_frames = (mddats(i)%length_steps-1)/mddats(i)%sdump
+        if (expected_frames < 1) then
+          status = status_failed
+          message = 'trajectory frame accounting failed for completed MTD worker '//integer_string(i)
+          return
+        end if
+      else
+        ! Count and validate the finite partial trajectory left by a numerically
+        ! exhausted worker.  A term=1 worker is allowed to contribute zero frames.
+        call validate_xyz_trajectory(mddats(i)%trajectoryfile,mols(i)%at, &
+        & -1,frames,trajectory_bytes,io,iomessage)
+        if (io /= 0) then
+          status = status_failed
+          message = 'partial trajectory validation failed for MTD worker '// &
+          & integer_string(i)//': '//trim(iomessage)
+          return
+        end if
+        expected_frames = frames
+        trajectory_bytes_by_worker(i) = trajectory_bytes
+      end if
+      if (int(expected_frames,int64) > huge(total_frames64)-total_frames64) then
         status = status_failed
-        message = 'trajectory frame accounting failed for MTD worker '//integer_string(i)
+        message = 'trajectory frame total overflow for MTD worker '//integer_string(i)
         return
       end if
       expected_frame_counts(i) = expected_frames
@@ -536,20 +573,30 @@ contains
       worker_walls(i) = worker_wall
 
       if (.not.present(poststage_out)) then
-        call validate_xyz_trajectory(mddats(i)%trajectoryfile,mols(i)%at, &
-        & expected_frames,frames,trajectory_bytes,io,iomessage)
-        if (io /= 0) then
-          status = status_failed
-          message = 'trajectory validation failed for MTD worker '// &
-          & integer_string(i)//': '//trim(iomessage)
-          return
+        if (mddats(i)%termination_status == 0) then
+          call validate_xyz_trajectory(mddats(i)%trajectoryfile,mols(i)%at, &
+          & expected_frames,frames,trajectory_bytes,io,iomessage)
+          if (io /= 0) then
+            status = status_failed
+            message = 'trajectory validation failed for MTD worker '// &
+            & integer_string(i)//': '//trim(iomessage)
+            return
+          end if
+          trajectory_bytes_by_worker(i) = trajectory_bytes
+        else
+          frames = expected_frames
+          trajectory_bytes = trajectory_bytes_by_worker(i)
         end if
-        trajectory_bytes_by_worker(i) = trajectory_bytes
         call print_process_finish(mddats(i),i,worker_wall,frames,trajectory_bytes)
       end if
     end do
 
     if (present(poststage_out)) then
+      if (total_frames64 < 1_int64) then
+        status = status_failed
+        message = 'process MTD batch produced no usable trajectory frames'
+        return
+      end if
       if (total_frames64 > int(huge(1),int64)) then
         status = status_failed
         message = 'poststage trajectory frame total exceeds default-integer indexing'
@@ -621,13 +668,21 @@ contains
 !$omp shared(trajectory_read_seconds,trajectory_decode_seconds,nsim) &
 !$omp private(i)
       do i = 1,nsim
-        call read_canonical_trajectory_slice(mddats(i)%trajectoryfile,mols(i)%at, &
-        & expected_frame_counts(i), &
-        & poststage_out%xyz(:,:,slice_first(i):slice_last(i)), &
-        & poststage_out%eread(slice_first(i):slice_last(i)), &
-        & poststage_out%comments(slice_first(i):slice_last(i)), &
-        & trajectory_bytes_by_worker(i),trajectory_status(i),trajectory_messages(i), &
-        & trajectory_read_seconds(i),trajectory_decode_seconds(i))
+        if (expected_frame_counts(i) > 0) then
+          call read_canonical_trajectory_slice(mddats(i)%trajectoryfile,mols(i)%at, &
+          & expected_frame_counts(i), &
+          & poststage_out%xyz(:,:,slice_first(i):slice_last(i)), &
+          & poststage_out%eread(slice_first(i):slice_last(i)), &
+          & poststage_out%comments(slice_first(i):slice_last(i)), &
+          & trajectory_bytes_by_worker(i),trajectory_status(i),trajectory_messages(i), &
+          & trajectory_read_seconds(i),trajectory_decode_seconds(i))
+        else
+          trajectory_status(i) = status_normal
+          trajectory_bytes_by_worker(i) = 0_int64
+          trajectory_messages(i) = ''
+          trajectory_read_seconds(i) = 0.0_wp
+          trajectory_decode_seconds(i) = 0.0_wp
+        end if
       end do
 !$omp end parallel do
       parser_finish = omp_get_wtime()
@@ -693,8 +748,12 @@ contains
     engrad_total = engrad_total+batch_engrad_calls
     write(stdout,'(1x,a,i0)') 'Process MTD energy+gradient calls added to parent: ', &
     & batch_engrad_calls
-    write(stdout,'(1x,a,i0,a)') 'All ',nsim, &
-    & ' process-isolated MTD workers exited 0 and passed trajectory validation.'
+    write(stdout,'(1x,a,i0,a,i0,a)') 'Process MTD summary: ', &
+    & count(mddats%termination_status == 0),' completed; ', &
+    & count(mddats%termination_status /= 0),' terminated early/empty with validated output.'
+    if (any(mddats%termination_status /= 0)) then
+      write(stdout,'(1x,a)') 'WARNING: numerical trajectory failures did not abort the MTD batch.'
+    end if
   end subroutine run_mtd_process_batch
 
   subroutine prepare_canonical_capsule_calculator(source_calc,mols,mddats,topology_file, &
@@ -1706,11 +1765,14 @@ contains
       status = status_failed
       return
     end if
-    if (term /= 0) then
-      status = status_failed
-    else
+    select case(term)
+    case(0,1,2)
+      ! Dynamics-level numerical termination is recorded in result.bin and is
+      ! handled by the parent as a per-trajectory warning, not a process crash.
       status = status_normal
-    end if
+    case default
+      status = status_failed
+    end select
   end subroutine mtd_process_worker_dispatch
 
   subroutine validate_process_configuration(env,mols,mddats,nsim,outer_threads, &
@@ -2363,7 +2425,7 @@ contains
       frames = frames+1
     end do
     close(unit)
-    if (io == 0 .and. frames /= expected_frames) then
+    if (io == 0 .and. expected_frames >= 0 .and. frames /= expected_frames) then
       io = 5
       write(message,'(a,i0,a,i0)') 'trajectory frame count ',frames, &
       & ' differs from exact expected count ',expected_frames
@@ -2393,6 +2455,25 @@ contains
       & total_normal
     end if
   end subroutine scan_worker_logs
+
+  subroutine report_worker_recovery_notices(workdir,worker_index)
+    character(len=*),intent(in) :: workdir
+    integer,intent(in) :: worker_index
+    character(len=:),allocatable :: path
+    character(len=4096) :: line
+    integer :: unit,read_io
+    path = trim(workdir)//'/worker.stdout'
+    open(newunit=unit,file=path,status='old',action='read',form='formatted',iostat=read_io)
+    if (read_io /= 0) return
+    do
+      read(unit,'(a)',iostat=read_io) line
+      if (read_io /= 0) exit
+      if (index(line,'CREST-MD-RECOVERY') > 0) then
+        write(stdout,'(2x,a,i0,a,a)') 'MTD ',worker_index,' notice: ',trim(adjustl(line))
+      end if
+    end do
+    close(unit)
+  end subroutine report_worker_recovery_notices
 
   subroutine scan_one_worker_log(path,normal_count,io,message)
     character(len=*),intent(in) :: path
@@ -2517,8 +2598,19 @@ contains
     real(wp) :: seconds
     minutes = int(wall/60.0_wp,int64)
     seconds = wall-real(minutes,wp)*60.0_wp
-    write(stdout,'(a,i3,a,i9,a,f6.3,a)') '*MTD ',index, &
-    & ' completed successfully ...',minutes,' min, ',seconds,' sec'
+    select case(md%termination_status)
+    case(0)
+      write(stdout,'(a,i3,a,i9,a,f6.3,a)') '*MTD ',index, &
+      & ' completed successfully ...',minutes,' min, ',seconds,' sec'
+    case(1)
+      write(stdout,'(a,i3,a,i9,a,f6.3,a)') '*MTD ',index, &
+      & ' produced no usable frames after numerical recovery ...',minutes,' min, ',seconds,' sec'
+    case(2)
+      write(stdout,'(a,i3,a,i9,a,f6.3,a)') '*MTD ',index, &
+      & ' terminated EARLY after numerical recovery ...',minutes,' min, ',seconds,' sec'
+    case default
+      write(stdout,'(a,i3,a,i0)') '*MTD ',index,' returned unexpected term=',md%termination_status
+    end select
     write(stdout,'(2x,a,i0,a,i0,a,i0,a,i0)') 'process worker metadata: input=', &
     & md%input_structure_id,', bias=',md%bias_configuration_id,', frames=',frames, &
     & ', bytes=',file_bytes
