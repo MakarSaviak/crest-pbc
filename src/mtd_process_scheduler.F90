@@ -2444,15 +2444,17 @@ contains
     integer,intent(out) :: io
     character(len=*),intent(out) :: message
     integer :: i,normal_count,total_normal
+    logical :: recovery_seen
     character(len=:),allocatable :: path
     character(len=13),parameter :: names(2) = [character(len=13) :: &
     & 'worker.stdout','worker.stderr']
     io = 0
     message = ''
     total_normal = 0
+    call worker_recovery_marker_present(workdir,recovery_seen)
     do i = 1,size(names)
       path = trim(workdir)//'/'//trim(names(i))
-      call scan_one_worker_log(path,normal_count,io,message)
+      call scan_one_worker_log(path,recovery_seen,normal_count,io,message)
       if (io /= 0) return
       total_normal = total_normal+normal_count
     end do
@@ -2462,6 +2464,27 @@ contains
       & total_normal
     end if
   end subroutine scan_worker_logs
+
+  subroutine worker_recovery_marker_present(workdir,found)
+    character(len=*),intent(in) :: workdir
+    logical,intent(out) :: found
+    character(len=:),allocatable :: path
+    character(len=4096) :: line
+    integer :: unit,read_io
+    found = .false.
+    path = trim(workdir)//'/worker.stdout'
+    open(newunit=unit,file=path,status='old',action='read',form='formatted',iostat=read_io)
+    if (read_io /= 0) return
+    do
+      read(unit,'(a)',iostat=read_io) line
+      if (read_io /= 0) exit
+      if (index(line,'CREST-MD-RECOVERY') > 0) then
+        found = .true.
+        exit
+      end if
+    end do
+    close(unit)
+  end subroutine worker_recovery_marker_present
 
   subroutine report_worker_recovery_notices(workdir,worker_index)
     character(len=*),intent(in) :: workdir
@@ -2482,8 +2505,9 @@ contains
     close(unit)
   end subroutine report_worker_recovery_notices
 
-  subroutine scan_one_worker_log(path,normal_count,io,message)
+  subroutine scan_one_worker_log(path,allow_recovered_nonfinite,normal_count,io,message)
     character(len=*),intent(in) :: path
+    logical,intent(in) :: allow_recovered_nonfinite
     integer,intent(out) :: normal_count
     integer,intent(out) :: io
     character(len=*),intent(out) :: message
@@ -2522,10 +2546,12 @@ contains
       lower = ascii_lower(line)
       if (index(lower,'crest terminated normally') > 0) normal_count = normal_count+1
       if (contains_nan_token(lower)) then
-        io = 1
-        write(message,'(a,i0,a,a)') 'NaN token at line ',line_number,' of ',trim(path)
-        close(unit)
-        return
+        if (.not.allow_recovered_nonfinite) then
+          io = 1
+          write(message,'(a,i0,a,a)') 'NaN token at line ',line_number,' of ',trim(path)
+          close(unit)
+          return
+        end if
       end if
       do i = 1,size(fatal)
         if (index(lower,trim(fatal(i))) > 0) then
