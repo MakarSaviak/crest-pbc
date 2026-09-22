@@ -542,16 +542,23 @@ contains
         message = 'invalid trajectory dimensions for MTD worker '//integer_string(i)
         return
       end if
-      if (mddats(i)%termination_status == 0) then
+      select case(mddats(i)%termination_status)
+      case(0)
         expected_frames = (mddats(i)%length_steps-1)/mddats(i)%sdump
         if (expected_frames < 1) then
           status = status_failed
           message = 'trajectory frame accounting failed for completed MTD worker '//integer_string(i)
           return
         end if
-      else
-        ! Count and validate the finite partial trajectory left by a numerically
-        ! exhausted worker.  A term=1 worker is allowed to contribute zero frames.
+      case(1)
+        ! The worker exhausted numerical recovery before producing a frame.
+        ! Keep the rest of the MTD ensemble usable instead of aborting the batch.
+        expected_frames = 0
+        trajectory_bytes_by_worker(i) = 0_int64
+      case(2)
+        ! Count and validate every finite frame produced before the recoverable
+        ! early termination.  Exact full-length accounting is intentionally not
+        ! required for this one trajectory.
         call validate_xyz_trajectory(mddats(i)%trajectoryfile,mols(i)%at, &
         & -1,frames,trajectory_bytes,io,iomessage)
         if (io /= 0) then
@@ -562,7 +569,7 @@ contains
         end if
         expected_frames = frames
         trajectory_bytes_by_worker(i) = trajectory_bytes
-      end if
+      end select
       if (int(expected_frames,int64) > huge(total_frames64)-total_frames64) then
         status = status_failed
         message = 'trajectory frame total overflow for MTD worker '//integer_string(i)
