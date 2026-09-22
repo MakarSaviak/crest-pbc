@@ -21,6 +21,7 @@
 !================================================================================!
 
 module dynamics_module
+  use, intrinsic :: ieee_arithmetic,only:ieee_is_finite
   use crest_parameters
   use crest_calculator
   use strucrd
@@ -41,6 +42,7 @@ module dynamics_module
   !>-- filetypes as integers
   integer,parameter,public :: type_md = 1
   integer,parameter,public :: type_mtd = 2
+  integer,parameter,public :: md_engrad_max_attempts = 4
 
   !>-- REEXPORTS from metadynamics_module
   public :: mtdpot,mtd_ini,cv_dump,calc_mtd
@@ -156,7 +158,9 @@ contains  !> MODULE PROCEDURES START HERE
     character(len=256) :: commentline
     integer :: i,j,k,l,ich,och,io
     integer :: dcount,printcount
-    logical :: ex,fail,bdump
+    integer :: engrad_attempt,bad_atom,bad_component
+    real(wp) :: max_force
+    logical :: ex,fail,bdump,energy_finite,gradient_finite
 
     call initsignal()
 
@@ -322,17 +326,43 @@ contains  !> MODULE PROCEDURES START HERE
       call initsignal()
 
       !>>-- STEP 1: calculate energy and forces
-      !>--- singlepoint calculation
-      epot = 0.0_wp
-      grd = 0.0_wp
-      call engrad(mol,calc,epot,grd,io)
+      !>--- singlepoint calculation with bounded numerical recovery.
+      !> A failed/nonfinite evaluation is repeated at exactly the same geometry.
+      !> Between retries, only geometry-dependent GFN-FF caches are released;
+      !> the canonical topology, fragments, and frozen-host mask are retained.
+      io = 0
+      energy_finite = .false.
+      gradient_finite = .false.
+      do engrad_attempt = 1,md_engrad_max_attempts
+        epot = 0.0_wp
+        grd = 0.0_wp
+        call engrad(mol,calc,epot,grd,io)
+        energy_finite = ieee_is_finite(epot)
+        gradient_finite = all(ieee_is_finite(grd))
+        if (io == 0 .and. energy_finite .and. gradient_finite) exit
 
-      if (io /= 0) then
-        if (dat%dumped > 0) then
-          term = 2  !> termination during MD
-        else
-          term = 1  !> termination upon first engrad call
+        call first_nonfinite_2d(grd,bad_atom,bad_component)
+        max_force = max_finite_abs_2d(grd)
+        write(stdout,'(1x,a,i0,a,i0,a,i0,a,i0,a,l1,a,l1,a,i0,a,i0,a,es12.4)') &
+        & 'CREST-MD-RECOVERY step=',t,', attempt=',engrad_attempt,'/', &
+        & md_engrad_max_attempts,', io=',io,', energy_finite=',energy_finite, &
+        & ', gradient_finite=',gradient_finite,', first_bad_atom=',bad_atom, &
+        & ', first_bad_component=',bad_component,', max_finite_abs_gradient=',max_force
+        flush(stdout)
+        if (engrad_attempt < md_engrad_max_attempts) then
+          call reset_gfnff_trial_history(calc)
         end if
+      end do
+
+      if (io /= 0 .or. .not.energy_finite .or. .not.gradient_finite) then
+        if (dat%dumped > 0) then
+          term = 2  !> recoverable early termination during MD
+        else
+          term = 1  !> no usable MD frame was produced
+        end if
+        write(stdout,'(1x,a,i0,a,i0,a)') 'CREST-MD-RECOVERY exhausted at step ', &
+        & t,' after ',md_engrad_max_attempts,' attempts; preserving last finite state.'
+        flush(stdout)
         exit MD
       end if
       if (t == 1) then
@@ -343,6 +373,24 @@ contains  !> MODULE PROCEDURES START HERE
       if (dat%simtype == type_mtd) then
         !> MTD energy and gradient are added to epot and grd, respectively.
         call md_calc_mtd(mol,dat,epot,grd,grdmtd,pr)
+        energy_finite = ieee_is_finite(epot)
+        gradient_finite = all(ieee_is_finite(grd)) .and. all(ieee_is_finite(grdmtd))
+        if (.not.energy_finite .or. .not.gradient_finite) then
+          call first_nonfinite_2d(grdmtd,bad_atom,bad_component)
+          max_force = max_finite_abs_2d(grdmtd)
+          if (dat%dumped > 0) then
+            term = 2
+          else
+            term = 1
+          end if
+          write(stdout,'(1x,a,i0,a,l1,a,l1,a,i0,a,i0,a,es12.4)') &
+          & 'CREST-MD-RECOVERY nonfinite MTD result at step ',t, &
+          & '; energy_finite=',energy_finite,', gradient_finite=',gradient_finite, &
+          & ', first_bad_atom=',bad_atom,', first_bad_component=',bad_component, &
+          & ', max_finite_abs_mtd_gradient=',max_force
+          flush(stdout)
+          exit MD
+        end if
         call md_update_mtd(mol,dat,pr)
       end if
 
@@ -414,6 +462,19 @@ contains  !> MODULE PROCEDURES START HERE
 
       !>--- THERMOSTATING (determine factor thermoscal)
       call thermostating(mol,dat,temp,thermoscal)
+      if (.not.ieee_is_finite(ekin) .or. .not.ieee_is_finite(temp) .or. &
+      & .not.ieee_is_finite(thermoscal)) then
+        if (dat%dumped > 0) then
+          term = 2
+        else
+          term = 1
+        end if
+        write(stdout,'(1x,a,i0,a,3(1x,es12.4))') &
+        & 'CREST-MD-RECOVERY nonfinite kinetic/thermostat state at step ',t, &
+        & '; Ekin,T,scale=',ekin,temp,thermoscal
+        flush(stdout)
+        exit MD
+      end if
 
       !>>-- STEP 3: velocity and position update
       !>--- update velocities to t
@@ -432,12 +493,45 @@ contains  !> MODULE PROCEDURES START HERE
         mol%xyz = molo%xyz+vel*tstep_au
       endif
 
+      !>--- reject a nonfinite propagated state before it can contaminate the
+      !> next E/G call or the restart.  molo%xyz and velo still hold the last
+      !> finite pre-propagation state here.
+      if (.not.all(ieee_is_finite(mol%xyz)) .or. .not.all(ieee_is_finite(vel))) then
+        call first_nonfinite_2d(mol%xyz,bad_atom,bad_component)
+        if (bad_atom == 0) call first_nonfinite_2d(vel,bad_atom,bad_component)
+        mol%xyz = molo%xyz
+        if (dat%dumped > 0) then
+          term = 2
+        else
+          term = 1
+        end if
+        write(stdout,'(1x,a,i0,a,i0,a,i0,a)') &
+        & 'CREST-MD-RECOVERY nonfinite propagated state at step ',t, &
+        & '; first_bad_atom=',bad_atom,', first_bad_component=',bad_component, &
+        & '; rolled back to last finite coordinates.'
+        flush(stdout)
+        exit MD
+      end if
+
       !>--- estimate new velocities at t
       veln = 0.5_wp*(velo+vel)
 
       !>--- compute kinetic energy and temperature for average tracking
       call ekinet(mol%nat,veln,mass,ekin)
       temp = 2.0_wp*ekin/float(nfreedom)/kB
+      if (.not.ieee_is_finite(ekin) .or. .not.ieee_is_finite(temp)) then
+        mol%xyz = molo%xyz
+        if (dat%dumped > 0) then
+          term = 2
+        else
+          term = 1
+        end if
+        write(stdout,'(1x,a,i0,a,2(1x,es12.4),a)') &
+        & 'CREST-MD-RECOVERY nonfinite post-propagation kinetic state at step ', &
+        & t,'; Ekin,T=',ekin,temp,'; rolled back to last finite coordinates.'
+        flush(stdout)
+        exit MD
+      end if
 
       !>--- apply SHAKE at t+dt?
       if (dat%shake.and.dat%nshake > 0) then
@@ -455,8 +549,16 @@ contains  !> MODULE PROCEDURES START HERE
       !>--- update velocities
       velo = vel
 
-      !>--- remove translational and rotational componetnts of the velocity
-      call rmrottr(mol%nat,mass,velo,mol%xyz)
+      !>--- A frozen host defines the inertial reference frame.  Applying
+      !> whole-system rmrottr() would reintroduce tiny velocities on frozen
+      !> atoms and would also project out physical guest translation/rotation.
+      if (calc%nfreeze > 0) then
+        do i = 1,mol%nat
+          if (calc%freezelist(i)) velo(:,i) = 0.0_wp
+        end do
+      else
+        call rmrottr(mol%nat,mass,velo,mol%xyz)
+      end if
 
       !>>-- Update averages and counter
       edum = edum+epot+ekin
@@ -487,8 +589,13 @@ contains  !> MODULE PROCEDURES START HERE
       write (*,*) '<T> / K              :',Tav/float(t)
     end if
 
-!>--- write restart file
-    rt = float(dat%length_steps)*dat%tstep + rtshift
+!>--- write restart file.  On early termination, preserve the actual
+!>--- finite state/time reached instead of stamping the requested final time.
+    if (term == 0) then
+      rt = float(dat%length_steps)*dat%tstep + rtshift
+    else
+      rt = float(max(0,t-1))*dat%tstep + rtshift
+    end if
     !$omp critical(crest_md_io)
     call wrmdrestart(mol,dat,velo,rt)
     !$omp end critical(crest_md_io)
@@ -519,6 +626,36 @@ contains  !> MODULE PROCEDURES START HERE
 
     return
   end subroutine dynamics
+
+!========================================================================================!
+  subroutine first_nonfinite_2d(values,atom,component)
+    real(wp),intent(in) :: values(:,:)
+    integer,intent(out) :: atom,component
+    integer :: i,j
+    atom = 0
+    component = 0
+    do j = 1,size(values,2)
+      do i = 1,size(values,1)
+        if (.not.ieee_is_finite(values(i,j))) then
+          atom = j
+          component = i
+          return
+        end if
+      end do
+    end do
+  end subroutine first_nonfinite_2d
+
+!========================================================================================!
+  real(wp) function max_finite_abs_2d(values) result(maximum)
+    real(wp),intent(in) :: values(:,:)
+    integer :: i,j
+    maximum = 0.0_wp
+    do j = 1,size(values,2)
+      do i = 1,size(values,1)
+        if (ieee_is_finite(values(i,j))) maximum = max(maximum,abs(values(i,j)))
+      end do
+    end do
+  end function max_finite_abs_2d
 
 !========================================================================================!
   subroutine mdautoset(dat,iostatus)
