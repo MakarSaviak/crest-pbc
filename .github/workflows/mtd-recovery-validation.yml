@@ -71,6 +71,7 @@ jobs:
           EOF
           cat > _smoke_md/short-md.toml <<'EOF'
           runtype = "md"
+          input = "struc.xyz"
           constraints = "constraints.inp"
 
           [[calculation.level]]
@@ -87,7 +88,7 @@ jobs:
           EOF
           (
             cd _smoke_md
-            ../_build/crest struc.xyz --input short-md.toml 2>&1 | tee crest-short-md.out
+            ../_build/crest short-md.toml 2>&1 | tee crest-short-md.out
             exit ${PIPESTATUS[0]}
           )
           python - <<'PY'
