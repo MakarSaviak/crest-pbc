@@ -111,6 +111,147 @@ jobs:
           PY
           grep -q "normal MD termination" _smoke_md/crest-short-md.out
 
+      - name: Injected transient E/G recovery smoke test
+        env:
+          OMP_NUM_THREADS: 1
+          OPENBLAS_NUM_THREADS: 1
+          GFORTRAN_UNBUFFERED_ALL: 1
+          CREST_INTERNAL_TEST_MODE: 1
+          CREST_INTERNAL_TEST_MD_FAULT_WORKER: -1
+          CREST_INTERNAL_TEST_MD_FAULT_STEP: 3
+          CREST_INTERNAL_TEST_MD_FAULT_ATTEMPTS: 1
+        run: |
+          rm -rf _smoke_retry
+          mkdir _smoke_retry
+          cp examples/expl-4/struc.xyz _smoke_retry/struc.xyz
+          cat > _smoke_retry/constraints.inp <<'EOF'
+          $fix
+            atoms: 1-4
+          $end
+          EOF
+          cat > _smoke_retry/short-md.toml <<'EOF'
+          runtype = "md"
+          input = "struc.xyz"
+          constraints = "constraints.inp"
+
+          [[calculation.level]]
+          method = "gfnff"
+
+          [dynamics]
+          length = 0.006
+          tstep = 0.5
+          dump = 1.0
+          temperature = 100.0
+          shake = false
+          printstep = 2
+          blocklength = 2
+          EOF
+          (
+            cd _smoke_retry
+            ../_build/crest short-md.toml 2>&1 | tee crest-retry.out
+            exit ${PIPESTATUS[0]}
+          )
+          grep -q "CREST-MD-TEST-FAULT" _smoke_retry/crest-retry.out
+          grep -q "recovered successfully on attempt 2/4" _smoke_retry/crest-retry.out
+          grep -q "normal MD termination" _smoke_retry/crest-retry.out
+          python - <<'PY'
+          import math
+          from pathlib import Path
+
+          restart = Path("_smoke_retry/crest_0.mdrestart")
+          rows = restart.read_text().splitlines()
+          state = [[float(x.replace("D", "E")) for x in line.split()] for line in rows[1:]]
+          if not all(math.isfinite(v) for row in state for v in row):
+              raise SystemExit("transient-recovery restart contains non-finite values")
+          frozen_velocities = [v for row in state[:4] for v in row[3:6]]
+          if any(v != 0.0 for v in frozen_velocities):
+              raise SystemExit(f"frozen-host velocity leak after retry: {frozen_velocities}")
+          print("transient E/G failure recovered and frozen-host velocities remained exactly zero")
+          PY
+
+      - name: Injected exhausted E/G recovery smoke test
+        env:
+          OMP_NUM_THREADS: 1
+          OPENBLAS_NUM_THREADS: 1
+          GFORTRAN_UNBUFFERED_ALL: 1
+          CREST_INTERNAL_TEST_MODE: 1
+          CREST_INTERNAL_TEST_MD_FAULT_WORKER: -1
+          CREST_INTERNAL_TEST_MD_FAULT_STEP: 5
+          CREST_INTERNAL_TEST_MD_FAULT_ATTEMPTS: 4
+        run: |
+          rm -rf _smoke_exhausted
+          mkdir _smoke_exhausted
+          cp examples/expl-4/struc.xyz _smoke_exhausted/struc.xyz
+          cat > _smoke_exhausted/constraints.inp <<'EOF'
+          $fix
+            atoms: 1-4
+          $end
+          EOF
+          cat > _smoke_exhausted/short-md.toml <<'EOF'
+          runtype = "md"
+          input = "struc.xyz"
+          constraints = "constraints.inp"
+
+          [[calculation.level]]
+          method = "gfnff"
+
+          [dynamics]
+          length = 0.010
+          tstep = 0.5
+          dump = 1.0
+          temperature = 100.0
+          shake = false
+          printstep = 2
+          blocklength = 2
+          EOF
+          set +e
+          (
+            cd _smoke_exhausted
+            ../_build/crest short-md.toml > crest-exhausted.out 2>&1
+          )
+          rc=$?
+          set -e
+          cat _smoke_exhausted/crest-exhausted.out
+          if [ "$rc" -ne 0 ]; then
+            echo "recoverable exhausted MD returned unexpected process exit $rc"
+            exit 1
+          fi
+          test "$(grep -c 'CREST-MD-TEST-FAULT' _smoke_exhausted/crest-exhausted.out)" -eq 4
+          grep -q "exhausted at step 5 after 4 attempts; preserving last finite state" _smoke_exhausted/crest-exhausted.out
+          grep -q "MD terminated, but still taking as converged" _smoke_exhausted/crest-exhausted.out
+          python - <<'PY'
+          import math
+          from pathlib import Path
+
+          restart = Path("_smoke_exhausted/crest_0.mdrestart")
+          rows = restart.read_text().splitlines()
+          state = [[float(x.replace("D", "E")) for x in line.split()] for line in rows[1:]]
+          if not all(math.isfinite(v) for row in state for v in row):
+              raise SystemExit("exhausted-recovery restart contains non-finite values")
+          frozen_velocities = [v for row in state[:4] for v in row[3:6]]
+          if any(v != 0.0 for v in frozen_velocities):
+              raise SystemExit(f"frozen-host velocity leak after exhausted retry: {frozen_velocities}")
+          print("exhausted E/G recovery preserved a finite state with exact frozen-host velocities")
+          PY
+
+      - name: Scheduler numerical-termination policy contract
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+
+          src = Path("src/mtd_process_scheduler.F90").read_text()
+          required = [
+              "case(0,1,2)",
+              "handled by the parent as a per-trajectory warning, not a process crash",
+              "retaining its finite trajectory while the batch continues",
+              "partial trajectory validation failed for MTD worker",
+          ]
+          missing = [token for token in required if token not in src]
+          if missing:
+              raise SystemExit(f"scheduler recovery-policy contract missing: {missing}")
+          print("scheduler source contract preserves term=1/2 as per-trajectory outcomes")
+          PY
+
       - name: Package exact tested source
         run: |
           git archive --format=zip \
