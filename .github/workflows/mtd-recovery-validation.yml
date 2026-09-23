@@ -83,7 +83,14 @@ jobs:
           EOF
           (
             cd _smoke_md
-            ../_build/crest struc.xyz --input short-md.toml > crest-short-md.out 2>&1
+            set +e
+            ../_build/crest struc.xyz --input short-md.toml 2>&1 | tee crest-short-md.out
+            rc=${PIPESTATUS[0]}
+            set -e
+            if [ "$rc" -ne 0 ]; then
+              echo "short MD exited with status $rc"
+              exit "$rc"
+            fi
           )
           python - <<'PY'
           import math
