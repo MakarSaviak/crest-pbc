@@ -21,7 +21,7 @@
 !================================================================================!
 
 module dynamics_module
-  use, intrinsic :: ieee_arithmetic,only:ieee_is_finite
+  use, intrinsic :: ieee_arithmetic,only:ieee_is_finite,ieee_value,ieee_quiet_nan
   use crest_parameters
   use crest_calculator
   use strucrd
@@ -159,8 +159,51 @@ contains  !> MODULE PROCEDURES START HERE
     integer :: i,j,k,l,ich,och,io
     integer :: dcount,printcount
     integer :: engrad_attempt,bad_atom,bad_component
+    integer :: test_fault_worker,test_fault_step,test_fault_attempts
+    integer :: test_env_status,test_read_io
     real(wp) :: max_force
-    logical :: ex,fail,bdump,energy_finite,gradient_finite
+    logical :: ex,fail,bdump,energy_finite,gradient_finite,test_fault_enabled
+    character(len=64) :: test_env
+
+    !> Internal deterministic fault injection for regression testing only.
+    !> It is completely inactive unless CREST_INTERNAL_TEST_MODE=1 is set.
+    test_fault_enabled = .false.
+    test_fault_worker = -999999
+    test_fault_step = -1
+    test_fault_attempts = 0
+    test_env = ''
+    call get_environment_variable('CREST_INTERNAL_TEST_MODE',value=test_env,status=test_env_status)
+    if (test_env_status == 0 .and. trim(test_env) == '1') then
+      call get_environment_variable('CREST_INTERNAL_TEST_MD_FAULT_WORKER', &
+      & value=test_env,status=test_env_status)
+      if (test_env_status == 0) then
+        read(test_env,*,iostat=test_read_io) test_fault_worker
+      else
+        test_read_io = 1
+      end if
+      if (test_read_io == 0) then
+        call get_environment_variable('CREST_INTERNAL_TEST_MD_FAULT_STEP', &
+        & value=test_env,status=test_env_status)
+        if (test_env_status == 0) then
+          read(test_env,*,iostat=test_read_io) test_fault_step
+        else
+          test_read_io = 1
+        end if
+      end if
+      if (test_read_io == 0) then
+        call get_environment_variable('CREST_INTERNAL_TEST_MD_FAULT_ATTEMPTS', &
+        & value=test_env,status=test_env_status)
+        if (test_env_status == 0) then
+          read(test_env,*,iostat=test_read_io) test_fault_attempts
+        else
+          test_read_io = 1
+        end if
+      end if
+      if (test_read_io == 0 .and. test_fault_step > 0 .and. &
+      & test_fault_attempts > 0 .and. test_fault_attempts <= md_engrad_max_attempts) then
+        test_fault_enabled = .true.
+      end if
+    end if
 
     call initsignal()
 
@@ -337,6 +380,14 @@ contains  !> MODULE PROCEDURES START HERE
         epot = 0.0_wp
         grd = 0.0_wp
         call engrad(mol,calc,epot,grd,io)
+        if (test_fault_enabled .and. t == test_fault_step .and. &
+        & (test_fault_worker < 0 .or. dat%md_index == test_fault_worker) .and. &
+        & engrad_attempt <= test_fault_attempts) then
+          grd(1,1) = ieee_value(0.0_wp,ieee_quiet_nan)
+          write(stdout,'(1x,a,i0,a,i0,a,i0)') 'CREST-MD-TEST-FAULT worker=', &
+          & dat%md_index,', step=',t,', injected_attempt=',engrad_attempt
+          flush(stdout)
+        end if
         energy_finite = ieee_is_finite(epot)
         gradient_finite = all(ieee_is_finite(grd))
         if (io == 0 .and. energy_finite .and. gradient_finite) exit
@@ -353,6 +404,13 @@ contains  !> MODULE PROCEDURES START HERE
           call reset_gfnff_trial_history(calc)
         end if
       end do
+
+      if (io == 0 .and. energy_finite .and. gradient_finite .and. engrad_attempt > 1) then
+        write(stdout,'(1x,a,i0,a,i0,a,i0,a)') 'CREST-MD-RECOVERY step=',t, &
+        & ' recovered successfully on attempt ',engrad_attempt,'/', &
+        & md_engrad_max_attempts,'.'
+        flush(stdout)
+      end if
 
       if (io /= 0 .or. .not.energy_finite .or. .not.gradient_finite) then
         if (dat%dumped > 0) then
