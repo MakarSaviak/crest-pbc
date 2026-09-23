@@ -212,8 +212,11 @@ jobs:
           rc=$?
           set -e
           cat _smoke_exhausted/crest-exhausted.out
-          if [ "$rc" -ne 0 ]; then
-            echo "recoverable exhausted MD returned unexpected process exit $rc"
+          # Standalone CREST MD retains its native top-level behavior: term=2
+          # is reported as process exit 155. The process-MTD worker wrapper separately
+          # maps term=1/2 to a normal child exit so the ensemble can continue.
+          if [ "$rc" -ne 155 ]; then
+            echo "exhausted standalone MD returned unexpected process exit $rc (expected 155)"
             exit 1
           fi
           test "$(grep -c 'CREST-MD-TEST-FAULT' _smoke_exhausted/crest-exhausted.out)" -eq 4
