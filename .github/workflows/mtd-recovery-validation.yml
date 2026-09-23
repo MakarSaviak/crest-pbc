@@ -55,6 +55,56 @@ jobs:
           OPENBLAS_NUM_THREADS: 1
         run: ./test/crest-tester gfnff
 
+      - name: Short frozen-host MD smoke test
+        env:
+          OMP_NUM_THREADS: 1
+          OPENBLAS_NUM_THREADS: 1
+        run: |
+          rm -rf _smoke_md
+          mkdir _smoke_md
+          cp examples/expl-4/struc.xyz _smoke_md/struc.xyz
+          cat > _smoke_md/short-md.toml <<'EOF'
+          runtype = "md"
+
+          [calculation]
+          freeze = "1-4"
+
+          [[calculation.level]]
+          method = "gfnff"
+
+          [dynamics]
+          length = 0.006
+          tstep = 0.5
+          dump = 1.0
+          temperature = 100.0
+          shake = false
+          printstep = 2
+          blocklength = 2
+          EOF
+          (
+            cd _smoke_md
+            ../_build/crest struc.xyz --input short-md.toml > crest-short-md.out 2>&1
+          )
+          python - <<'PY'
+          import math
+          from pathlib import Path
+
+          restart = Path("_smoke_md/crest_0.mdrestart")
+          if not restart.exists():
+              raise SystemExit("short MD did not produce crest_0.mdrestart")
+          rows = restart.read_text().splitlines()
+          if len(rows) != 13:
+              raise SystemExit(f"unexpected restart line count: {len(rows)}")
+          state = [[float(x.replace("D", "E")) for x in line.split()] for line in rows[1:]]
+          if not all(math.isfinite(v) for row in state for v in row):
+              raise SystemExit("non-finite restart value in short frozen-host MD")
+          frozen_velocities = [v for row in state[:4] for v in row[3:6]]
+          if any(v != 0.0 for v in frozen_velocities):
+              raise SystemExit(f"frozen-host velocity leak: {frozen_velocities}")
+          print("short frozen-host MD passed: all restart values finite and atoms 1-4 velocities exactly zero")
+          PY
+          grep -q "normal MD termination" _smoke_md/crest-short-md.out
+
       - name: Package exact tested source
         run: |
           git archive --format=zip \
